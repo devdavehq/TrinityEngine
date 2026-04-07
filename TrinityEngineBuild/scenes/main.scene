@@ -1,0 +1,39 @@
+# main.scene
+# Format: entity blocks separated by blank lines.
+# Lines starting with # are comments.
+# The engine reloads this file when it detects a change.
+
+[entity]
+name     = player
+mesh     = meshes/cube.obj
+position = 0.0  1.0  0.0
+color    = 1.0  1.0  1.0
+metallic  = 0.0
+roughness = 0.4
+script   = scripts/player.lua
+
+[entity]
+name     = enemy
+mesh     = meshes/cube.obj
+position = 3.0  1.0  0.0
+color    = 1.0  0.2  0.2
+metallic  = 0.3
+roughness = 0.7
+script   = scripts/enemy.lua
+
+[entity]
+name     = floor
+mesh     = meshes/cube.obj
+position = 0.0  -0.5  0.0
+scale    = 10.0  0.2  10.0
+color    = 0.4  0.4  0.4
+metallic  = 0.0
+roughness = 0.9
+
+[entity]
+name     = shiny_sphere
+mesh     = meshes/cube.obj
+position = -3.0  1.0  0.0
+color    = 1.0  0.7  0.2
+metallic  = 1.0
+roughness = 0.05

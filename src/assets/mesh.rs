@@ -114,4 +114,107 @@ impl Mesh {
         }
         Ok(Mesh { vertices })
     }
+
+    pub fn make_plane(size_x: f32, size_z: f32) -> Mesh {
+        let hx = size_x * 0.5;
+        let hz = size_z * 0.5;
+        let n = [0.0, 1.0, 0.0];
+        let c = [1.0, 1.0, 1.0];
+        let p0 = [-hx, 0.0, -hz];
+        let p1 = [hx, 0.0, -hz];
+        let p2 = [hx, 0.0, hz];
+        let p3 = [-hx, 0.0, hz];
+        Mesh {
+            vertices: vec![
+                Vertex::new(p0, n, c),
+                Vertex::new(p1, n, c),
+                Vertex::new(p2, n, c),
+                Vertex::new(p0, n, c),
+                Vertex::new(p2, n, c),
+                Vertex::new(p3, n, c),
+            ],
+        }
+    }
+
+    pub fn make_capsule(radius: f32, half_height: f32, rings: usize, segments: usize) -> Mesh {
+        let mut vertices = Vec::new();
+        let rings = rings.max(4);
+        let segments = segments.max(8);
+        let h = half_height.max(0.01);
+        let r = radius.max(0.01);
+
+        // Cylinder body
+        for i in 0..segments {
+            let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+            let (x0, z0) = (a0.cos() * r, a0.sin() * r);
+            let (x1, z1) = (a1.cos() * r, a1.sin() * r);
+            let n0 = [a0.cos(), 0.0, a0.sin()];
+            let n1 = [a1.cos(), 0.0, a1.sin()];
+            let c = [1.0, 1.0, 1.0];
+            let b0 = [x0, -h, z0];
+            let t0 = [x0, h, z0];
+            let b1 = [x1, -h, z1];
+            let t1 = [x1, h, z1];
+            vertices.extend_from_slice(&[
+                Vertex::new(b0, n0, c),
+                Vertex::new(t0, n0, c),
+                Vertex::new(t1, n1, c),
+                Vertex::new(b0, n0, c),
+                Vertex::new(t1, n1, c),
+                Vertex::new(b1, n1, c),
+            ]);
+        }
+
+        // Hemisphere helper
+        let mut add_hemi = |top: bool| {
+            let y_sign = if top { 1.0 } else { -1.0 };
+            let y_offset = if top { h } else { -h };
+            for y in 0..(rings / 2) {
+                let v0 = y as f32 / (rings as f32 / 2.0);
+                let v1 = (y + 1) as f32 / (rings as f32 / 2.0);
+                let phi0 = v0 * std::f32::consts::FRAC_PI_2;
+                let phi1 = v1 * std::f32::consts::FRAC_PI_2;
+                let ry0 = phi0.sin() * r * y_sign;
+                let rr0 = phi0.cos() * r;
+                let ry1 = phi1.sin() * r * y_sign;
+                let rr1 = phi1.cos() * r;
+                for i in 0..segments {
+                    let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                    let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+                    let p00 = [a0.cos() * rr0, y_offset + ry0, a0.sin() * rr0];
+                    let p01 = [a1.cos() * rr0, y_offset + ry0, a1.sin() * rr0];
+                    let p10 = [a0.cos() * rr1, y_offset + ry1, a0.sin() * rr1];
+                    let p11 = [a1.cos() * rr1, y_offset + ry1, a1.sin() * rr1];
+                    let n00 = glam::Vec3::new(p00[0], p00[1] - y_offset, p00[2]).normalize();
+                    let n01 = glam::Vec3::new(p01[0], p01[1] - y_offset, p01[2]).normalize();
+                    let n10 = glam::Vec3::new(p10[0], p10[1] - y_offset, p10[2]).normalize();
+                    let n11 = glam::Vec3::new(p11[0], p11[1] - y_offset, p11[2]).normalize();
+                    let c = [1.0, 1.0, 1.0];
+                    if top {
+                        vertices.extend_from_slice(&[
+                            Vertex::new(p00, n00.to_array(), c),
+                            Vertex::new(p10, n10.to_array(), c),
+                            Vertex::new(p11, n11.to_array(), c),
+                            Vertex::new(p00, n00.to_array(), c),
+                            Vertex::new(p11, n11.to_array(), c),
+                            Vertex::new(p01, n01.to_array(), c),
+                        ]);
+                    } else {
+                        vertices.extend_from_slice(&[
+                            Vertex::new(p00, n00.to_array(), c),
+                            Vertex::new(p11, n11.to_array(), c),
+                            Vertex::new(p10, n10.to_array(), c),
+                            Vertex::new(p00, n00.to_array(), c),
+                            Vertex::new(p01, n01.to_array(), c),
+                            Vertex::new(p11, n11.to_array(), c),
+                        ]);
+                    }
+                }
+            }
+        };
+        add_hemi(true);
+        add_hemi(false);
+        Mesh { vertices }
+    }
 }

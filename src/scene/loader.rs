@@ -2,8 +2,6 @@
 // Reads .scene files and returns a list of entity descriptions.
 // The engine spawns ECS entities from these descriptions.
 
-use std::collections::HashMap;
-
 // EntityDesc holds everything needed to spawn one entity.
 // All fields have defaults — you only write what you need in the scene file.
 #[derive(Debug, Clone)]

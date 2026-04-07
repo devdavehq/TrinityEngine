@@ -1,11 +1,10 @@
 // src/scene.rs — scene module root
 pub mod loader;
-pub use loader::{EntityDesc, parse_scene};
+pub use loader::parse_scene;
 
 use crate::assets::{AssetStore, Handle, Mesh};
 use crate::components::{Position, Renderable, Script};
 use hecs::World;
-use std::collections::HashMap;
 // SceneManager owns the scene file path and the current list of entities.
 // When the file changes, rebuild() clears the world and respawns everything.
 pub struct SceneManager {

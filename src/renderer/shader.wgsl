@@ -9,6 +9,10 @@ struct Uniforms {
     _pad1:       f32,
     light_color: vec3<f32>,
     _pad2:       f32,
+    point_light_pos_range: vec4<f32>,
+    point_light_color_intensity: vec4<f32>,
+    post_params0: vec4<f32>, // x=bloom_enabled, y=bloom_strength, z=ssao_enabled, w=ssao_strength
+    post_params1: vec4<f32>, // x=fog_enabled, y=fog_density, z=voxel_enabled, w=voxel_strength
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -34,22 +38,20 @@ struct Uniforms {
 struct VertIn {
     @location(0) position:  vec3<f32>,
     @location(1) normal:    vec3<f32>,
-    @location(2) uv:        vec2<f32>,
-    @location(3) color:     vec3<f32>,
-    @location(4) metallic:  f32,
-    @location(5) roughness: f32,
-    @location(6) ao:        f32,
+    @location(2) color:     vec3<f32>,
+    @location(3) metallic:  f32,
+    @location(4) roughness: f32,
+    @location(5) ao:        f32,
 }
 
 struct VertOut {
     @builtin(position) clip_pos:  vec4<f32>,
     @location(0)       world_pos: vec3<f32>,
     @location(1)       normal:    vec3<f32>,
-    @location(2)       uv:        vec2<f32>,
-    @location(3)       color:     vec3<f32>,
-    @location(4)       metallic:  f32,
-    @location(5)       roughness: f32,
-    @location(6)       ao:        f32,
+    @location(2)       color:     vec3<f32>,
+    @location(3)       metallic:  f32,
+    @location(4)       roughness: f32,
+    @location(5)       ao:        f32,
 }
 
 @vertex
@@ -58,7 +60,6 @@ fn vs_main(in: VertIn) -> VertOut {
     out.clip_pos  = uniforms.view_proj * vec4<f32>(in.position, 1.0);
     out.world_pos = in.position;
     out.normal    = in.normal;
-    out.uv        = in.uv;
     out.color     = in.color;
     out.metallic  = in.metallic;
     out.roughness = in.roughness;
@@ -269,13 +270,14 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     // ── Sample textures ────────────────────────────────────────────────────
     // Sample albedo texture at the vertex's UV coordinates.
     // Multiply by the vertex color (tint). Usually tint = white = no change.
-    let albedo_sample = textureSample(t_albedo, s_albedo, in.uv).rgb;
+    let world_uv = in.world_pos.xz * 0.12;
+    let albedo_sample = textureSample(t_albedo, s_albedo, world_uv).rgb;
     let albedo = albedo_sample * in.color;
 
     // Sample normal map.
     // Normal maps store directions as RGB where (0.5, 0.5, 1.0) = flat.
     // Unpacking: multiply by 2 and subtract 1 maps (0..1) → (-1..1).
-    let normal_sample = textureSample(t_normal, s_normal, in.uv).rgb;
+    let normal_sample = textureSample(t_normal, s_normal, world_uv).rgb;
     // Unpack: (0,0,1) in texture = (0,0,1) in tangent space = flat surface.
     // We're using object-space normals here for simplicity.
     // A full implementation uses tangent-space normals + TBN matrix.
@@ -288,7 +290,7 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
 
     // Sample metallic-roughness texture.
     // glTF convention: B channel = metallic, G channel = roughness.
-    let mr_sample  = textureSample(t_metallic_roughness, s_metallic_roughness, in.uv);
+    let mr_sample  = textureSample(t_metallic_roughness, s_metallic_roughness, world_uv);
     // Multiply by component values from vertex — allows scene-level override.
     let metallic   = mr_sample.b * in.metallic  + (1.0 - in.metallic)  * mr_sample.b;
     let roughness  = mr_sample.g * in.roughness + (1.0 - in.roughness) * mr_sample.g;
@@ -310,7 +312,8 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let kS_dir = F_dir;
     let kD_dir = (vec3<f32>(1.0) - kS_dir) * (1.0 - metallic);
    // IBL is ambient — it comes from everywhere so shadows don't apply.
-    let shadow = compute_shadow(in.world_pos, N, in.view_z);  // add view_z to VertOut
+    let view_z = abs(in.clip_pos.z / max(in.clip_pos.w, 0.0001));
+    let shadow = compute_shadow(in.world_pos, N, view_z);
     let Lo = (kD_dir * albedo / PI + spec) * uniforms.light_color * 3.0 * NdotL * shadow;
 
 
@@ -346,17 +349,58 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let spec_ibl    = prefiltered * (F_ibl * brdf.x + brdf.y);
 
     // Combine IBL diffuse + specular with ambient occlusion.
-    let ao          = in.ao; // vertex AO — later add AO texture
+    var ao = in.ao; // vertex AO — later add AO texture
+    if uniforms.post_params0.z > 0.5 {
+        // Cheap SSAO-like approximation from normal orientation and distance.
+        let horizon = 1.0 - max(N.y, 0.0);
+        let dist_occ = clamp(view_z * 0.03, 0.0, 1.0);
+        let approx = clamp((horizon * 0.6 + dist_occ * 0.4) * uniforms.post_params0.w, 0.0, 0.9);
+        ao *= (1.0 - approx);
+    }
     let ambient     = (kD_ibl * diffuse_ibl + spec_ibl) * ao;
 
+    // Single movable point light.
+    let pl_pos = uniforms.point_light_pos_range.xyz;
+    let pl_range = max(uniforms.point_light_pos_range.w, 0.001);
+    let pl_color = uniforms.point_light_color_intensity.xyz;
+    let pl_intensity = uniforms.point_light_color_intensity.w;
+    let to_pl = pl_pos - in.world_pos;
+    let pl_dist = length(to_pl);
+    let pl_dir = normalize(to_pl);
+    let pl_nl = max(dot(N, pl_dir), 0.0);
+    let pl_att = clamp(1.0 - (pl_dist / pl_range), 0.0, 1.0);
+    let point_diff = (albedo / PI) * pl_color * (pl_nl * pl_att * pl_intensity);
+
     // ── Final combination ──────────────────────────────────────────────────
-    var color = ambient + Lo;
+    var color = ambient + Lo + point_diff;
+
+    // Voxel GI prototype (cheap approximation) — gives blocky bounced fill style.
+    if uniforms.post_params1.z > 0.5 {
+        let voxel_cell = floor(in.world_pos * 0.5);
+        let hash = fract(sin(dot(voxel_cell, vec3<f32>(12.9898, 78.233, 39.425))) * 43758.5453);
+        let voxel_bounce = mix(vec3<f32>(0.03, 0.04, 0.05), albedo * 0.25, hash);
+        color += voxel_bounce * uniforms.post_params1.w;
+    }
+
+    // Volumetric fog approximation.
+    if uniforms.post_params1.x > 0.5 {
+        let fog = 1.0 - exp(-view_z * uniforms.post_params1.y);
+        let fog_color = vec3<f32>(0.52, 0.60, 0.70);
+        color = mix(color, fog_color, clamp(fog, 0.0, 0.9));
+    }
 
     // Tone mapping (Reinhard) — HDR → LDR.
     color = color / (color + vec3<f32>(1.0));
 
     // Gamma correction — linear → sRGB for display.
     color = pow(color, vec3<f32>(1.0 / 2.2));
+
+    // Bloom approximation: boost highlights after tone map.
+    if uniforms.post_params0.x > 0.5 {
+        let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let glow = smoothstep(0.7, 1.0, lum) * uniforms.post_params0.y;
+        color += color * glow;
+    }
 
     return vec4<f32>(color, 1.0);
 }

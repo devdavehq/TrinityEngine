@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/renderer/ibl.rs
 // Image-Based Lighting preprocessing.
 // Loads an HDR equirectangular environment map and produces:
@@ -37,21 +39,16 @@ impl IblMaps {
         let hdr_data = std::fs::read(path)
             .map_err(|e| format!("Cannot read HDR {}: {}", path, e))?;
 
-        let cursor  = std::io::Cursor::new(hdr_data);
-        let decoder = image::codecs::hdr::HdrDecoder::new(cursor)
+        let dyn_img = image::load_from_memory_with_format(&hdr_data, image::ImageFormat::Hdr)
             .map_err(|e| format!("Cannot decode HDR: {}", e))?;
-        let meta   = decoder.metadata();
-        let width  = meta.width;
-        let height = meta.height;
-
-        // ── image 0.25: read_image_native() replaces read_image_hdr() ────
-        let pixels: Vec<image::Rgb<f32>> = decoder
-            .read_image_native()
-            .map_err(|e| format!("HDR decode failed: {}", e))?;
+        let rgb = dyn_img.to_rgb32f();
+        let width = rgb.width();
+        let height = rgb.height();
 
         // Convert RGB f32 pixels to RGBA f32 (GPU requires 4 channels).
-        let mut hdr_rgba: Vec<f32> = Vec::with_capacity(pixels.len() * 4);
-        for px in &pixels {
+        let raw_rgb = rgb.into_raw();
+        let mut hdr_rgba: Vec<f32> = Vec::with_capacity((width * height * 4) as usize);
+        for px in raw_rgb.chunks_exact(3) {
             hdr_rgba.push(px[0]);
             hdr_rgba.push(px[1]);
             hdr_rgba.push(px[2]);
@@ -73,14 +70,14 @@ impl IblMaps {
         });
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture:   &env_tex,
                 mip_level: 0,
                 origin:    wgpu::Origin3d::ZERO,
                 aspect:    wgpu::TextureAspect::All,
             },
             bytemuck::cast_slice(&hdr_rgba),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset:         0,
                 bytes_per_row:  Some(width * 4 * 4), // width × RGBA × 4 bytes/f32
                 rows_per_image: Some(height),
@@ -153,12 +150,12 @@ impl IblMaps {
         });
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             bytemuck::cast_slice(&data),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row:  Some(SIZE * 4), // 2 channels × 2 bytes each
                 rows_per_image: Some(SIZE),

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/renderer/shadow.rs
 // Cascaded Shadow Maps (CSM) for the directional sun light.
 //

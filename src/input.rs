@@ -2,6 +2,7 @@
 // std::collections is a module in Rust's built-in library.
 // HashSet is a collection that holds unique values — no duplicates.
 use std::collections::HashSet;
+use gilrs::{Axis, Button, EventType, Gilrs};
 
 // KeyCode represents a physical key position on the keyboard.
 // PhysicalKey is the wrapper type winit uses — we unwrap it to get KeyCode.
@@ -15,6 +16,12 @@ pub struct InputState {
     // When you release W, W is removed.
     // Asking "is W in here?" is very fast — O(1) time.
     held: HashSet<KeyCode>,
+    gamepad_enabled: bool,
+    deadzone: f32,
+    left_x: f32,
+    left_y: f32,
+    south_pressed: bool,
+    gilrs: Option<Gilrs>,
 }
 
 // "impl InputState" means: here are the functions that belong to InputState.
@@ -24,11 +31,23 @@ impl InputState {
     // "-> Self" means it returns an InputState (Self = the type we're implementing).
     // This is the constructor pattern in Rust.
     pub fn new() -> Self {
+        let gilrs = Gilrs::new().ok();
         Self {
             // HashSet::new() creates an empty set.
             // Nothing is held down at startup.
             held: HashSet::new(),
+            gamepad_enabled: true,
+            deadzone: 0.2,
+            left_x: 0.0,
+            left_y: 0.0,
+            south_pressed: false,
+            gilrs,
         }
+    }
+
+    pub fn configure_gamepad(&mut self, enabled: bool, deadzone: f32) {
+        self.gamepad_enabled = enabled;
+        self.deadzone = deadzone.clamp(0.0, 0.95);
     }
 
     // Call this when the OS tells you a key was pressed.
@@ -58,5 +77,52 @@ impl InputState {
         // contains() checks if the key is in the set.
         // Returns true or false.
         self.held.contains(&key)
+    }
+
+    pub fn update_gamepads(&mut self) {
+        if !self.gamepad_enabled {
+            return;
+        }
+        if let Some(g) = &mut self.gilrs {
+            while let Some(ev) = g.next_event() {
+                match ev.event {
+                    EventType::AxisChanged(Axis::LeftStickX, val, _) => self.left_x = val,
+                    EventType::AxisChanged(Axis::LeftStickY, val, _) => self.left_y = val,
+                    EventType::ButtonPressed(Button::South, _) => self.south_pressed = true,
+                    EventType::ButtonReleased(Button::South, _) => self.south_pressed = false,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn is_virtual_key_held(&self, key: &str) -> bool {
+        let stick_left = self.left_x < -self.deadzone;
+        let stick_right = self.left_x > self.deadzone;
+        let stick_up = self.left_y > self.deadzone;
+        let stick_down = self.left_y < -self.deadzone;
+
+        match key {
+            "W" | "ArrowUp" => {
+                self.is_held(KeyCode::KeyW) || self.is_held(KeyCode::ArrowUp) || stick_up
+            }
+            "S" | "ArrowDown" => {
+                self.is_held(KeyCode::KeyS) || self.is_held(KeyCode::ArrowDown) || stick_down
+            }
+            "A" | "ArrowLeft" => {
+                self.is_held(KeyCode::KeyA) || self.is_held(KeyCode::ArrowLeft) || stick_left
+            }
+            "D" | "ArrowRight" => {
+                self.is_held(KeyCode::KeyD) || self.is_held(KeyCode::ArrowRight) || stick_right
+            }
+            "Space" => self.is_held(KeyCode::Space) || self.south_pressed,
+            "Shift" => self.is_held(KeyCode::ShiftLeft) || self.is_held(KeyCode::ShiftRight),
+            "Ctrl" => self.is_held(KeyCode::ControlLeft) || self.is_held(KeyCode::ControlRight),
+            "E" => self.is_held(KeyCode::KeyE),
+            "Q" => self.is_held(KeyCode::KeyQ),
+            "R" => self.is_held(KeyCode::KeyR),
+            "F" => self.is_held(KeyCode::KeyF),
+            _ => false,
+        }
     }
 }

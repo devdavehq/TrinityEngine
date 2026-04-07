@@ -7,6 +7,7 @@ use glam::{Mat4, Vec3};
 // Camera2D represents a 2D camera looking down at a flat world.
 // It has a position in the world and a zoom level.
 // "2D" means we use orthographic projection — no perspective distortion.
+#[allow(dead_code)]
 pub struct Camera2D {
     // Where the camera is in world space.
     // Moving this pans the view.
@@ -23,6 +24,7 @@ pub struct Camera2D {
     pub aspect: f32,
 }
 
+#[allow(dead_code)]
 impl Camera2D {
     // Create a new camera at the world origin, not zoomed.
     // aspect: pass window_width / window_height when creating.

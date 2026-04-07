@@ -6,12 +6,20 @@ use std::marker::PhantomData;
 // Handle<T> — a typed ID pointing to an asset in a store.
 // Copy + Clone: cheap to duplicate, just a number.
 // PartialEq + Eq + Hash: allows using handles as HashMap keys.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Handle<T> {
     pub id: u32,
     // PhantomData makes Handle<Mesh> and Handle<Texture> distinct types
     // without storing any T data. Zero cost at runtime.
     _marker: PhantomData<T>,
+}
+
+impl<T> Copy for Handle<T> {}
+
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 // AssetStore<T> — a registry of assets indexed by Handle.
@@ -39,6 +47,7 @@ impl<T> AssetStore<T> {
     }
 
     // get_mut() for assets that need updating (textures, reloaded meshes).
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, handle: &Handle<T>) -> Option<&mut T> {
         self.assets.get_mut(&handle.id)
     }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // src/renderer/light_probes.rs
 
 use glam::Vec3;
@@ -65,7 +67,7 @@ impl LightProbeGrid {
         // Step 1: Find the N nearest probes within range.
         // "Within range" = position is inside the probe's radius.
         // We collect at most 8 candidates for the blend.
-        let mut candidates: Vec<(usize, f32)> = self.probes
+        let candidates: Vec<(usize, f32)> = self.probes
             .iter()
             .enumerate()
             .filter_map(|(i, probe)| {

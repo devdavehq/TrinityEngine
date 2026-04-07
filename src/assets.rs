@@ -1,12 +1,12 @@
 pub mod mesh;
+pub mod streaming;
 pub mod store;
 
 // Re-export the most commonly used types so callers write
 // "use crate::assets::Mesh" instead of "crate::assets::mesh::Mesh"
 pub use mesh::Mesh;
+pub use streaming::MeshStreamingQueue;
 pub use store::{AssetStore, Handle};
-use std::collections::HashMap;
-use std::marker::PhantomData;
 
 // Handle<T> is a typed ID — just a number that refers to an asset.
 //

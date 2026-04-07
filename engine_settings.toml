@@ -1,0 +1,73 @@
+[render]
+# Render preset:
+# - "Mobile"    = fastest, low-end laptops.
+# - "Balanced"  = good quality/performance mix (recommended).
+# - "Cinematic" = highest quality, heavy.
+# - "Custom"    = uses the values below exactly.
+preset = "Balanced"
+
+# Shadows: main sunlight shadow maps.
+# Turn off for large FPS gain.
+shadows_enabled = true
+# PCF smooths shadow edges.
+pcf_enabled = true
+# PCSS gives softer contact shadows (heavier).
+pcss_enabled = false
+# IBL = environment lighting/reflections.
+ibl_enabled = true
+# Probe lighting cache (more realistic ambient, moderate cost).
+probes_enabled = false
+# Legacy volumetric toggle (kept for compatibility).
+volumetric_enabled = false
+# Shadow map texture size. Higher = sharper shadows + more GPU cost.
+shadow_resolution = 1024
+# PCF sample count. Higher = softer shadows + more GPU cost.
+pcf_samples = 4
+
+# Distance + frustum culling skip objects camera can't see.
+culling_enabled = true
+culling_distance = 80.0
+frustum_culling_enabled = true
+
+# Bloom: glowy highlights around bright areas.
+bloom_enabled = false
+bloom_strength = 0.15
+# SSAO: darkens tight corners to improve depth perception.
+ssao_enabled = false
+ssao_strength = 0.35
+# Volumetric fog: light/fog depth in atmosphere (expensive).
+volumetric_fog_enabled = false
+fog_density = 0.03
+# Voxel GI prototype: stylized bounced light estimate.
+voxel_gi_enabled = false
+voxel_gi_strength = 0.20
+sun_azimuth_deg = 35.0
+sun_elevation_deg = 42.0
+sun_intensity = 1.0
+
+[input]
+gamepad_enabled = true
+left_stick_deadzone = 0.2
+
+[runtime]
+# Multi-thread job system. Enable on stronger CPUs.
+multithreading_enabled = false
+# 0 = automatic thread count.
+worker_threads = 0
+# Profiler logs average timings to console.
+profiler_enabled = true
+profiler_log_interval_frames = 120
+# Background mesh loading/streaming.
+asset_streaming_enabled = true
+# Wind animation for foliage/trees.
+foliage_wind_enabled = true
+# Update wind every N frames (2 = half-rate, cheaper CPU).
+foliage_wind_update_divisor = 2
+# Frame cap to reduce CPU usage when editor is open.
+max_fps = 60
+# Script watcher for hot-reload in Content/Scripts.
+script_hot_reload_enabled = true
+# External editor command template, e.g. 'code -r "{file}"' or 'notepad "{file}"'
+preferred_script_editor = ""
+# Watch Content/ for .obj/.png/.jpg changes and hot-reload assets.
+asset_hot_reload_enabled = true

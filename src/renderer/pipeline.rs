@@ -192,6 +192,7 @@ pub fn create_pipeline(
 // create_shadow_pipeline() — vertex-only pipeline for depth-only shadow pass.
 // Uses the same vertex layout but no fragment shader and front-face culling
 // (the standard trick to eliminate shadow acne without large depth bias).
+#[allow(dead_code)]
 pub fn create_shadow_pipeline(
     device:     &Device,
     shader:     &wgpu::ShaderModule,

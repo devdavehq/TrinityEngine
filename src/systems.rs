@@ -11,13 +11,13 @@ use crate::scripting::ScriptEngine;
 // Why pass ScriptEngine by reference?
 // ScriptEngine owns the Lua runtime. We borrow it to call scripts.
 // We don't want the system to own it — main.rs should own it.
-pub fn scripting_system(world: &mut World, scripts: &ScriptEngine, input: &InputState, dt: f32) {
+pub fn scripting_system(world: &mut World, scripts: &mut ScriptEngine, input: &InputState, dt: f32) {
     // We can't query and mutate world at the same time with hecs,
     // so we collect the (entity, path) pairs first, then run scripts.
     // Why: run_update() needs &mut World, but the query already borrows it.
     // Collecting into a Vec ends the borrow before we call run_update().
     let script_entities: Vec<(hecs::Entity, String)> = world
-        .query::<&Script>()
+        .query::<(hecs::Entity, &Script)>()
         .iter()
         .map(|(entity, script)| (entity, script.path.clone()))
         .collect();
@@ -28,14 +28,15 @@ pub fn scripting_system(world: &mut World, scripts: &ScriptEngine, input: &Input
         // Why load here? For simplicity — later we'll cache loaded scripts.
         // If the script fails, we print the error and continue.
         // A scripting error should never crash the engine.
-        if let Err(e) = scripts.run_update(world, input, entity, dt) {
+        if let Err(e) = scripts.run_update(world, input, entity, &path, dt) {
             eprintln!("[Scripting] Error in {}: {}", path, e);
         }
     }
 }
 
+#[allow(dead_code)]
 pub fn movement_system(world: &mut World) {
-    for (_entity, (pos, vel)) in world.query_mut::<(&mut Position, &Velocity)>().iter() {
+    for (pos, vel) in world.query_mut::<(&mut Position, &Velocity)>() {
         pos.x += vel.dx;
         pos.y += vel.dy;
     }
@@ -54,6 +55,7 @@ pub fn movement_system(world: &mut World) {
 //   target        — which entity to follow (the player's entity ID)
 //   follow_speed  — how quickly the camera catches up, 0.0–1.0
 //                   0.1 = slow/floaty, 0.3 = snappy, 1.0 = instant snap
+#[allow(dead_code)]
 pub fn camera_follow_system(
     camera: &mut Camera2D,
     world: &World,
