@@ -17,6 +17,7 @@ mod animation;
 mod camera;
 mod components;
 mod editor;
+mod editor_assets;
 mod editor_ui;
 mod input;
 mod jobs;
@@ -66,6 +67,13 @@ const CONTENT_SCRIPTS_DIR: &str = "Content/Scripts";
 const CONTENT_MESHES_DIR: &str = "Content/Meshes";
 const CONTENT_TEXTURES_DIR: &str = "Content/Textures";
 const APP_ICON_PATH: &str = "assets/trinity_icon.png";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppStage {
+    ProjectHub,
+    EditorLoading,
+    EditorReady,
+}
 
 // ── GameApp ───────────────────────────────────────────────────────────────────
 // Owns all engine state. Created before the event loop starts.
@@ -120,6 +128,8 @@ struct GameApp {
     last_cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
     camera_yaw: f32,
     camera_pitch: f32,
+    app_stage: AppStage,
+    project_stage_started_at: std::time::Instant,
 }
 
 impl GameApp {
@@ -196,6 +206,8 @@ impl GameApp {
             last_cursor_pos: None,
             camera_yaw,
             camera_pitch,
+            app_stage: AppStage::ProjectHub,
+            project_stage_started_at: std::time::Instant::now(),
         }
     }
 
@@ -257,7 +269,7 @@ impl GameApp {
         };
         if let Ok(mut rend) = self.world.get::<&mut components::Renderable>(entity) {
             match self.materials.apply_instance(name, &mut rend) {
- git               Ok(_) => println!("[Materials] Applied '{}' to {:?}", name, entity),
+                Ok(_) => println!("[Materials] Applied '{}' to {:?}", name, entity),
                 Err(e) => eprintln!("[Materials] {}", e),
             }
         } else {
@@ -521,6 +533,8 @@ impl ApplicationHandler for GameApp {
         if let (Some(window_ref), Some(renderer_ref)) = (self.window.as_ref(), self.renderer.as_ref()) {
             self.editor_ui = Some(EditorUi::new(window_ref, renderer_ref));
         }
+        self.app_stage = AppStage::ProjectHub;
+        self.project_stage_started_at = std::time::Instant::now();
     }
 
     fn window_event(
@@ -909,6 +923,46 @@ impl ApplicationHandler for GameApp {
                 let render_start = std::time::Instant::now();
                 let mut draw_stats = renderer::DrawStats::default();
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                    if self.app_stage == AppStage::ProjectHub {
+                        if let Some(ui) = self.editor_ui.as_mut() {
+                            let elapsed = self.project_stage_started_at.elapsed().as_secs_f32();
+                            if ui.begin_project_hub(window, elapsed) {
+                                self.app_stage = AppStage::EditorLoading;
+                                self.project_stage_started_at = std::time::Instant::now();
+                            }
+                        }
+                        let mut draw_ui = |device: &wgpu::Device,
+                                           queue: &wgpu::Queue,
+                                           encoder: &mut wgpu::CommandEncoder,
+                                           view: &wgpu::TextureView| {
+                            if let Some(ui) = self.editor_ui.as_mut() {
+                                ui.paint_on(device, queue, encoder, view);
+                            }
+                        };
+                        draw_stats = renderer.draw_world(
+                            &self.world,
+                            &self.meshes,
+                            &self.camera,
+                            &self.jobs,
+                            Some(&mut draw_ui),
+                        );
+                        let render_time = render_start.elapsed();
+                        self.profiler.record(
+                            frame_start.elapsed(),
+                            script_time,
+                            physics_time,
+                            render_time,
+                            asset_time,
+                            draw_stats,
+                            self.jobs.enabled(),
+                        );
+                        return;
+                    }
+                    if self.app_stage == AppStage::EditorLoading
+                        && self.project_stage_started_at.elapsed().as_millis() > 250
+                    {
+                        self.app_stage = AppStage::EditorReady;
+                    }
                     if let Some(ui) = self.editor_ui.as_mut() {
                         let mut frame_args = UiFrameArgs {
                             world: &mut self.world,
@@ -937,7 +991,11 @@ impl ApplicationHandler for GameApp {
                             preferred_script_editor: &mut self.preferred_script_editor,
                             asset_hot_reload_enabled: &mut self.asset_hot_reload_enabled,
                         };
-                        ui.begin_and_build(window, &mut frame_args);
+                        if self.app_stage == AppStage::EditorLoading {
+                            ui.begin_editor_loading(window, self.project_stage_started_at.elapsed().as_secs_f32());
+                        } else {
+                            ui.begin_and_build(window, &mut frame_args);
+                        }
                     }
 
                     let mut draw_ui = |device: &wgpu::Device,

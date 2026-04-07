@@ -25,6 +25,7 @@ rayon = "1"
 egui = "0.34.1"
 egui-wgpu = "0.34.1"
 egui-winit = "0.34.1"
+egui_dock = "0.19.1"
 
 
 [lib]

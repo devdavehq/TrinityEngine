@@ -1,8 +1,13 @@
 #![allow(deprecated)]
 
 use std::fs;
+use std::collections::HashMap;
+
+#[path = "editor_ui/panels/mod.rs"]
+mod panels;
 
 use crate::editor;
+use crate::editor_assets::{AssetMetadataDb, IconRegistry};
 use crate::materials::MaterialLibrary;
 use crate::profiler::FrameProfiler;
 use crate::renderer::Renderer;
@@ -13,6 +18,7 @@ use crate::scripting::ScriptEngine;
 use crate::camera::Camera;
 use crate::{assets, components};
 use egui::{Color32, RichText};
+use egui_dock::{DockArea, DockState, NodeIndex, Style as DockStyle, TabViewer};
 use hecs::World;
 use winit::window::Window;
 
@@ -33,7 +39,7 @@ struct UiWidgetSpec {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GizmoMode {
+pub(crate) enum GizmoMode {
     Move,
     Rotate,
     Scale,
@@ -47,12 +53,29 @@ enum GizmoAxis {
 }
 
 #[derive(Clone, Copy)]
-struct GizmoDragState {
+pub(crate) struct GizmoDragState {
     axis: GizmoAxis,
     pointer_start: egui::Pos2,
     pos_start: [f32; 3],
     rot_start: [f32; 3],
     scale_start: [f32; 3],
+    axis_dir_screen: egui::Vec2,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GizmoSpace {
+    Local,
+    World,
+}
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum EditorDockTab {
+    Viewport,
+    Outliner,
+    Details,
+    ContentBrowser,
+    Profiler,
+    Console,
 }
 
 pub struct EditorUi {
@@ -80,6 +103,21 @@ pub struct EditorUi {
     show_project_launcher: bool,
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDragState>,
+    gizmo_space: GizmoSpace,
+    snap_translate: f32,
+    snap_rotate_deg: f32,
+    snap_scale: f32,
+    snap_enabled: bool,
+    texture_thumbnail_cache: HashMap<String, egui::TextureHandle>,
+    mesh_thumbnail_color_cache: HashMap<String, Color32>,
+    scene_texture_id: Option<egui::TextureId>,
+    asset_db: AssetMetadataDb,
+    icon_registry: IconRegistry,
+    dock_state: DockState<EditorDockTab>,
+    workspace_preset: String,
+    asset_search: String,
+    asset_kind_filter: String,
+    asset_sort_desc: bool,
 }
 
 struct PreparedUi {
@@ -132,6 +170,16 @@ impl EditorUi {
             renderer.surface_format(),
             egui_wgpu::RendererOptions::default(),
         );
+        let mut dock_state = DockState::new(vec![EditorDockTab::Viewport]);
+        let [main, left] = dock_state
+            .main_surface_mut()
+            .split_left(NodeIndex::root(), 0.20, vec![EditorDockTab::Outliner]);
+        let [_main, _right] = dock_state
+            .main_surface_mut()
+            .split_right(main, 0.26, vec![EditorDockTab::Details]);
+        dock_state
+            .main_surface_mut()
+            .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler]);
         Self {
             visible: true,
             egui_ctx,
@@ -160,7 +208,104 @@ impl EditorUi {
             show_project_launcher: true,
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
+            gizmo_space: GizmoSpace::World,
+            snap_translate: 0.25,
+            snap_rotate_deg: 5.0,
+            snap_scale: 0.1,
+            snap_enabled: true,
+            texture_thumbnail_cache: HashMap::new(),
+            mesh_thumbnail_color_cache: HashMap::new(),
+            scene_texture_id: None,
+            asset_db: AssetMetadataDb::default(),
+            icon_registry: IconRegistry::default(),
+            dock_state,
+            workspace_preset: "Default".to_string(),
+            asset_search: String::new(),
+            asset_kind_filter: "all".to_string(),
+            asset_sort_desc: true,
         }
+    }
+
+    pub fn begin_project_hub(&mut self, window: &Window, elapsed: f32) -> bool {
+        self.apply_theme();
+        let mut open_editor = false;
+        let raw_input = self.egui_state.take_egui_input(window);
+        let output = self.egui_ctx.run_ui(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(10, 10, 12));
+                draw_triangle_logo(ui.painter(), rect.center_top() + egui::vec2(0.0, 120.0), 95.0);
+                ui.add_space(220.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading(RichText::new("TrinityEngine Project Hub").color(Color32::from_rgb(214, 216, 220)));
+                    ui.label(RichText::new("Matte black + silver creator dashboard").color(Color32::from_rgb(160, 165, 174)));
+                    ui.add_space(12.0);
+                    if ui.button("Open Current Project").clicked() {
+                        open_editor = true;
+                    }
+                    if ui.button("Open Project Folder").clicked() {
+                        let _ = open_external_editor("explorer \"{file}\"", ".");
+                    }
+                    if ui.button("Create Project In Documents").clicked() {
+                        if let Some(home) = std::env::var_os("USERPROFILE") {
+                            let p = std::path::PathBuf::from(home).join("Documents").join("TrinityProject");
+                            let _ = std::fs::create_dir_all(p.join("Content"));
+                            let _ = std::fs::create_dir_all(p.join("scenes"));
+                            let _ = std::fs::create_dir_all(p.join(".trinity/cache/thumbnails"));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.label(format!("Session uptime {:.1}s", elapsed));
+                });
+            });
+        });
+        self.egui_state
+            .handle_platform_output(window, output.platform_output);
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(output.shapes, output.pixels_per_point);
+        let size = window.inner_size();
+        self.pending = Some(PreparedUi {
+            paint_jobs,
+            textures_delta: output.textures_delta,
+            screen_desc: egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [size.width, size.height],
+                pixels_per_point: output.pixels_per_point,
+            },
+        });
+        open_editor
+    }
+
+    pub fn begin_editor_loading(&mut self, window: &Window, elapsed: f32) {
+        self.apply_theme();
+        let raw_input = self.egui_state.take_egui_input(window);
+        let output = self.egui_ctx.run_ui(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(8, 8, 10));
+                ui.vertical_centered(|ui| {
+                    ui.add_space(rect.height() * 0.42);
+                    ui.heading("Loading Trinity Editor...");
+                    ui.add(
+                        egui::ProgressBar::new((elapsed / 0.25).clamp(0.0, 1.0))
+                            .desired_width(300.0)
+                            .show_percentage(),
+                    );
+                });
+            });
+        });
+        self.egui_state
+            .handle_platform_output(window, output.platform_output);
+        let paint_jobs = self.egui_ctx.tessellate(output.shapes, output.pixels_per_point);
+        let size = window.inner_size();
+        self.pending = Some(PreparedUi {
+            paint_jobs,
+            textures_delta: output.textures_delta,
+            screen_desc: egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [size.width, size.height],
+                pixels_per_point: output.pixels_per_point,
+            },
+        });
     }
 
     pub fn push_toast(&mut self, message: String, now_seconds: f32) {
@@ -179,6 +324,23 @@ impl EditorUi {
         }
 
         self.apply_theme();
+        self.asset_db.scan_content_root("Content");
+        self.icon_registry.load_from_dir("assets/icons");
+        if let Some(tex_id) = self.scene_texture_id {
+            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                &args.renderer.device,
+                args.renderer.scene_color_view(),
+                wgpu::FilterMode::Linear,
+                tex_id,
+            );
+        } else {
+            let id = self.egui_renderer.register_native_texture(
+                &args.renderer.device,
+                args.renderer.scene_color_view(),
+                wgpu::FilterMode::Linear,
+            );
+            self.scene_texture_id = Some(id);
+        }
         let raw_input = self.egui_state.take_egui_input(window);
         let output = self.egui_ctx.run_ui(raw_input, |ctx| {
             build_ui(
@@ -203,6 +365,21 @@ impl EditorUi {
                 &mut self.show_project_launcher,
                 &mut self.gizmo_mode,
                 &mut self.gizmo_drag,
+                &mut self.gizmo_space,
+                &mut self.snap_enabled,
+                &mut self.snap_translate,
+                &mut self.snap_rotate_deg,
+                &mut self.snap_scale,
+                &mut self.texture_thumbnail_cache,
+                &mut self.mesh_thumbnail_color_cache,
+                self.scene_texture_id,
+                &self.asset_db,
+                &self.icon_registry,
+                &mut self.dock_state,
+                &mut self.workspace_preset,
+                &mut self.asset_search,
+                &mut self.asset_kind_filter,
+                &mut self.asset_sort_desc,
             );
         });
         self.egui_state
@@ -273,15 +450,15 @@ impl EditorUi {
     fn apply_theme(&self) {
         let mut style = (*self.egui_ctx.global_style()).clone();
         style.visuals = egui::Visuals::dark();
-        style.visuals.window_fill = Color32::from_rgb(18, 18, 22);
-        style.visuals.panel_fill = Color32::from_rgb(20, 20, 24);
-        style.visuals.faint_bg_color = Color32::from_rgb(26, 26, 32);
-        style.visuals.extreme_bg_color = Color32::from_rgb(10, 10, 14);
-        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 24, 28);
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 32, 38);
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(64, 64, 70);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(94, 94, 100);
-        style.visuals.selection.bg_fill = Color32::from_rgb(170, 170, 176);
+        style.visuals.window_fill = Color32::from_rgb(14, 14, 16);
+        style.visuals.panel_fill = Color32::from_rgb(17, 17, 20);
+        style.visuals.faint_bg_color = Color32::from_rgb(24, 24, 28);
+        style.visuals.extreme_bg_color = Color32::from_rgb(8, 8, 10);
+        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 22, 26);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 30, 35);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(52, 52, 58);
+        style.visuals.widgets.active.bg_fill = Color32::from_rgb(112, 112, 120);
+        style.visuals.selection.bg_fill = Color32::from_rgb(174, 174, 182);
         self.egui_ctx.set_global_style(style);
     }
 }
@@ -308,33 +485,22 @@ fn build_ui(
     show_project_launcher: &mut bool,
     gizmo_mode: &mut GizmoMode,
     gizmo_drag: &mut Option<GizmoDragState>,
+    gizmo_space: &mut GizmoSpace,
+    snap_enabled: &mut bool,
+    snap_translate: &mut f32,
+    snap_rotate_deg: &mut f32,
+    snap_scale: &mut f32,
+    texture_thumbnail_cache: &mut HashMap<String, egui::TextureHandle>,
+    mesh_thumbnail_color_cache: &mut HashMap<String, Color32>,
+    scene_texture_id: Option<egui::TextureId>,
+    asset_db: &AssetMetadataDb,
+    icon_registry: &IconRegistry,
+    dock_state: &mut DockState<EditorDockTab>,
+    workspace_preset: &mut String,
+    asset_search: &mut String,
+    asset_kind_filter: &mut String,
+    asset_sort_desc: &mut bool,
 ) {
-    if args.app_time_seconds < 2.2 {
-        egui::Area::new("startup_splash".into())
-            .fixed_pos([0.0, 0.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(4, 6, 10));
-                let center = rect.center();
-                draw_triangle_logo(ui.painter(), center + egui::vec2(0.0, -40.0), 120.0);
-                ui.painter().text(
-                    center + egui::vec2(0.0, 90.0),
-                    egui::Align2::CENTER_CENTER,
-                    "TRINITY",
-                    egui::FontId::proportional(42.0),
-                    Color32::from_rgb(220, 224, 230),
-                );
-                ui.painter().text(
-                    center + egui::vec2(0.0, 130.0),
-                    egui::Align2::CENTER_CENTER,
-                    "STUDIOS",
-                    egui::FontId::proportional(20.0),
-                    Color32::from_rgb(170, 176, 186),
-                );
-            });
-        return;
-    }
     ctx.input(|i| {
         if i.key_pressed(egui::Key::W) {
             *gizmo_mode = GizmoMode::Move;
@@ -382,6 +548,12 @@ fn build_ui(
             ui.selectable_value(gizmo_mode, GizmoMode::Move, "W Move");
             ui.selectable_value(gizmo_mode, GizmoMode::Rotate, "E Rotate");
             ui.selectable_value(gizmo_mode, GizmoMode::Scale, "R Scale");
+            ui.selectable_value(gizmo_space, GizmoSpace::World, "World");
+            ui.selectable_value(gizmo_space, GizmoSpace::Local, "Local");
+            ui.checkbox(snap_enabled, "Snap");
+            ui.add(egui::DragValue::new(snap_translate).prefix("T ").speed(0.05).range(0.01..=5.0));
+            ui.add(egui::DragValue::new(snap_rotate_deg).prefix("R ").speed(0.2).range(1.0..=45.0));
+            ui.add(egui::DragValue::new(snap_scale).prefix("S ").speed(0.01).range(0.01..=1.0));
             if ui.button("Project Launcher").clicked() {
                 *show_project_launcher = true;
             }
@@ -391,8 +563,154 @@ fn build_ui(
                 *undock_asset_browser = false;
                 *undock_viewport = false;
             }
+            if ui.button("Save Layout").clicked() {
+                save_dock_layout(dock_state, workspace_preset);
+            }
+            if ui.button("Load Layout").clicked() {
+                if let Some(loaded_preset) = load_dock_layout(workspace_preset) {
+                    *workspace_preset = loaded_preset;
+                    apply_workspace_preset(dock_state, workspace_preset);
+                }
+            }
+            ui.separator();
+            ui.label(format!("Assets: {}", asset_db.entries.len()));
+            ui.label(format!("Icons: {}", icon_registry.icons.len()));
+            ui.separator();
+            ui.label("Workspace");
+            if ui.selectable_label(*workspace_preset == "Default", "Default").clicked() {
+                *workspace_preset = "Default".to_string();
+                apply_workspace_preset(dock_state, workspace_preset);
+            }
+            if ui.selectable_label(*workspace_preset == "Level Design", "Level Design").clicked() {
+                *workspace_preset = "Level Design".to_string();
+                apply_workspace_preset(dock_state, workspace_preset);
+            }
+            if ui.selectable_label(*workspace_preset == "Scripting", "Scripting").clicked() {
+                *workspace_preset = "Scripting".to_string();
+                apply_workspace_preset(dock_state, workspace_preset);
+            }
         });
     });
+
+    struct Viewer<'a, 'b> {
+        args: &'a mut UiFrameArgs<'b>,
+        texture_dragging: &'a mut Option<String>,
+        texture_selected: &'a mut Option<String>,
+        mesh_selected: &'a mut Option<String>,
+        content_new_folder: &'a mut String,
+        content_new_file: &'a mut String,
+        gizmo_mode: &'a mut GizmoMode,
+        gizmo_drag: &'a mut Option<GizmoDragState>,
+        gizmo_space: GizmoSpace,
+        snap_enabled: bool,
+        snap_translate: f32,
+        snap_rotate_deg: f32,
+        snap_scale: f32,
+        scene_texture_id: Option<egui::TextureId>,
+        asset_db: &'a AssetMetadataDb,
+        asset_search: &'a mut String,
+        asset_kind_filter: &'a mut String,
+        asset_sort_desc: &'a mut bool,
+        texture_thumbnail_cache: &'a mut HashMap<String, egui::TextureHandle>,
+        egui_ctx: &'a egui::Context,
+    }
+    impl<'a, 'b> TabViewer for Viewer<'a, 'b> {
+        type Tab = EditorDockTab;
+        fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+            match tab {
+                EditorDockTab::Viewport => "Viewport".into(),
+                EditorDockTab::Outliner => "Outliner".into(),
+                EditorDockTab::Details => "Details".into(),
+                EditorDockTab::ContentBrowser => "Content Browser".into(),
+                EditorDockTab::Profiler => "Profiler".into(),
+                EditorDockTab::Console => "Console".into(),
+            }
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+            match tab {
+                EditorDockTab::Viewport => {
+                    panels::render_viewport_panel(
+                        ui,
+                        self.args,
+                        self.scene_texture_id,
+                        self.gizmo_mode,
+                        self.gizmo_drag,
+                        self.gizmo_space,
+                        self.snap_enabled,
+                        self.snap_translate,
+                        self.snap_rotate_deg,
+                        self.snap_scale,
+                    );
+                }
+                EditorDockTab::Outliner => {
+                    panels::render_outliner_panel(ui, self.args);
+                }
+                EditorDockTab::Details => {
+                    panels::render_details_panel(ui, self.args);
+                }
+                EditorDockTab::ContentBrowser => {
+                    panels::render_content_browser_panel(
+                        ui,
+                        self.asset_db,
+                        self.asset_search,
+                        self.asset_kind_filter,
+                        self.asset_sort_desc,
+                        self.texture_selected,
+                        self.mesh_selected,
+                        self.texture_dragging,
+                        self.content_new_folder,
+                        self.content_new_file,
+                        self.texture_thumbnail_cache,
+                        self.egui_ctx,
+                    );
+                }
+                EditorDockTab::Profiler => {
+                    if let Some(text) = self.args.profiler.overlay_text() {
+                        ui.label(text);
+                    }
+                }
+                EditorDockTab::Console => {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for line in self.args.error_log.iter().rev().take(200) {
+                            ui.monospace(line);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    let use_legacy_panels = std::env::var("TRINITY_LEGACY_UI").is_ok();
+    if !use_legacy_panels {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mut viewer = Viewer {
+                args,
+                texture_dragging,
+                texture_selected,
+                mesh_selected,
+                content_new_folder,
+                content_new_file,
+                gizmo_mode,
+                gizmo_drag,
+                gizmo_space: *gizmo_space,
+                snap_enabled: *snap_enabled,
+                snap_translate: *snap_translate,
+                snap_rotate_deg: *snap_rotate_deg,
+                snap_scale: *snap_scale,
+                scene_texture_id,
+                asset_db,
+                asset_search,
+                asset_kind_filter,
+                asset_sort_desc,
+                texture_thumbnail_cache,
+                egui_ctx: ctx,
+            };
+            DockArea::new(dock_state)
+                .style(DockStyle::from_egui(ui.style().as_ref()))
+                .show_inside(ui, &mut viewer);
+        });
+        return;
+    }
 
     let mut draw_hierarchy_panel = |ui: &mut egui::Ui| {
         ui.heading("Hierarchy");
@@ -773,34 +1091,44 @@ fn build_ui(
                     }
                 }
                 if let Ok(entries) = fs::read_dir("Content/Textures") {
+                    ui.label("Textures");
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let p = path.to_string_lossy().to_string();
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
                         if ["png", "jpg", "jpeg"].contains(&ext.as_str()) {
                             let selected = texture_selected.as_ref().map(|s| s == &p).unwrap_or(false);
-                            if ui.selectable_label(selected, format!("TEX {}", path.file_name().unwrap_or_default().to_string_lossy())).clicked() {
-                                *texture_selected = Some(p);
+                            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            ui.vertical(|ui| {
+                                if let Some(tex) = texture_thumbnail(ctx, texture_thumbnail_cache, &p) {
+                                    let img = egui::Image::new((tex.id(), egui::vec2(96.0, 54.0))).sense(egui::Sense::click());
+                                    if ui.add(img).clicked() {
+                                        *texture_selected = Some(p.clone());
+                                    }
+                                } else if ui.selectable_label(selected, format!("TEX {}", name)).clicked() {
+                                    *texture_selected = Some(p.clone());
+                                }
+                                if ui.selectable_label(selected, name).clicked() {
+                                    *texture_selected = Some(p.clone());
+                                }
+                            });
                             }
-                        }
                     }
                 }
                 if let Ok(entries) = fs::read_dir("Content/Meshes") {
+                    ui.separator();
+                    ui.label("Meshes");
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let p = path.to_string_lossy().to_string();
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
                         if ext == "obj" {
                             let selected = mesh_selected.as_ref().map(|s| s == &p).unwrap_or(false);
-                            if ui
-                                .selectable_label(
-                                    selected,
-                                    format!("MESH {}", path.file_name().unwrap_or_default().to_string_lossy()),
-                                )
-                                .clicked()
-                            {
+                            let col = mesh_thumb_color(mesh_thumbnail_color_cache, &p);
+                            thumbnail_card(ui, "MESH", &path.file_name().unwrap_or_default().to_string_lossy(), Some(col));
+                            if ui.selectable_label(selected, "Select mesh").clicked() {
                                 *mesh_selected = Some(p);
-                            }
+                            };
                         }
                     }
                 }
@@ -930,6 +1258,14 @@ fn build_ui(
         let desired = egui::vec2(ui.available_width(), (ui.available_height() - 8.0).max(120.0));
         let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
         ui.painter().rect_filled(rect, 6.0, Color32::from_rgb(12, 14, 18));
+        if let Some(texture_id) = scene_texture_id {
+            ui.painter().image(
+                texture_id,
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
         ui.painter().text(
             rect.left_top() + egui::vec2(10.0, 10.0),
             egui::Align2::LEFT_TOP,
@@ -958,7 +1294,20 @@ fn build_ui(
             }
         }
         if let Some(entity) = args.selected_renderable.as_ref().copied() {
-            draw_transform_gizmo(ui, args, entity, rect, response.interact_pointer_pos(), gizmo_mode, gizmo_drag);
+            draw_transform_gizmo(
+                ui,
+                args,
+                entity,
+                rect,
+                response.interact_pointer_pos(),
+                gizmo_mode,
+                gizmo_drag,
+                *gizmo_space,
+                *snap_enabled,
+                *snap_translate,
+                *snap_rotate_deg,
+                *snap_scale,
+            );
         }
     };
     if !*undock_viewport {
@@ -1268,7 +1617,9 @@ fn build_ui(
                         let p = e.path();
                         if p.extension().map(|x| x == "prefab").unwrap_or(false) {
                             ui.horizontal(|ui| {
-                                ui.label(p.file_name().unwrap_or_default().to_string_lossy());
+                                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                let col = mesh_thumb_color(mesh_thumbnail_color_cache, &name);
+                                thumbnail_card(ui, "PREFAB", &name, Some(col));
                                 if ui.button("Spawn").clicked() {
                                     if let Err(err) = spawn_prefab(args, &p.to_string_lossy()) {
                                         args.error_log.push(format!("[Prefab] Spawn error: {}", err));
@@ -1286,6 +1637,67 @@ fn terrain_color_at_cursor(args: &UiFrameArgs<'_>) -> [f32; 3] {
     let world_x = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
     let world_z = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
     args.terrain.auto_surface_color_world(world_x, world_z)
+}
+
+fn dock_layout_path(preset: &str) -> String {
+    let sanitized = preset.to_ascii_lowercase().replace(' ', "_");
+    format!(".trinity/layout_{}.toml", sanitized)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredWorkspacePreset {
+    preset: String,
+}
+
+fn save_dock_layout(_dock_state: &DockState<EditorDockTab>, preset: &str) {
+    let data = StoredWorkspacePreset {
+        preset: preset.to_string(),
+    };
+    if let Ok(s) = toml::to_string(&data) {
+        let _ = fs::create_dir_all(".trinity");
+        let _ = fs::write(dock_layout_path(preset), s);
+    }
+}
+
+fn load_dock_layout(preset: &str) -> Option<String> {
+    let path = dock_layout_path(preset);
+    let s = fs::read_to_string(path).ok()?;
+    toml::from_str::<StoredWorkspacePreset>(&s).ok().map(|d| d.preset)
+}
+
+fn apply_workspace_preset(dock_state: &mut DockState<EditorDockTab>, preset: &str) {
+    match preset {
+        "Level Design" => {
+            *dock_state = DockState::new(vec![EditorDockTab::Viewport]);
+            let [main, _left] = dock_state
+                .main_surface_mut()
+                .split_left(NodeIndex::root(), 0.24, vec![EditorDockTab::Outliner]);
+            dock_state
+                .main_surface_mut()
+                .split_right(main, 0.30, vec![EditorDockTab::Details, EditorDockTab::Profiler]);
+            dock_state
+                .main_surface_mut()
+                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::ContentBrowser]);
+        }
+        "Scripting" => {
+            *dock_state = DockState::new(vec![EditorDockTab::ContentBrowser, EditorDockTab::Console]);
+            dock_state
+                .main_surface_mut()
+                .split_right(NodeIndex::root(), 0.55, vec![EditorDockTab::Viewport]);
+        }
+        _ => {
+            *dock_state = DockState::new(vec![EditorDockTab::Viewport]);
+            let [main, left] = dock_state
+                .main_surface_mut()
+                .split_left(NodeIndex::root(), 0.20, vec![EditorDockTab::Outliner]);
+            let [_m, _r] = dock_state
+                .main_surface_mut()
+                .split_right(main, 0.26, vec![EditorDockTab::Details]);
+            dock_state
+                .main_surface_mut()
+                .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler]);
+        }
+    }
 }
 
 enum IconKind {
@@ -1331,7 +1743,7 @@ fn draw_triangle_logo(p: &egui::Painter, center: egui::Pos2, size: f32) {
     p.line_segment([c, a], egui::Stroke::new(7.0, Color32::from_rgb(224, 228, 236)));
 }
 
-fn pick_entity_in_viewport(
+pub(crate) fn pick_entity_in_viewport(
     world: &World,
     camera: &dyn Camera,
     rect: egui::Rect,
@@ -1394,7 +1806,7 @@ fn nearest_axis_hit(pointer: egui::Pos2, origin: egui::Pos2, x_end: egui::Pos2, 
     }
 }
 
-fn draw_transform_gizmo(
+pub(crate) fn draw_transform_gizmo(
     ui: &mut egui::Ui,
     args: &mut UiFrameArgs<'_>,
     entity: hecs::Entity,
@@ -1402,9 +1814,17 @@ fn draw_transform_gizmo(
     pointer: Option<egui::Pos2>,
     mode: &mut GizmoMode,
     drag: &mut Option<GizmoDragState>,
+    space: GizmoSpace,
+    snap_enabled: bool,
+    snap_translate: f32,
+    snap_rotate_deg: f32,
+    snap_scale: f32,
 ) {
-    let Ok(pos) = args.world.get::<&components::Position>(entity) else { return; };
-    let origin_world = glam::Vec3::new(pos.x, pos.y, pos.z);
+    let (pos_x, pos_y, pos_z) = {
+        let Ok(pos) = args.world.get::<&components::Position>(entity) else { return; };
+        (pos.x, pos.y, pos.z)
+    };
+    let origin_world = glam::Vec3::new(pos_x, pos_y, pos_z);
     let axis_len = 1.0;
     let Some(origin) = project_to_screen(args.camera, rect, origin_world) else { return; };
     let Some(x_end) = project_to_screen(args.camera, rect, origin_world + glam::Vec3::X * axis_len) else { return; };
@@ -1425,10 +1845,16 @@ fn draw_transform_gizmo(
             if let Some(axis) = nearest_axis_hit(ptr, origin, x_end, y_end, z_end) {
                 let rot = args.world.get::<&components::Rotation>(entity).ok();
                 let rend = args.world.get::<&components::Renderable>(entity).ok();
+                let axis_screen = match axis {
+                    GizmoAxis::X => x_end - origin,
+                    GizmoAxis::Y => y_end - origin,
+                    GizmoAxis::Z => z_end - origin,
+                };
+                let axis_dir_screen = axis_screen.normalized();
                 *drag = Some(GizmoDragState {
                     axis,
                     pointer_start: ptr,
-                    pos_start: [pos.x, pos.y, pos.z],
+                    pos_start: [pos_x, pos_y, pos_z],
                     rot_start: [
                         rot.as_ref().map(|r| r.pitch).unwrap_or(0.0),
                         rot.as_ref().map(|r| r.yaw).unwrap_or(0.0),
@@ -1439,26 +1865,50 @@ fn draw_transform_gizmo(
                         rend.as_ref().map(|r| r.scale[1]).unwrap_or(1.0),
                         rend.as_ref().map(|r| r.scale[2]).unwrap_or(1.0),
                     ],
+                    axis_dir_screen,
                 });
             }
         }
         if let Some(d) = *drag {
             if primary_down {
-                let delta_px = (ptr.x - d.pointer_start.x) + (d.pointer_start.y - ptr.y);
+                let pointer_delta = ptr - d.pointer_start;
+                let delta_px = pointer_delta.dot(d.axis_dir_screen);
                 match *mode {
                     GizmoMode::Move => {
                         if let Ok(mut p) = args.world.get::<&mut components::Position>(entity) {
-                            let amt = delta_px * 0.01;
-                            match d.axis {
-                                GizmoAxis::X => p.x = d.pos_start[0] + amt,
-                                GizmoAxis::Y => p.y = d.pos_start[1] + amt,
-                                GizmoAxis::Z => p.z = d.pos_start[2] + amt,
+                            let mut amt = delta_px * 0.012;
+                            if snap_enabled {
+                                amt = (amt / snap_translate).round() * snap_translate;
                             }
+                            let local_axis = match d.axis {
+                                GizmoAxis::X => glam::Vec3::X,
+                                GizmoAxis::Y => glam::Vec3::Y,
+                                GizmoAxis::Z => glam::Vec3::Z,
+                            };
+                            let apply_axis = if matches!(space, GizmoSpace::Local) {
+                                if let Ok(r) = args.world.get::<&components::Rotation>(entity) {
+                                    let q = glam::Quat::from_euler(glam::EulerRot::XYZ, r.pitch, r.yaw, r.roll);
+                                    q * local_axis
+                                } else {
+                                    local_axis
+                                }
+                            } else {
+                                local_axis
+                            };
+                            let base = glam::Vec3::new(d.pos_start[0], d.pos_start[1], d.pos_start[2]);
+                            let result = base + apply_axis * amt;
+                            p.x = result.x;
+                            p.y = result.y;
+                            p.z = result.z;
                         }
                     }
                     GizmoMode::Rotate => {
                         if let Ok(mut r) = args.world.get::<&mut components::Rotation>(entity) {
-                            let amt = delta_px * 0.01;
+                            let mut amt = delta_px * 0.01;
+                            if snap_enabled {
+                                let snap_rad = snap_rotate_deg.to_radians();
+                                amt = (amt / snap_rad).round() * snap_rad;
+                            }
                             match d.axis {
                                 GizmoAxis::X => r.pitch = d.rot_start[0] + amt,
                                 GizmoAxis::Y => r.yaw = d.rot_start[1] + amt,
@@ -1468,7 +1918,10 @@ fn draw_transform_gizmo(
                     }
                     GizmoMode::Scale => {
                         if let Ok(mut r) = args.world.get::<&mut components::Renderable>(entity) {
-                            let amt = (delta_px * 0.01).max(-0.95);
+                            let mut amt = (delta_px * 0.01).max(-0.95);
+                            if snap_enabled {
+                                amt = (amt / snap_scale).round() * snap_scale;
+                            }
                             match d.axis {
                                 GizmoAxis::X => r.scale[0] = (d.scale_start[0] + amt).max(0.05),
                                 GizmoAxis::Y => r.scale[1] = (d.scale_start[1] + amt).max(0.05),
@@ -1583,6 +2036,40 @@ fn thumbnail_card(ui: &mut egui::Ui, kind: &str, name: &str, swatch: Option<Colo
                 ui.label(RichText::new(name).strong());
             });
         });
+}
+
+pub(crate) fn texture_thumbnail<'a>(
+    ctx: &egui::Context,
+    cache: &'a mut HashMap<String, egui::TextureHandle>,
+    path: &str,
+) -> Option<&'a egui::TextureHandle> {
+    if !cache.contains_key(path) {
+        let img = image::open(path).ok()?;
+        let thumb = img.thumbnail(96, 54).to_rgba8();
+        let size = [thumb.width() as usize, thumb.height() as usize];
+        let pixels = thumb.into_raw();
+        let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+        let handle = ctx.load_texture(format!("thumb_{}", path), color, egui::TextureOptions::LINEAR);
+        cache.insert(path.to_string(), handle);
+    }
+    cache.get(path)
+}
+
+fn mesh_thumb_color(cache: &mut HashMap<String, Color32>, path: &str) -> Color32 {
+    if let Some(col) = cache.get(path).copied() {
+        return col;
+    }
+    let mut hash: u32 = 2166136261;
+    for b in path.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let r = 60 + ((hash & 0xFF) as u8 / 3);
+    let g = 60 + (((hash >> 8) & 0xFF) as u8 / 3);
+    let b = 60 + (((hash >> 16) & 0xFF) as u8 / 3);
+    let col = Color32::from_rgb(r, g, b);
+    cache.insert(path.to_string(), col);
+    col
 }
 
 fn spawn_primitive(

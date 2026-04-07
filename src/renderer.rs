@@ -180,6 +180,10 @@ pub struct Renderer {
     default_normal_sampler: wgpu::Sampler,
     default_mr_view: wgpu::TextureView,
     default_mr_sampler: wgpu::Sampler,
+    _shadow_fallback_uniform: wgpu::Buffer,
+    _shadow_fallback_texture: wgpu::Texture,
+    _shadow_fallback_view: wgpu::TextureView,
+    _shadow_fallback_sampler: wgpu::Sampler,
     pub features:  RenderFeatures,
     pub adapter_info: wgpu::AdapterInfo,
 }
@@ -302,6 +306,29 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let shadow_fallback_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Fallback Uniform"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shadow_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Shadow Fallback Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let shadow_fallback_view = shadow_fallback_texture.create_view(&Default::default());
+        let shadow_fallback_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         // Global bind group — camera uniform goes here.
         // IBL textures would be bound here too; we use fallbacks for now.
@@ -322,6 +349,12 @@ impl Renderer {
                 // BRDF LUT (fallback white — lighting will look wrong but won't crash)
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&def_white.0)  },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&linear_sampler)  },
+                // Shadow fallbacks so shader bindings are valid even before full shadow system hookup.
+                wgpu::BindGroupEntry { binding: 7, resource: shadow_fallback_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow_fallback_sampler) },
             ],
         });
 
@@ -426,6 +459,10 @@ impl Renderer {
             default_normal_sampler: def_normal.1.clone(),
             default_mr_view: def_mr.0.clone(),
             default_mr_sampler: def_mr.1.clone(),
+            _shadow_fallback_uniform: shadow_fallback_uniform,
+            _shadow_fallback_texture: shadow_fallback_texture,
+            _shadow_fallback_view: shadow_fallback_view,
+            _shadow_fallback_sampler: shadow_fallback_sampler,
             features,
             adapter_info,
         }
@@ -895,6 +932,10 @@ impl Renderer {
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    pub fn scene_color_view(&self) -> &wgpu::TextureView {
+        &self.scene_view
     }
 
     fn get_or_load_texture(&self, path: &str, srgb: bool) -> Option<(wgpu::TextureView, wgpu::Sampler)> {

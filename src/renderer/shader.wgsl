@@ -293,9 +293,9 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let mr_sample  = textureSample(t_metallic_roughness, s_metallic_roughness, world_uv);
     // Multiply by component values from vertex — allows scene-level override.
     let metallic   = mr_sample.b * in.metallic  + (1.0 - in.metallic)  * mr_sample.b;
-    let roughness  = mr_sample.g * in.roughness + (1.0 - in.roughness) * mr_sample.g;
+    let roughness_raw  = mr_sample.g * in.roughness + (1.0 - in.roughness) * mr_sample.g;
     // Clamp roughness — pure 0.0 causes division by zero in GGX.
-    let roughness  = clamp(roughness, 0.04, 1.0);
+    let roughness  = clamp(roughness_raw, 0.04, 1.0);
 
     let V  = normalize(uniforms.camera_pos - in.world_pos);
     let L  = normalize(uniforms.light_dir);

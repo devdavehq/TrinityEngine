@@ -58,6 +58,23 @@ pub fn create_bind_group_layouts(
         count: None,
     };
 
+    let depth_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let comparison_sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+        count: None,
+    };
+
     // Group 0: camera/lights uniform (binding 0) + 3 IBL texture pairs (1–6).
     let global_bgl = device.create_bind_group_layout(
         &wgpu::BindGroupLayoutDescriptor {
@@ -70,6 +87,11 @@ pub fn create_bind_group_layouts(
                 sampler_entry(4),
                 texture_entry(5), // brdf_lut
                 sampler_entry(6),
+                uniform_entry(7), // ShadowData
+                depth_texture_entry(8), // t_shadow0
+                depth_texture_entry(9), // t_shadow1
+                depth_texture_entry(10), // t_shadow2
+                comparison_sampler_entry(11), // s_shadow
             ],
         },
     );
