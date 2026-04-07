@@ -1,0 +1,25 @@
+[package]
+name = "Triengine"
+version = "0.1.0"
+edition = "2024"   # Always use 2025, it's the modern Rust edition
+
+[dependencies]
+# We'll add libraries here as we need them, one phase at a time
+winit = "0.30.13"     # Creates and manages the OS window
+wgpu = "29.0.1"      # Cross-platform GPU rendering
+notify = "8.2.0"
+mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
+glam = { version = "0.32.1", features = ["bytemuck"] }
+pollster = "0.4.0"
+bytemuck = { version = "1.14", features = ["derive"] }
+env_logger = "0.11"
+log      = "0.4"
+hecs     = "0.11.0"
+# image   = "0.25"   # loads PNG, JPG textures
+# For HDR loading we use image's hdr feature:
+image   = { version = "0.25", features = ["hdr"] }
+
+
+[lib]
+name = "triengine"
+crate-type = ["rlib"]  # "rlib" means reusable library

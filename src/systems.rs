@@ -1,0 +1,81 @@
+use crate::camera::Camera2D;
+use crate::components::{Position, Velocity};
+use hecs::World;
+
+use crate::components::Script;
+use crate::input::InputState;
+use crate::scripting::ScriptEngine;
+
+// scripting_system() runs the Lua update() for every entity with a Script.
+//
+// Why pass ScriptEngine by reference?
+// ScriptEngine owns the Lua runtime. We borrow it to call scripts.
+// We don't want the system to own it — main.rs should own it.
+pub fn scripting_system(world: &mut World, scripts: &ScriptEngine, input: &InputState, dt: f32) {
+    // We can't query and mutate world at the same time with hecs,
+    // so we collect the (entity, path) pairs first, then run scripts.
+    // Why: run_update() needs &mut World, but the query already borrows it.
+    // Collecting into a Vec ends the borrow before we call run_update().
+    let script_entities: Vec<(hecs::Entity, String)> = world
+        .query::<&Script>()
+        .iter()
+        .map(|(entity, script)| (entity, script.path.clone()))
+        .collect();
+
+    // Now run each script — world is free to borrow mutably.
+    for (entity, path) in script_entities {
+        // Load and run the script for this entity.
+        // Why load here? For simplicity — later we'll cache loaded scripts.
+        // If the script fails, we print the error and continue.
+        // A scripting error should never crash the engine.
+        if let Err(e) = scripts.run_update(world, input, entity, dt) {
+            eprintln!("[Scripting] Error in {}: {}", path, e);
+        }
+    }
+}
+
+pub fn movement_system(world: &mut World) {
+    for (_entity, (pos, vel)) in world.query_mut::<(&mut Position, &Velocity)>().iter() {
+        pos.x += vel.dx;
+        pos.y += vel.dy;
+    }
+}
+
+// camera_follow_system makes the camera track an entity smoothly.
+//
+// Why "follow" instead of "snap"?
+// Snapping (setting camera position = entity position every frame) feels rigid.
+// Smooth following (moving the camera a fraction toward the target each frame)
+// feels natural — the camera has a little "lag" that feels good in games.
+//
+// Parameters:
+//   camera        — mutable ref to the camera we want to move
+//   world         — ECS world to query the target entity's position
+//   target        — which entity to follow (the player's entity ID)
+//   follow_speed  — how quickly the camera catches up, 0.0–1.0
+//                   0.1 = slow/floaty, 0.3 = snappy, 1.0 = instant snap
+pub fn camera_follow_system(
+    camera: &mut Camera2D,
+    world: &World,
+    target: hecs::Entity,
+    follow_speed: f32,
+) {
+    // Try to get the Position component of the target entity.
+    // get::<&Position>(target) returns Result — Ok if found, Err if not.
+    // "if let Ok(pos)" means: only run the body if we successfully got it.
+    // If the entity was destroyed (died, despawned), this safely does nothing.
+    if let Ok(pos) = world.get::<&Position>(target) {
+        // Lerp = linear interpolation.
+        // lerp(a, b, t) moves from a toward b by fraction t.
+        // t = follow_speed: 0.1 moves 10% of the remaining distance each frame.
+        // This creates smooth exponential easing — fast at first, slowing as it arrives.
+        //
+        // Why glam::Vec3? Camera position is a Vec3 for future 3D support.
+        // pos.x and pos.y come from the entity's 2D Position component.
+        let target_pos = glam::Vec3::new(pos.x, pos.y, 0.0);
+
+        // Move camera position toward target position.
+        // Vec3::lerp(self, other, t) is a method on glam's Vec3.
+        camera.position = camera.position.lerp(target_pos, follow_speed);
+    }
+}
