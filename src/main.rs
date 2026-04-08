@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 // src/main.rs
 // Engine entry point. Wires all systems together.
 // Uses winit 0.30's ApplicationHandler trait (no old EventLoop::run() closure).
@@ -18,7 +20,9 @@ mod camera;
 mod components;
 mod editor;
 mod editor_assets;
+mod editor_persist;
 mod editor_ui;
+mod project_registry;
 mod input;
 mod jobs;
 mod materials;
@@ -32,8 +36,11 @@ mod scripting;
 mod systems;
 mod terrain;
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::time::Duration;
 
 use assets::{AssetStore, Mesh, MeshStreamingQueue};
 use animation::{animation_system, AnimState, Animator};
@@ -67,9 +74,11 @@ const CONTENT_SCRIPTS_DIR: &str = "Content/Scripts";
 const CONTENT_MESHES_DIR: &str = "Content/Meshes";
 const CONTENT_TEXTURES_DIR: &str = "Content/Textures";
 const APP_ICON_PATH: &str = "assets/trinity_icon.png";
+pub const TRINITY_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppStage {
+    BootSplash,
     ProjectHub,
     EditorLoading,
     EditorReady,
@@ -113,6 +122,7 @@ struct GameApp {
     frame_index: u64,
     sim_paused: bool,
     sim_step_once: bool,
+    script_skip_frames_remaining: u32,
     error_log: Vec<String>,
     nav_grid: NavGrid,
     nav_rebuild_requested: bool,
@@ -128,8 +138,19 @@ struct GameApp {
     last_cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
     camera_yaw: f32,
     camera_pitch: f32,
+    camera_move_velocity: glam::Vec3,
+    nav_speed_scalar: f32,
+    look_sensitivity: f32,
+    orbit_mode: bool,
+    orbit_distance: f32,
     app_stage: AppStage,
     project_stage_started_at: std::time::Instant,
+    request_return_to_hub: bool,
+    available_scene_paths: Vec<String>,
+    scene_list_dirty: bool,
+    requested_scene_switch: Option<String>,
+    stop_asset_watch: Arc<AtomicBool>,
+    stop_scene_watch: Arc<AtomicBool>,
 }
 
 impl GameApp {
@@ -171,7 +192,7 @@ impl GameApp {
             mesh_cache:     HashMap::new(),
             camera,
             scripts:        ScriptEngine::new(),
-            scene_mgr:      SceneManager::new("scenes/main.scene"),
+            scene_mgr:      SceneManager::new(&resolve_primary_scene_path(&settings.runtime.startup_scene_path)),
             settings,
             jobs,
             profiler,
@@ -191,6 +212,7 @@ impl GameApp {
             frame_index:    0,
             sim_paused: false,
             sim_step_once: false,
+            script_skip_frames_remaining: 0,
             error_log: Vec::new(),
             nav_grid: NavGrid::from_terrain(&TerrainGrid::new(64, 64, 1.0), 0.8),
             nav_rebuild_requested: true,
@@ -206,9 +228,57 @@ impl GameApp {
             last_cursor_pos: None,
             camera_yaw,
             camera_pitch,
-            app_stage: AppStage::ProjectHub,
+            camera_move_velocity: glam::Vec3::ZERO,
+            nav_speed_scalar: 6.0,
+            look_sensitivity: 0.0035,
+            orbit_mode: false,
+            orbit_distance: 8.0,
+            app_stage: AppStage::BootSplash,
             project_stage_started_at: std::time::Instant::now(),
+            request_return_to_hub: false,
+            available_scene_paths: Vec::new(),
+            scene_list_dirty: true,
+            requested_scene_switch: None,
+            stop_asset_watch: Arc::new(AtomicBool::new(false)),
+            stop_scene_watch: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn refresh_available_scenes(&mut self) {
+        self.available_scene_paths.clear();
+        if let Ok(rd) = std::fs::read_dir("scenes") {
+            for p in rd.flatten().map(|e| e.path()) {
+                if p.extension().and_then(|x| x.to_str()) == Some("scene") {
+                    self.available_scene_paths
+                        .push(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        self.available_scene_paths.sort();
+        if self.available_scene_paths.is_empty() {
+            self.available_scene_paths.push("scenes/main.scene".to_string());
+        }
+        self.scene_list_dirty = false;
+    }
+
+    fn refresh_available_scenes_if_needed(&mut self) {
+        if self.scene_list_dirty {
+            self.refresh_available_scenes();
+        }
+    }
+
+    fn mark_editor_content_dirty(&mut self) {
+        if let Some(ui) = self.editor_ui.as_mut() {
+            ui.mark_content_dirty();
+        }
+    }
+
+    fn stop_project_watchers(&mut self) {
+        self.script_watcher = None;
+        self.asset_watcher = None;
+        self.scene_watcher = None;
+        self.stop_asset_watch.store(true, Ordering::SeqCst);
+        self.stop_scene_watch.store(true, Ordering::SeqCst);
     }
 
     fn update_camera_target_from_angles(&mut self) {
@@ -224,7 +294,7 @@ impl GameApp {
 
     fn push_error(&mut self, msg: String) {
         self.error_log.push(msg);
-        if self.error_log.len() > 120 {
+        if self.error_log.len() > 500 {
             self.error_log.remove(0);
         }
     }
@@ -298,6 +368,155 @@ impl GameApp {
         }
     }
 
+    fn focus_selected_frame(&mut self) {
+        let Some(entity) = self.selected_renderable else {
+            return;
+        };
+        let Ok(pos) = self.world.get::<&components::Position>(entity) else {
+            return;
+        };
+        let mut radius = 1.5f32;
+        if let Ok(r) = self.world.get::<&components::Renderable>(entity) {
+            radius = r.scale[0]
+                .abs()
+                .max(r.scale[1].abs())
+                .max(r.scale[2].abs())
+                .max(0.6)
+                * 2.6;
+        }
+        let dir = (self.camera.position - glam::Vec3::new(pos.x, pos.y, pos.z)).normalize_or_zero();
+        let fallback = glam::Vec3::new(0.45, 0.25, 0.85).normalize();
+        let d = if dir.length_squared() < 1e-6 { fallback } else { dir };
+        self.camera.target = glam::Vec3::new(pos.x, pos.y, pos.z);
+        self.camera.position = self.camera.target + d * radius;
+        self.orbit_distance = radius;
+        let mut view_dir = (self.camera.target - self.camera.position).normalize_or_zero();
+        if view_dir.length_squared() < 1e-6 {
+            view_dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+        }
+        self.camera_yaw = view_dir.z.atan2(view_dir.x);
+        self.camera_pitch = view_dir.y.asin();
+    }
+
+    fn spawn_scene_watcher(&mut self) {
+        let prev = Arc::clone(&self.stop_scene_watch);
+        prev.store(true, Ordering::SeqCst);
+        self.scene_watcher = None;
+        self.stop_scene_watch = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&self.stop_scene_watch);
+        let (scene_tx, scene_rx) = std::sync::mpsc::channel::<String>();
+        {
+            let tx = scene_tx.clone();
+            std::thread::spawn(move || {
+                use notify::{recommended_watcher, RecursiveMode, Watcher};
+                use std::path::Path;
+                let (ntx, nrx) = std::sync::mpsc::channel();
+                let mut watcher = recommended_watcher(move |res| {
+                    let _ = ntx.send(res);
+                })
+                .expect("Scene watcher failed");
+                watcher.watch(Path::new("scenes"), RecursiveMode::Recursive).ok();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match nrx.recv_timeout(Duration::from_millis(400)) {
+                        Ok(Ok(event)) => {
+                            for path in event.paths {
+                                let s = path.to_string_lossy().to_string();
+                                if s.ends_with(".scene") {
+                                    if tx.send(s).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(_)) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+        }
+        self.scene_watcher = Some(scene_rx);
+    }
+
+    fn switch_to_project(&mut self, project_dir: PathBuf) {
+        if std::env::set_current_dir(&project_dir).is_err() {
+            self.error_log
+                .push(format!("[Hub] Could not open project path {:?}", project_dir));
+            return;
+        }
+        self.scene_mgr.scene_path = resolve_primary_scene_path(&self.settings.runtime.startup_scene_path);
+        self.scene_list_dirty = true;
+        self.refresh_available_scenes_if_needed();
+        self.ensure_content_layout();
+        self.mark_editor_content_dirty();
+        self.mesh_cache.clear();
+        match self.scene_mgr.build(&mut self.world, &mut self.meshes, &mut self.mesh_cache) {
+            Ok(()) => {}
+            Err(e) => {
+                self.error_log.push(format!("[Hub] Scene load failed: {}", e));
+            }
+        }
+        self.nav_grid.rebuild(&self.terrain);
+        self.selected_renderable = None;
+
+        self.scripts = ScriptEngine::new();
+        if self.scripts.register_api().is_ok() {
+            self.scripts
+                .load_script(&format!("{}/player.lua", CONTENT_SCRIPTS_DIR))
+                .ok();
+            self.scripts
+                .load_script(&format!("{}/enemy.lua", CONTENT_SCRIPTS_DIR))
+                .ok();
+        }
+
+        self.stop_project_watchers();
+        if self.script_hot_reload_enabled {
+            self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
+        }
+        if self.asset_hot_reload_enabled {
+            self.start_asset_watcher();
+        }
+        self.spawn_scene_watcher();
+
+        if self.mesh_streaming.enabled() {
+            if let Ok(descs) = scene::parse_scene(&self.scene_mgr.scene_path) {
+                for desc in descs {
+                    let dx = desc.position[0] - self.camera.position.x;
+                    let dy = desc.position[1] - self.camera.position.y;
+                    let dz = desc.position[2] - self.camera.position.z;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+                    let priority = 1.0 / dist;
+                    self.mesh_streaming
+                        .request_mesh_with_priority(&desc.mesh, priority);
+                }
+            }
+        }
+
+        let first_renderable = self
+            .world
+            .query::<(hecs::Entity, &components::Renderable)>()
+            .iter()
+            .next()
+            .map(|(e, _)| e);
+        if let Some(e) = first_renderable {
+            let _ = self.world.insert(
+                e,
+                (Animator {
+                    state: AnimState::Idle,
+                    ..Animator::humanoid_default()
+                },),
+            );
+        }
+
+        println!(
+            "[Hub] Opened project {:?} (scene {})",
+            project_dir, self.scene_mgr.scene_path
+        );
+    }
+
     fn ensure_content_layout(&mut self) {
         let _ = std::fs::create_dir_all(CONTENT_SCRIPTS_DIR);
         let _ = std::fs::create_dir_all(CONTENT_MESHES_DIR);
@@ -343,23 +562,37 @@ impl GameApp {
     }
 
     fn start_asset_watcher(&mut self) {
+        let prev = Arc::clone(&self.stop_asset_watch);
+        prev.store(true, Ordering::SeqCst);
+        self.asset_watcher = None;
+        self.stop_asset_watch = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&self.stop_asset_watch);
         let (asset_tx, asset_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             use notify::{recommended_watcher, RecursiveMode, Watcher};
             use std::path::Path;
             let (ntx, nrx) = std::sync::mpsc::channel();
-            let mut watcher = recommended_watcher(move |res| { let _ = ntx.send(res); })
-                .expect("Asset watcher failed");
+            let mut watcher = recommended_watcher(move |res| {
+                let _ = ntx.send(res);
+            })
+            .expect("Asset watcher failed");
             watcher.watch(Path::new("Content"), RecursiveMode::Recursive).ok();
             loop {
-                match nrx.recv() {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match nrx.recv_timeout(Duration::from_millis(400)) {
                     Ok(Ok(event)) => {
                         for p in event.paths {
                             let s = p.to_string_lossy().to_string();
                             if s.ends_with(".obj")
+                                || s.ends_with(".gltf")
+                                || s.ends_with(".glb")
                                 || s.ends_with(".png")
                                 || s.ends_with(".jpg")
                                 || s.ends_with(".jpeg")
+                                || s.ends_with(".mat")
+                                || s.ends_with(".material")
                             {
                                 if asset_tx.send(s).is_err() {
                                     return;
@@ -367,7 +600,9 @@ impl GameApp {
                             }
                         }
                     }
-                    _ => break,
+                    Ok(Err(_)) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -382,21 +617,55 @@ fn load_window_icon(path: &str) -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+fn resolve_primary_scene_path(preferred: &str) -> String {
+    if !preferred.trim().is_empty() {
+        let pref = std::path::Path::new(preferred.trim());
+        if pref.exists() {
+            return preferred.trim().to_string();
+        }
+    }
+    let main = std::path::Path::new("scenes/main.scene");
+    if main.exists() {
+        return "scenes/main.scene".to_string();
+    }
+    if let Ok(rd) = std::fs::read_dir("scenes") {
+        let mut paths: Vec<std::path::PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("scene"))
+            .collect();
+        paths.sort();
+        if let Some(p) = paths.first() {
+            return p.to_string_lossy().to_string();
+        }
+    }
+    "scenes/main.scene".to_string()
+}
+
 impl ApplicationHandler for GameApp {
     // resumed() fires when the OS tells us we can draw.
     // On desktop this fires once right away. On Android/iOS it may fire multiple times.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create the OS window.
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("TrinityEngine")
-                        .with_window_icon(load_window_icon(APP_ICON_PATH))
-                        .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32)),
-                )
-                .expect("Could not create window"),
-        );
+        let wp = editor_persist::load_window_prefs();
+        let mut win_attrs = Window::default_attributes()
+            .with_title("TrinityEngine")
+            .with_window_icon(load_window_icon(APP_ICON_PATH));
+        win_attrs = if let Some(ref p) = wp {
+            win_attrs.with_inner_size(winit::dpi::PhysicalSize::new(
+                p.width.max(960),
+                p.height.max(540),
+            ))
+        } else {
+            win_attrs.with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32))
+        };
+        if let Some(p) = wp {
+            if let (Some(x), Some(y)) = (p.pos_x, p.pos_y) {
+                win_attrs =
+                    win_attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+        }
+        let window = Arc::new(event_loop.create_window(win_attrs).expect("Could not create window"));
 
         // Update camera aspect ratio now that we know the window size.
         let phys = window.inner_size();
@@ -427,6 +696,18 @@ impl ApplicationHandler for GameApp {
         renderer.features.sun_azimuth_deg = self.settings.render.sun_azimuth_deg;
         renderer.features.sun_elevation_deg = self.settings.render.sun_elevation_deg;
         renderer.features.sun_intensity = self.settings.render.sun_intensity;
+        if !self.settings.render.sky_hdr_path.trim().is_empty() {
+            if let Err(e) = renderer.apply_sky_environment(&self.settings.render.sky_hdr_path) {
+                self.error_log.push(format!("[Sky] Startup apply failed: {}", e));
+            }
+        }
+        if !self.settings.runtime.gpu_scalability_tier.eq_ignore_ascii_case("auto") {
+            renderer.features = renderer::RenderFeatures::from_tier_name(
+                &self.settings.runtime.gpu_scalability_tier,
+            );
+            self.settings
+                .sync_render_from_renderer_features(&renderer.features);
+        }
 
         // Check if GPU is low-end and print a note.
         println!("[Engine] GPU: {:?}", renderer.adapter_info.name);
@@ -439,17 +720,6 @@ impl ApplicationHandler for GameApp {
         }
         if self.mesh_streaming.enabled() {
             println!("[Engine] Threaded mesh streaming queue enabled");
-            if let Ok(descs) = scene::parse_scene(&self.scene_mgr.scene_path) {
-                for desc in descs {
-                    let dx = desc.position[0] - self.camera.position.x;
-                    let dy = desc.position[1] - self.camera.position.y;
-                    let dz = desc.position[2] - self.camera.position.z;
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-                    let priority = 1.0 / dist;
-                    self.mesh_streaming
-                        .request_mesh_with_priority(&desc.mesh, priority);
-                }
-            }
         }
 
         self.input.configure_gamepad(
@@ -457,81 +727,16 @@ impl ApplicationHandler for GameApp {
             self.settings.input.left_stick_deadzone,
         );
 
-        self.ensure_content_layout();
-
-        // Register Lua API and load startup scripts.
-        self.scripts.register_api().expect("Lua API registration failed");
         EditorShell::print_help();
         MaterialLibrary::print_help();
-        self.scripts.load_script(&format!("{}/player.lua", CONTENT_SCRIPTS_DIR)).ok();
-        self.scripts.load_script(&format!("{}/enemy.lua", CONTENT_SCRIPTS_DIR)).ok();
-
-        // Build the initial scene from scenes/main.scene.
-        self.scene_mgr
-            .build(&mut self.world, &mut self.meshes, &mut self.mesh_cache)
-            .expect("Failed to load main.scene");
-        self.nav_grid.rebuild(&self.terrain);
-
-        // Add a starter animator to the first renderable entity as proof-of-system.
-        let first_renderable = {
-            self.world
-                .query::<(hecs::Entity, &components::Renderable)>()
-                .iter()
-                .next()
-                .map(|(e, _)| e)
-        };
-        if let Some(e) = first_renderable {
-            let _ = self.world.insert(
-                e,
-                (Animator {
-                    state: AnimState::Idle,
-                    ..Animator::humanoid_default()
-                },),
-            );
-            println!("[Animation] Animator attached to {:?}", e);
-            println!("[Animation] Press J/K/L to set Idle/Walk/Run on selected entity.");
-        }
-
-        // Start file watchers for hot reload.
-        if self.script_hot_reload_enabled {
-            self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
-        }
-        if self.asset_hot_reload_enabled {
-            self.start_asset_watcher();
-        }
-
-        // Separate watcher thread for scene files.
-        let (scene_tx, scene_rx) = std::sync::mpsc::channel::<String>();
-        {
-            let tx = scene_tx.clone();
-            std::thread::spawn(move || {
-                use notify::{Watcher, RecursiveMode, recommended_watcher};
-                use std::path::Path;
-                let (ntx, nrx) = std::sync::mpsc::channel();
-                let mut watcher = recommended_watcher(move |res| { let _ = ntx.send(res); })
-                    .expect("Scene watcher failed");
-                watcher.watch(Path::new("scenes"), RecursiveMode::Recursive).ok();
-                loop {
-                    match nrx.recv() {
-                        Ok(Ok(event)) => {
-                            for path in event.paths {
-                                let s = path.to_string_lossy().to_string();
-                                if s.ends_with(".scene") {
-                                    if tx.send(s).is_err() { return; }
-                                }
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-            });
-        }
-        self.scene_watcher = Some(scene_rx);
 
         self.window = Some(window);
         self.renderer = Some(renderer);
         if let (Some(window_ref), Some(renderer_ref)) = (self.window.as_ref(), self.renderer.as_ref()) {
             self.editor_ui = Some(EditorUi::new(window_ref, renderer_ref));
+        }
+        if let Some(ui) = self.editor_ui.as_mut() {
+            ui.mark_icons_dirty();
         }
         self.app_stage = AppStage::ProjectHub;
         self.project_stage_started_at = std::time::Instant::now();
@@ -548,7 +753,19 @@ impl ApplicationHandler for GameApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(w) = &self.window {
+                    let sz = w.inner_size();
+                    let pos = w.outer_position().ok();
+                    editor_persist::save_window_prefs(&editor_persist::EditorWindowPrefs {
+                        width: sz.width,
+                        height: sz.height,
+                        pos_x: pos.as_ref().map(|p| p.x),
+                        pos_y: pos.as_ref().map(|p| p.y),
+                    });
+                }
+                event_loop.exit();
+            }
 
             WindowEvent::KeyboardInput { event: ke, .. } => {
                 self.input.handle_key(ke.physical_key, ke.state == ElementState::Pressed);
@@ -698,6 +915,22 @@ impl ApplicationHandler for GameApp {
                                 println!("[Terrain/Foliage] Removed {} nearby foliage entities.", removed);
                             }
                             KeyCode::KeyP => self.snap_camera_to_selected(),
+                            KeyCode::Home => self.focus_selected_frame(),
+                            KeyCode::KeyO => {
+                                self.orbit_mode = !self.orbit_mode;
+                                println!(
+                                    "[Camera] Orbit mode: {}",
+                                    if self.orbit_mode { "ON" } else { "OFF" }
+                                );
+                            }
+                            KeyCode::Minus => {
+                                self.nav_speed_scalar = (self.nav_speed_scalar * 0.9).max(0.6);
+                                println!("[Camera] Move speed: {:.2}", self.nav_speed_scalar);
+                            }
+                            KeyCode::Equal => {
+                                self.nav_speed_scalar = (self.nav_speed_scalar * 1.12).min(80.0);
+                                println!("[Camera] Move speed: {:.2}", self.nav_speed_scalar);
+                            }
                             _ => {}
                         }
                     }
@@ -714,19 +947,39 @@ impl ApplicationHandler for GameApp {
                     MouseScrollDelta::LineDelta(_, y) => y * 0.7,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
                 };
-                let forward = (self.camera.target - self.camera.position).normalize_or_zero();
-                self.camera.position += forward * amount;
-                self.update_camera_target_from_angles();
+                if self.orbit_mode && self.selected_renderable.is_some() {
+                    self.orbit_distance = (self.orbit_distance - amount * 0.75).clamp(0.8, 120.0);
+                    let dir = (self.camera.position - self.camera.target).normalize_or_zero();
+                    if dir.length_squared() > 1e-6 {
+                        self.camera.position = self.camera.target + dir * self.orbit_distance;
+                    }
+                } else {
+                    let forward = (self.camera.target - self.camera.position).normalize_or_zero();
+                    self.camera.position += forward * amount;
+                    self.update_camera_target_from_angles();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if self.mouse_look_active || self.mouse_look_latched {
                     if let Some(prev) = self.last_cursor_pos {
                         let dx = (position.x - prev.x) as f32;
                         let dy = (position.y - prev.y) as f32;
-                        let sensitivity = 0.0035;
+                        let mag = ((dx * dx + dy * dy).sqrt() / 24.0).clamp(0.0, 1.8);
+                        let sensitivity = self.look_sensitivity * (1.0 + 0.45 * mag);
                         self.camera_yaw += dx * sensitivity;
-                        self.camera_pitch = (self.camera_pitch - dy * sensitivity).clamp(-1.5, 1.5);
-                        self.update_camera_target_from_angles();
+                        self.camera_pitch =
+                            (self.camera_pitch - dy * sensitivity).clamp(-1.5, 1.5);
+                        if self.orbit_mode && self.selected_renderable.is_some() {
+                            let dir = glam::Vec3::new(
+                                self.camera_yaw.cos() * self.camera_pitch.cos(),
+                                self.camera_pitch.sin(),
+                                self.camera_yaw.sin() * self.camera_pitch.cos(),
+                            )
+                            .normalize_or_zero();
+                            self.camera.position = self.camera.target - dir * self.orbit_distance;
+                        } else {
+                            self.update_camera_target_from_angles();
+                        }
                     }
                     self.last_cursor_pos = Some(position);
                 } else {
@@ -789,15 +1042,20 @@ impl ApplicationHandler for GameApp {
                     }
                 }
                 if !self.asset_hot_reload_enabled {
+                    self.stop_asset_watch.store(true, Ordering::SeqCst);
                     self.asset_watcher = None;
                 } else if self.asset_watcher.is_none() {
                     self.start_asset_watcher();
                 }
                 if let Some(rx) = &self.asset_watcher {
                     let mut pending_errors: Vec<String> = Vec::new();
+                    let mut changed_assets = HashSet::new();
                     while let Ok(path) = rx.try_recv() {
-                        let norm = path.replace('\\', "/");
-                        if norm.ends_with(".obj") {
+                        changed_assets.insert(path.replace('\\', "/"));
+                    }
+                    for norm in changed_assets {
+                        self.mark_editor_content_dirty();
+                        if norm.ends_with(".obj") || norm.ends_with(".gltf") || norm.ends_with(".glb") {
                             if let Some(handle) = self.mesh_cache.get(&norm).copied() {
                                 match Mesh::load(&norm) {
                                     Ok(mesh) => {
@@ -807,8 +1065,16 @@ impl ApplicationHandler for GameApp {
                                     Err(e) => pending_errors.push(format!("[Hot] Mesh reload failed {}: {}", norm, e)),
                                 }
                             }
-                        } else {
-                            println!("[Hot] Texture changed: {}", norm);
+                        } else if norm.ends_with(".png")
+                            || norm.ends_with(".jpg")
+                            || norm.ends_with(".jpeg")
+                        {
+                            if let Some(renderer) = self.renderer.as_ref() {
+                                renderer.invalidate_texture_path(&norm);
+                            }
+                            println!("[Hot] Texture reloaded: {}", norm);
+                        } else if norm.ends_with(".mat") || norm.ends_with(".material") {
+                            println!("[Hot] Material asset changed: {}", norm);
                         }
                     }
                     for e in pending_errors {
@@ -820,7 +1086,9 @@ impl ApplicationHandler for GameApp {
                 if let Some(rx) = &self.scene_watcher {
                     let mut pending_errors: Vec<String> = Vec::new();
                     let mut pending_toasts: Vec<String> = Vec::new();
+                    let mut content_dirty = false;
                     while let Ok(path) = rx.try_recv() {
+                        self.scene_list_dirty = true;
                         println!("[Hot] Scene changed: {}", path);
                         match self.scene_mgr.build(
                             &mut self.world,
@@ -829,10 +1097,14 @@ impl ApplicationHandler for GameApp {
                         ) {
                             Ok(_)  => {
                                 println!("[Hot] Scene rebuilt");
+                                content_dirty = true;
                                 pending_toasts.push(format!("Scene hot reloaded: {}", path));
                             }
                             Err(e) => pending_errors.push(format!("[Hot] Scene error: {}", e)),
                         }
+                    }
+                    if content_dirty {
+                        self.mark_editor_content_dirty();
                     }
                     for e in pending_errors {
                         self.push_error(e);
@@ -869,22 +1141,68 @@ impl ApplicationHandler for GameApp {
                 let mut physics_time = std::time::Duration::ZERO;
                 if run_sim {
                     let script_start = std::time::Instant::now();
-                    scripting_system(&mut self.world, &mut self.scripts, &self.input, dt);
-                    self.scripts.drain_destroys(&mut self.world);
+                    if self.script_skip_frames_remaining > 0 {
+                        self.script_skip_frames_remaining -= 1;
+                    } else {
+                        scripting_system(
+                            &mut self.world,
+                            &mut self.scripts,
+                            &self.input,
+                            self.camera.position.to_array(),
+                            self.camera.target.to_array(),
+                            dt,
+                        );
+                        self.scripts.drain_destroys(&mut self.world);
+                        if let Some((pos, target)) = self.scripts.consume_camera_request() {
+                            self.camera.position = glam::Vec3::from_array(pos);
+                            self.camera.target = glam::Vec3::from_array(target);
+                            let mut dir =
+                                (self.camera.target - self.camera.position).normalize_or_zero();
+                            if dir.length_squared() < 1e-6 {
+                                dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+                            }
+                            self.camera_yaw = dir.z.atan2(dir.x);
+                            self.camera_pitch = dir.y.asin();
+                        }
+                        let skip_n = self.scripts.consume_frame_skip_request();
+                        if skip_n > 0 {
+                            self.script_skip_frames_remaining = skip_n;
+                        }
+                    }
                     script_time = script_start.elapsed();
 
                     let physics_start = std::time::Instant::now();
                     let sim_time = self.start_time.elapsed().as_secs_f32();
                     let divisor = self.settings.runtime.foliage_wind_update_divisor.max(1) as u64;
-                    let wind_this_frame = (self.frame_index % divisor) == 0;
-                    let _collisions = physics_system(
-                        &mut self.world,
-                        dt,
-                        sim_time,
-                        &self.jobs,
-                        self.settings.runtime.foliage_wind_enabled,
-                        wind_this_frame,
-                    );
+                    let _wind_this_frame = (self.frame_index % divisor) == 0;
+                    // Bullet/high-speed safety: small fixed substeps reduce tunneling.
+                    let speed_peak = self
+                        .world
+                        .query::<&RigidBody>()
+                        .iter()
+                        .map(|b| b.velocity_x.abs().max(b.velocity_y.abs()).max(b._velocity_z.abs()))
+                        .fold(0.0f32, f32::max);
+                    let max_sub = self.settings.runtime.physics_max_substeps.clamp(1, 12);
+                    let substeps = if self.settings.runtime.physics_ccd_enabled {
+                        (((speed_peak * dt) / 0.45).ceil() as u32).clamp(1, max_sub)
+                    } else {
+                        1
+                    };
+                    let sub_dt = dt / substeps as f32;
+                    let mut collision_events = Vec::new();
+                    for s in 0..substeps {
+                        let collisions = physics_system(
+                            &mut self.world,
+                            sub_dt,
+                            sim_time + sub_dt * s as f32,
+                            &self.jobs,
+                            &self.settings.runtime,
+                        );
+                        collision_events.extend(collisions);
+                    }
+                    if let Err(err) = self.scripts.dispatch_collision_events(&collision_events) {
+                        eprintln!("[Scripting] Collision callback error: {}", err);
+                    }
                     physics_time = physics_start.elapsed();
 
                     animation_system(&mut self.world, dt, &self.jobs);
@@ -908,28 +1226,72 @@ impl ApplicationHandler for GameApp {
                     if self.input.is_held(KeyCode::ControlLeft) || self.input.is_held(KeyCode::ControlRight) {
                         move_dir -= up;
                     }
-                    if move_dir.length_squared() > 0.0 {
-                        let speed = if self.input.is_held(KeyCode::ShiftLeft) || self.input.is_held(KeyCode::ShiftRight) {
-                            14.0
+                    let mut speed = self.nav_speed_scalar;
+                    if self.input.is_held(KeyCode::ShiftLeft) || self.input.is_held(KeyCode::ShiftRight) {
+                        speed *= 2.2;
+                    }
+                    if self.input.is_held(KeyCode::AltLeft) || self.input.is_held(KeyCode::AltRight) {
+                        speed *= 0.35;
+                    }
+                    let desired_velocity = if move_dir.length_squared() > 0.0 {
+                        move_dir.normalize() * speed
+                    } else {
+                        glam::Vec3::ZERO
+                    };
+                    let accel_blend = (1.0 - (-dt * 10.0).exp()).clamp(0.0, 1.0);
+                    self.camera_move_velocity =
+                        self.camera_move_velocity.lerp(desired_velocity, accel_blend);
+                    if self.camera_move_velocity.length_squared() < 1e-5 {
+                        self.camera_move_velocity = glam::Vec3::ZERO;
+                    }
+                    let delta = self.camera_move_velocity * dt.max(0.0);
+                    if delta.length_squared() > 0.0 {
+                        if self.orbit_mode && self.selected_renderable.is_some() {
+                            self.camera.target += delta;
+                            self.camera.position += delta;
                         } else {
-                            6.0
-                        };
-                        self.camera.position += move_dir.normalize() * speed * dt.max(0.0);
-                        self.update_camera_target_from_angles();
+                            self.camera.position += delta;
+                            self.update_camera_target_from_angles();
+                        }
                     }
                 }
 
                 // ── Render ─────────────────────────────────────────────────
                 let render_start = std::time::Instant::now();
                 let mut draw_stats = renderer::DrawStats::default();
+                if self.app_stage == AppStage::ProjectHub {
+                    let hub_open = match (self.window.as_ref(), self.editor_ui.as_mut()) {
+                        (Some(w), Some(ui)) => {
+                            let elapsed =
+                                self.project_stage_started_at.elapsed().as_secs_f32();
+                            ui.begin_project_hub(w, elapsed)
+                        }
+                        _ => None,
+                    };
+                    if let Some(proj) = hub_open {
+                        let proj = std::fs::canonicalize(&proj).unwrap_or(proj);
+                        self.switch_to_project(proj);
+                        self.app_stage = AppStage::EditorLoading;
+                        self.project_stage_started_at =
+                            std::time::Instant::now();
+                    }
+                }
+                self.refresh_available_scenes_if_needed();
+                if self.app_stage == AppStage::BootSplash
+                    && self.project_stage_started_at.elapsed().as_millis() > 1100
+                {
+                    self.app_stage = AppStage::ProjectHub;
+                    self.project_stage_started_at = std::time::Instant::now();
+                }
+                let mut content_dirty_after_render = false;
+                let mut return_to_hub_after_render = false;
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
-                    if self.app_stage == AppStage::ProjectHub {
+                    if self.app_stage == AppStage::BootSplash {
                         if let Some(ui) = self.editor_ui.as_mut() {
-                            let elapsed = self.project_stage_started_at.elapsed().as_secs_f32();
-                            if ui.begin_project_hub(window, elapsed) {
-                                self.app_stage = AppStage::EditorLoading;
-                                self.project_stage_started_at = std::time::Instant::now();
-                            }
+                            ui.begin_editor_loading(
+                                window,
+                                self.project_stage_started_at.elapsed().as_secs_f32(),
+                            );
                         }
                         let mut draw_ui = |device: &wgpu::Device,
                                            queue: &wgpu::Queue,
@@ -958,8 +1320,36 @@ impl ApplicationHandler for GameApp {
                         );
                         return;
                     }
+                    if self.app_stage == AppStage::ProjectHub {
+                        let mut draw_ui = |device: &wgpu::Device,
+                                           queue: &wgpu::Queue,
+                                           encoder: &mut wgpu::CommandEncoder,
+                                           view: &wgpu::TextureView| {
+                            if let Some(ui) = self.editor_ui.as_mut() {
+                                ui.paint_on(device, queue, encoder, view);
+                            }
+                        };
+                        draw_stats = renderer.draw_world(
+                            &self.world,
+                            &self.meshes,
+                            &self.camera,
+                            &self.jobs,
+                            Some(&mut draw_ui),
+                        );
+                        let render_time = render_start.elapsed();
+                        self.profiler.record(
+                            frame_start.elapsed(),
+                            script_time,
+                            physics_time,
+                            render_time,
+                            asset_time,
+                            draw_stats,
+                            self.jobs.enabled(),
+                        );
+                        return;
+                    }
                     if self.app_stage == AppStage::EditorLoading
-                        && self.project_stage_started_at.elapsed().as_millis() > 250
+                        && self.project_stage_started_at.elapsed().as_millis() > 900
                     {
                         self.app_stage = AppStage::EditorReady;
                     }
@@ -990,12 +1380,34 @@ impl ApplicationHandler for GameApp {
                             script_hot_reload_enabled: &mut self.script_hot_reload_enabled,
                             preferred_script_editor: &mut self.preferred_script_editor,
                             asset_hot_reload_enabled: &mut self.asset_hot_reload_enabled,
+                            return_to_hub: &mut self.request_return_to_hub,
+                            scene_path: &mut self.scene_mgr.scene_path,
+                            available_scene_paths: &self.available_scene_paths,
+                            requested_scene_switch: &mut self.requested_scene_switch,
+                            camera_nav_speed: self.nav_speed_scalar,
                         };
                         if self.app_stage == AppStage::EditorLoading {
                             ui.begin_editor_loading(window, self.project_stage_started_at.elapsed().as_secs_f32());
                         } else {
                             ui.begin_and_build(window, &mut frame_args);
                         }
+                    }
+                    if let Some(scene_path) = self.requested_scene_switch.take() {
+                        self.scene_mgr.scene_path = scene_path.clone();
+                        self.mesh_cache.clear();
+                        match self.scene_mgr.build(&mut self.world, &mut self.meshes, &mut self.mesh_cache) {
+                            Ok(()) => {
+                                self.nav_grid.rebuild(&self.terrain);
+                                self.selected_renderable = None;
+                                content_dirty_after_render = true;
+                                self.error_log.push(format!("[Scene] Loaded {}", scene_path));
+                            }
+                            Err(e) => self.error_log.push(format!("[Scene] Load failed: {}", e)),
+                        }
+                    }
+                    if self.request_return_to_hub {
+                        self.request_return_to_hub = false;
+                        return_to_hub_after_render = true;
                     }
 
                     let mut draw_ui = |device: &wgpu::Device,
@@ -1013,6 +1425,19 @@ impl ApplicationHandler for GameApp {
                         &self.jobs,
                         Some(&mut draw_ui),
                     );
+                }
+                if content_dirty_after_render {
+                    self.mark_editor_content_dirty();
+                }
+                if return_to_hub_after_render {
+                    self.stop_project_watchers();
+                    self.app_stage = AppStage::ProjectHub;
+                    self.project_stage_started_at = std::time::Instant::now();
+                    self.sim_paused = true;
+                    self.error_log.push(format!(
+                        "[Editor] Returned to Project Hub (engine v {}).",
+                        TRINITY_ENGINE_VERSION
+                    ));
                 }
                 let render_time = render_start.elapsed();
 

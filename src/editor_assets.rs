@@ -37,9 +37,11 @@ impl AssetMetadataDb {
                 .to_ascii_lowercase();
             let kind = match ext.as_str() {
                 "png" | "jpg" | "jpeg" => "texture",
-                "obj" => "mesh",
+                "obj" | "gltf" | "glb" => "mesh",
                 "prefab" => "prefab",
                 "lua" => "script",
+                "mat" | "material" => "material",
+                "fol" | "foliage" => "foliage",
                 _ => "other",
             };
             let modified = fs::metadata(&path)

@@ -27,6 +27,7 @@ if (Test-Path $out) {
 New-Item -ItemType Directory -Path $out | Out-Null
 
 Copy-Item $exePath (Join-Path $out "TrinityEngine.exe") -Force
+Copy-Item $exePath (Join-Path $out "Triengine.exe") -Force
 
 $maybeFiles = @(
     "engine_settings.toml"

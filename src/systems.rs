@@ -11,7 +11,14 @@ use crate::scripting::ScriptEngine;
 // Why pass ScriptEngine by reference?
 // ScriptEngine owns the Lua runtime. We borrow it to call scripts.
 // We don't want the system to own it — main.rs should own it.
-pub fn scripting_system(world: &mut World, scripts: &mut ScriptEngine, input: &InputState, dt: f32) {
+pub fn scripting_system(
+    world: &mut World,
+    scripts: &mut ScriptEngine,
+    input: &InputState,
+    camera_pos: [f32; 3],
+    camera_target: [f32; 3],
+    dt: f32,
+) {
     // We can't query and mutate world at the same time with hecs,
     // so we collect the (entity, path) pairs first, then run scripts.
     // Why: run_update() needs &mut World, but the query already borrows it.
@@ -28,7 +35,15 @@ pub fn scripting_system(world: &mut World, scripts: &mut ScriptEngine, input: &I
         // Why load here? For simplicity — later we'll cache loaded scripts.
         // If the script fails, we print the error and continue.
         // A scripting error should never crash the engine.
-        if let Err(e) = scripts.run_update(world, input, entity, &path, dt) {
+        if let Err(e) = scripts.run_update(
+            world,
+            input,
+            camera_pos,
+            camera_target,
+            entity,
+            &path,
+            dt,
+        ) {
             eprintln!("[Scripting] Error in {}: {}", path, e);
         }
     }

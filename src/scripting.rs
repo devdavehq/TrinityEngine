@@ -17,9 +17,9 @@
 //   set_position(entity, x, y, z)
 //
 //   -- RigidBody velocity
-//   local vx, vy = get_velocity(entity)
-//   set_velocity(entity, vx, vy)
-//   apply_force(entity, fx, fy)        -- adds to current velocity
+//   local vx, vy, vz = get_velocity(entity)
+//   set_velocity(entity, vx, vy, vz)
+//   apply_force(entity, fx, fy, fz)    -- adds to current velocity
 //   local grounded = is_on_ground(entity)
 //
 //   -- Health
@@ -52,7 +52,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
-use crate::components::{Health, MaterialTexture, Position, Renderable, RigidBody, Rotation};
+use crate::components::{
+    Collider, CollisionPair, CollisionPhase, FixedJoint, Health, HingeJoint, MaterialTexture,
+    OrientedBoxCollider, Position, Renderable, RigidBody, RopeConstraint, Rotation, SpringJoint,
+};
 use crate::input::InputState;
 use hecs::{Entity, World};
 
@@ -60,7 +63,12 @@ struct ScriptInstance {
     path: String,
     revision: u64,
     env_key: LuaRegistryKey,
+    start_key: Option<LuaRegistryKey>,
     update_key: LuaRegistryKey,
+    collision_enter_key: Option<LuaRegistryKey>,
+    collision_stay_key: Option<LuaRegistryKey>,
+    collision_exit_key: Option<LuaRegistryKey>,
+    started: bool,
 }
 
 // ── ScriptEngine ──────────────────────────────────────────────────────────────
@@ -77,6 +85,8 @@ pub struct ScriptEngine {
     script_revisions: HashMap<String, u64>,
     ui_values: HashMap<String, f32>,
     ui_texts: HashMap<String, String>,
+    pending_camera_set: std::cell::UnsafeCell<Option<([f32; 3], [f32; 3])>>,
+    pending_frame_skip: std::cell::UnsafeCell<u32>,
 }
 
 // SAFETY: ScriptEngine is only ever used on the main thread.
@@ -92,7 +102,21 @@ impl ScriptEngine {
             script_revisions: HashMap::new(),
             ui_values: HashMap::new(),
             ui_texts: HashMap::new(),
+            pending_camera_set: std::cell::UnsafeCell::new(None),
+            pending_frame_skip: std::cell::UnsafeCell::new(0),
         }
+    }
+
+    pub fn consume_camera_request(&mut self) -> Option<([f32; 3], [f32; 3])> {
+        let slot = unsafe { &mut *self.pending_camera_set.get() };
+        slot.take()
+    }
+
+    pub fn consume_frame_skip_request(&mut self) -> u32 {
+        let slot = unsafe { &mut *self.pending_frame_skip.get() };
+        let n = *slot;
+        *slot = 0;
+        n
     }
 
     pub fn ui_value(&self, id: &str) -> f32 {
@@ -120,6 +144,104 @@ impl ScriptEngine {
             Ok(())
         })?;
         globals.set("log", log_fn)?;
+
+        let clamp01_fn = self.lua.create_function(|_, v: f32| Ok(v.clamp(0.0, 1.0)))?;
+        globals.set("clamp01", clamp01_fn)?;
+        let vec2_fn = self.lua.create_function(|lua, (x, y): (f32, f32)| {
+            let t = lua.create_table()?;
+            t.set("x", x)?;
+            t.set("y", y)?;
+            Ok(t)
+        })?;
+        globals.set("vec2", vec2_fn)?;
+        let vec3_fn = self.lua.create_function(|lua, (x, y, z): (f32, f32, f32)| {
+            let t = lua.create_table()?;
+            t.set("x", x)?;
+            t.set("y", y)?;
+            t.set("z", z)?;
+            Ok(t)
+        })?;
+        globals.set("vec3", vec3_fn)?;
+        let vec_add_fn = self.lua.create_function(|lua, (a, b): (LuaTable, LuaTable)| {
+            let t = lua.create_table()?;
+            t.set("x", a.get::<f32>("x").unwrap_or(0.0) + b.get::<f32>("x").unwrap_or(0.0))?;
+            t.set("y", a.get::<f32>("y").unwrap_or(0.0) + b.get::<f32>("y").unwrap_or(0.0))?;
+            t.set("z", a.get::<f32>("z").unwrap_or(0.0) + b.get::<f32>("z").unwrap_or(0.0))?;
+            Ok(t)
+        })?;
+        globals.set("vec_add", vec_add_fn)?;
+        let vec_scale_fn = self.lua.create_function(|lua, (a, s): (LuaTable, f32)| {
+            let t = lua.create_table()?;
+            t.set("x", a.get::<f32>("x").unwrap_or(0.0) * s)?;
+            t.set("y", a.get::<f32>("y").unwrap_or(0.0) * s)?;
+            t.set("z", a.get::<f32>("z").unwrap_or(0.0) * s)?;
+            Ok(t)
+        })?;
+        globals.set("vec_scale", vec_scale_fn)?;
+        let vec_dot_fn = self.lua.create_function(|_, (a, b): (LuaTable, LuaTable)| {
+            let ax = a.get::<f32>("x").unwrap_or(0.0);
+            let ay = a.get::<f32>("y").unwrap_or(0.0);
+            let az = a.get::<f32>("z").unwrap_or(0.0);
+            let bx = b.get::<f32>("x").unwrap_or(0.0);
+            let by = b.get::<f32>("y").unwrap_or(0.0);
+            let bz = b.get::<f32>("z").unwrap_or(0.0);
+            Ok(ax * bx + ay * by + az * bz)
+        })?;
+        globals.set("vec_dot", vec_dot_fn)?;
+        let vec_cross_fn = self.lua.create_function(|lua, (a, b): (LuaTable, LuaTable)| {
+            let ax = a.get::<f32>("x").unwrap_or(0.0);
+            let ay = a.get::<f32>("y").unwrap_or(0.0);
+            let az = a.get::<f32>("z").unwrap_or(0.0);
+            let bx = b.get::<f32>("x").unwrap_or(0.0);
+            let by = b.get::<f32>("y").unwrap_or(0.0);
+            let bz = b.get::<f32>("z").unwrap_or(0.0);
+            let t = lua.create_table()?;
+            t.set("x", ay * bz - az * by)?;
+            t.set("y", az * bx - ax * bz)?;
+            t.set("z", ax * by - ay * bx)?;
+            Ok(t)
+        })?;
+        globals.set("vec_cross", vec_cross_fn)?;
+        let vec_length_fn = self.lua.create_function(|_, a: LuaTable| {
+            let x = a.get::<f32>("x").unwrap_or(0.0);
+            let y = a.get::<f32>("y").unwrap_or(0.0);
+            let z = a.get::<f32>("z").unwrap_or(0.0);
+            Ok((x * x + y * y + z * z).sqrt())
+        })?;
+        globals.set("vec_length", vec_length_fn)?;
+        let vec_normalize_fn = self.lua.create_function(|lua, a: LuaTable| {
+            let x = a.get::<f32>("x").unwrap_or(0.0);
+            let y = a.get::<f32>("y").unwrap_or(0.0);
+            let z = a.get::<f32>("z").unwrap_or(0.0);
+            let len = (x * x + y * y + z * z).sqrt();
+            let t = lua.create_table()?;
+            if len > 1e-6 {
+                t.set("x", x / len)?;
+                t.set("y", y / len)?;
+                t.set("z", z / len)?;
+            } else {
+                t.set("x", 0.0)?;
+                t.set("y", 0.0)?;
+                t.set("z", 0.0)?;
+            }
+            Ok(t)
+        })?;
+        globals.set("vec_normalize", vec_normalize_fn)?;
+        let vec_lerp_fn = self.lua.create_function(|lua, (a, b, t): (LuaTable, LuaTable, f32)| {
+            let ax = a.get::<f32>("x").unwrap_or(0.0);
+            let ay = a.get::<f32>("y").unwrap_or(0.0);
+            let az = a.get::<f32>("z").unwrap_or(0.0);
+            let bx = b.get::<f32>("x").unwrap_or(0.0);
+            let by = b.get::<f32>("y").unwrap_or(0.0);
+            let bz = b.get::<f32>("z").unwrap_or(0.0);
+            let t = t.clamp(0.0, 1.0);
+            let out = lua.create_table()?;
+            out.set("x", ax + (bx - ax) * t)?;
+            out.set("y", ay + (by - ay) * t)?;
+            out.set("z", az + (bz - az) * t)?;
+            Ok(out)
+        })?;
+        globals.set("vec_lerp", vec_lerp_fn)?;
 
         Ok(())
     }
@@ -159,7 +281,19 @@ impl ScriptEngine {
     fn remove_instance(&mut self, entity_bits: u64) {
         if let Some(inst) = self.instances.remove(&entity_bits) {
             let _ = self.lua.remove_registry_value(inst.env_key);
+            if let Some(key) = inst.start_key {
+                let _ = self.lua.remove_registry_value(key);
+            }
             let _ = self.lua.remove_registry_value(inst.update_key);
+            if let Some(key) = inst.collision_enter_key {
+                let _ = self.lua.remove_registry_value(key);
+            }
+            if let Some(key) = inst.collision_stay_key {
+                let _ = self.lua.remove_registry_value(key);
+            }
+            if let Some(key) = inst.collision_exit_key {
+                let _ = self.lua.remove_registry_value(key);
+            }
         }
     }
 
@@ -202,7 +336,18 @@ impl ScriptEngine {
     // Lua closures need 'static lifetimes, but World and InputState are stack values.
     // We pass them as raw pointers baked into closures valid only for the duration
     // of this function call. Re-registering is cheap (~microseconds).
-    fn build_instance(&mut self, path: &str) -> LuaResult<(LuaRegistryKey, LuaRegistryKey, u64)> {
+    fn build_instance(
+        &mut self,
+        path: &str,
+    ) -> LuaResult<(
+        LuaRegistryKey,
+        Option<LuaRegistryKey>,
+        LuaRegistryKey,
+        Option<LuaRegistryKey>,
+        Option<LuaRegistryKey>,
+        Option<LuaRegistryKey>,
+        u64,
+    )> {
         let code = fs::read_to_string(path)
             .map_err(|e| LuaError::RuntimeError(format!("Could not load script {}: {}", path, e)))?;
 
@@ -218,6 +363,10 @@ impl ScriptEngine {
             .set_environment(env.clone())
             .exec()?;
 
+        let start_key = env
+            .get::<Option<LuaFunction>>("start")?
+            .map(|f| self.lua.create_registry_value(f))
+            .transpose()?;
         let update: LuaFunction = env.get("update").map_err(|_| {
             LuaError::RuntimeError(format!(
                 "Script {} must define function update(entity, dt)",
@@ -225,16 +374,38 @@ impl ScriptEngine {
             ))
         })?;
 
+        let collision_enter_key = env
+            .get::<Option<LuaFunction>>("on_collision_enter")?
+            .map(|f| self.lua.create_registry_value(f))
+            .transpose()?;
+        let collision_stay_key = env
+            .get::<Option<LuaFunction>>("on_collision_stay")?
+            .map(|f| self.lua.create_registry_value(f))
+            .transpose()?;
+        let collision_exit_key = env
+            .get::<Option<LuaFunction>>("on_collision_exit")?
+            .map(|f| self.lua.create_registry_value(f))
+            .transpose()?;
         let env_key = self.lua.create_registry_value(env)?;
         let update_key = self.lua.create_registry_value(update)?;
         let revision = *self.script_revisions.get(path).unwrap_or(&0);
-        Ok((env_key, update_key, revision))
+        Ok((
+            env_key,
+            start_key,
+            update_key,
+            collision_enter_key,
+            collision_stay_key,
+            collision_exit_key,
+            revision,
+        ))
     }
 
     pub fn run_update(
         &mut self,
         world: &mut World,
         input: &InputState,
+        camera_pos: [f32; 3],
+        camera_target: [f32; 3],
         entity: Entity,
         script_path: &str,
         dt: f32,
@@ -243,6 +414,8 @@ impl ScriptEngine {
         let script_ptr = self as *mut ScriptEngine as usize;
         let world_ptr = world as *mut World as usize;
         let input_ptr = input as *const InputState as usize;
+        let camera_pos_copy = camera_pos;
+        let camera_target_copy = camera_target;
         let entity_bits = entity.to_bits().get();
 
         let current_rev = *self.script_revisions.get(script_path).unwrap_or(&0);
@@ -254,14 +427,20 @@ impl ScriptEngine {
 
         if needs_rebuild {
             self.remove_instance(entity_bits);
-            let (env_key, update_key, revision) = self.build_instance(script_path)?;
+            let (env_key, start_key, update_key, collision_enter_key, collision_stay_key, collision_exit_key, revision) =
+                self.build_instance(script_path)?;
             self.instances.insert(
                 entity_bits,
                 ScriptInstance {
                     path: script_path.to_string(),
                     revision,
                     env_key,
+                    start_key,
                     update_key,
+                    collision_enter_key,
+                    collision_stay_key,
+                    collision_exit_key,
+                    started: false,
                 },
             );
         }
@@ -289,37 +468,166 @@ impl ScriptEngine {
         })?;
         globals.set("set_position", sp)?;
 
+        let mv = self
+            .lua
+            .create_function(move |_, (eid, dx, dy, dz): (u64, f32, f32, f32)| {
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let entity = Entity::from_bits(eid).unwrap();
+                if let Ok(mut p) = world.get::<&mut Position>(entity) {
+                    p.x += dx;
+                    p.y += dy;
+                    p.z += dz;
+                }
+                Ok(())
+            })?;
+        globals.set("move_by", mv)?;
+
         // ── RigidBody ─────────────────────────────────────────────────────
-        // get_velocity(entity) → vx, vy
+        // get_velocity(entity) → vx, vy, vz
         let gv = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
             let entity = Entity::from_bits(eid).unwrap();
             match world.get::<&RigidBody>(entity) {
-                Ok(b)  => Ok((b.velocity_x, b.velocity_y)),
-                Err(_) => Ok((0.0f32, 0.0f32)),
+                Ok(b)  => Ok((b.velocity_x, b.velocity_y, b._velocity_z)),
+                Err(_) => Ok((0.0f32, 0.0f32, 0.0f32)),
             }
         })?;
         globals.set("get_velocity", gv)?;
 
-        // set_velocity(entity, vx, vy) — replaces current velocity
-        let sv = self.lua.create_function(move |_, (eid, vx, vy): (u64, f32, f32)| {
+        // set_velocity(entity, vx, vy, vz) — replaces current velocity
+        let sv = self.lua.create_function(move |_, (eid, vx, vy, vz): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
             let entity = Entity::from_bits(eid).unwrap();
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.velocity_x = vx;
                 b.velocity_y = vy;
+                b._velocity_z = vz;
             }
             Ok(())
         })?;
         globals.set("set_velocity", sv)?;
 
-        // apply_force(entity, fx, fy) — adds to current velocity
-        let af = self.lua.create_function(move |_, (eid, fx, fy): (u64, f32, f32)| {
+        let gav = self.lua.create_function(move |_, eid: u64| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            let v = world
+                .get::<&RigidBody>(entity)
+                .map(|b| b.angular_velocity)
+                .unwrap_or(0.0);
+            Ok(v)
+        })?;
+        globals.set("get_angular_velocity", gav)?;
+
+        let sav = self.lua.create_function(move |_, (eid, w): (u64, f32)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
+                b.angular_velocity = w;
+                b.sleeping = false;
+                b.sleep_timer = 0.0;
+            }
+            Ok(())
+        })?;
+        globals.set("set_angular_velocity", sav)?;
+
+        let at = self.lua.create_function(move |_, (eid, torque): (u64, f32)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
+                b.torque += torque;
+                b.sleeping = false;
+                b.sleep_timer = 0.0;
+            }
+            Ok(())
+        })?;
+        globals.set("apply_torque", at)?;
+
+        let chj = self.lua.create_function(move |_, (eid, other, rest_length, stiffness): (u64, u64, f32, f32)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            let Some(other) = Entity::from_bits(other) else { return Ok(()); };
+            let _ = world.insert(
+                entity,
+                (HingeJoint {
+                    connected: other,
+                    rest_length,
+                    stiffness,
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                },),
+            );
+            Ok(())
+        })?;
+        globals.set("create_hinge_joint", chj)?;
+
+        let cfj = self.lua.create_function(
+            move |_, (eid, other, offset_x, offset_y, stiffness): (u64, u64, f32, f32, f32)| {
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let entity = Entity::from_bits(eid).unwrap();
+                let Some(other) = Entity::from_bits(other) else { return Ok(()); };
+                let _ = world.insert(
+                    entity,
+                    (FixedJoint {
+                        connected: other,
+                        offset_x,
+                        offset_y,
+                        stiffness,
+                        anchor_a: [0.0, 0.0, 0.0],
+                        anchor_b: [0.0, 0.0, 0.0],
+                    },),
+                );
+                Ok(())
+            },
+        )?;
+        globals.set("create_fixed_joint", cfj)?;
+
+        let csj = self.lua.create_function(
+            move |_, (eid, other, rest_length, stiffness, damping): (u64, u64, f32, f32, f32)| {
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let entity = Entity::from_bits(eid).unwrap();
+                let Some(other) = Entity::from_bits(other) else { return Ok(()); };
+                let _ = world.insert(
+                    entity,
+                    (SpringJoint {
+                        connected: other,
+                        rest_length,
+                        stiffness,
+                        damping,
+                        anchor_a: [0.0, 0.0, 0.0],
+                        anchor_b: [0.0, 0.0, 0.0],
+                    },),
+                );
+                Ok(())
+            },
+        )?;
+        globals.set("create_spring_joint", csj)?;
+
+        let crc = self.lua.create_function(move |_, (eid, other, max_length, stiffness): (u64, u64, f32, f32)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            let Some(other) = Entity::from_bits(other) else { return Ok(()); };
+            let _ = world.insert(
+                entity,
+                (RopeConstraint {
+                    connected: other,
+                    max_length,
+                    stiffness,
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                },),
+            );
+            Ok(())
+        })?;
+        globals.set("create_rope_constraint", crc)?;
+
+        // apply_force(entity, fx, fy, fz) — adds to current velocity
+        let af = self.lua.create_function(move |_, (eid, fx, fy, fz): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
             let entity = Entity::from_bits(eid).unwrap();
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.velocity_x += fx;
                 b.velocity_y += fy;
+                b._velocity_z += fz;
             }
             Ok(())
         })?;
@@ -335,6 +643,9 @@ impl ScriptEngine {
             Ok(g)
         })?;
         globals.set("is_on_ground", og)?;
+
+        let self_fn = self.lua.create_function(move |_, ()| Ok(entity_bits))?;
+        globals.set("self_entity", self_fn)?;
 
         // ── Health ────────────────────────────────────────────────────────
         // get_health(entity) → current, max
@@ -507,15 +818,255 @@ impl ScriptEngine {
             let has = match name.as_str() {
                 "Position" => world.get::<&Position>(entity).is_ok(),
                 "RigidBody" => world.get::<&RigidBody>(entity).is_ok(),
+                "Collider" => world.get::<&Collider>(entity).is_ok(),
+                "OrientedBoxCollider" => world.get::<&OrientedBoxCollider>(entity).is_ok(),
                 "Renderable" => world.get::<&Renderable>(entity).is_ok(),
                 "Rotation" => world.get::<&Rotation>(entity).is_ok(),
                 "MaterialTexture" => world.get::<&MaterialTexture>(entity).is_ok(),
                 "Health" => world.get::<&Health>(entity).is_ok(),
+                "HingeJoint" => world.get::<&HingeJoint>(entity).is_ok(),
+                "FixedJoint" => world.get::<&FixedJoint>(entity).is_ok(),
+                "SpringJoint" => world.get::<&SpringJoint>(entity).is_ok(),
+                "RopeConstraint" => world.get::<&RopeConstraint>(entity).is_ok(),
                 _ => false,
             };
             Ok(has)
         })?;
         globals.set("has_component", hc)?;
+
+        let gc = self.lua.create_function(move |lua, (eid, name): (u64, String)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            let table = lua.create_table()?;
+            let found = match name.as_str() {
+                "Position" => {
+                    if let Ok(c) = world.get::<&Position>(entity) {
+                        table.set("x", c.x)?;
+                        table.set("y", c.y)?;
+                        table.set("z", c.z)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Rotation" => {
+                    if let Ok(c) = world.get::<&Rotation>(entity) {
+                        table.set("pitch", c.pitch)?;
+                        table.set("yaw", c.yaw)?;
+                        table.set("roll", c.roll)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "RigidBody" => {
+                    if let Ok(c) = world.get::<&RigidBody>(entity) {
+                        table.set("body_type", match c.body_type {
+                            crate::components::BodyType::Static => "Static",
+                            crate::components::BodyType::Dynamic => "Dynamic",
+                            crate::components::BodyType::Kinematic => "Kinematic",
+                        })?;
+                        table.set("velocity_x", c.velocity_x)?;
+                        table.set("velocity_y", c.velocity_y)?;
+                        table.set("velocity_z", c._velocity_z)?;
+                        table.set("angular_velocity", c.angular_velocity)?;
+                        table.set("use_gravity", c.use_gravity)?;
+                        table.set("mass", c.mass)?;
+                        table.set("inertia", c.inertia)?;
+                        table.set("restitution", c.restitution)?;
+                        table.set("friction", c.friction)?;
+                        table.set("linear_damping", c.linear_damping)?;
+                        table.set("angular_damping", c.angular_damping)?;
+                        table.set("lock_rotation", c.lock_rotation)?;
+                        table.set("on_ground", c.on_ground)?;
+                        table.set("sleeping", c.sleeping)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Collider" => {
+                    if let Ok(c) = world.get::<&Collider>(entity) {
+                        table.set("half_w", c.half_w)?;
+                        table.set("half_h", c.half_h)?;
+                        table.set("half_d", c.half_d)?;
+                        table.set("layer", c.layer)?;
+                        table.set("mask", c.mask)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "OrientedBoxCollider" => {
+                    if let Ok(c) = world.get::<&OrientedBoxCollider>(entity) {
+                        table.set("half_w", c.half_w)?;
+                        table.set("half_h", c.half_h)?;
+                        table.set("half_d", c.half_d)?;
+                        table.set("angle_rad", c.angle_rad)?;
+                        table.set("layer", c.layer)?;
+                        table.set("mask", c.mask)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Renderable" => {
+                    if let Ok(c) = world.get::<&Renderable>(entity) {
+                        table.set("color_r", c.color[0])?;
+                        table.set("color_g", c.color[1])?;
+                        table.set("color_b", c.color[2])?;
+                        table.set("metallic", c.metallic)?;
+                        table.set("roughness", c.roughness)?;
+                        table.set("ao", c.ao)?;
+                        table.set("scale_x", c.scale[0])?;
+                        table.set("scale_y", c.scale[1])?;
+                        table.set("scale_z", c.scale[2])?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "MaterialTexture" => {
+                    if let Ok(c) = world.get::<&MaterialTexture>(entity) {
+                        table.set("path", c.path.clone())?;
+                        table.set("normal_path", c.normal_path.clone())?;
+                        table.set("metallic_roughness_path", c.metallic_roughness_path.clone())?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Health" => {
+                    if let Ok(c) = world.get::<&Health>(entity) {
+                        table.set("current", c.current)?;
+                        table.set("max", c.max)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if found { Ok(Some(table)) } else { Ok(None) }
+        })?;
+        globals.set("get_component", gc)?;
+
+        let sc = self.lua.create_function(move |_, (eid, name, data): (u64, String, LuaTable)| {
+            let world = unsafe { &mut *(world_ptr as *mut World) };
+            let entity = Entity::from_bits(eid).unwrap();
+            let ok = match name.as_str() {
+                "Position" => {
+                    if let Ok(mut c) = world.get::<&mut Position>(entity) {
+                        if let Ok(v) = data.get::<f32>("x") { c.x = v; }
+                        if let Ok(v) = data.get::<f32>("y") { c.y = v; }
+                        if let Ok(v) = data.get::<f32>("z") { c.z = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Rotation" => {
+                    if let Ok(mut c) = world.get::<&mut Rotation>(entity) {
+                        if let Ok(v) = data.get::<f32>("pitch") { c.pitch = v; }
+                        if let Ok(v) = data.get::<f32>("yaw") { c.yaw = v; }
+                        if let Ok(v) = data.get::<f32>("roll") { c.roll = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "RigidBody" => {
+                    if let Ok(mut c) = world.get::<&mut RigidBody>(entity) {
+                        if let Ok(v) = data.get::<String>("body_type") {
+                            c.body_type = match v.as_str() {
+                                "Static" => crate::components::BodyType::Static,
+                                "Kinematic" => crate::components::BodyType::Kinematic,
+                                _ => crate::components::BodyType::Dynamic,
+                            };
+                        }
+                        if let Ok(v) = data.get::<f32>("velocity_x") { c.velocity_x = v; }
+                        if let Ok(v) = data.get::<f32>("velocity_y") { c.velocity_y = v; }
+                        if let Ok(v) = data.get::<f32>("velocity_z") { c._velocity_z = v; }
+                        if let Ok(v) = data.get::<f32>("angular_velocity") { c.angular_velocity = v; }
+                        if let Ok(v) = data.get::<bool>("use_gravity") { c.use_gravity = v; }
+                        if let Ok(v) = data.get::<f32>("mass") { c.mass = v; }
+                        if let Ok(v) = data.get::<f32>("inertia") { c.inertia = v; }
+                        if let Ok(v) = data.get::<f32>("restitution") { c.restitution = v; }
+                        if let Ok(v) = data.get::<f32>("friction") { c.friction = v; }
+                        if let Ok(v) = data.get::<f32>("linear_damping") { c.linear_damping = v; }
+                        if let Ok(v) = data.get::<f32>("angular_damping") { c.angular_damping = v; }
+                        if let Ok(v) = data.get::<bool>("lock_rotation") { c.lock_rotation = v; }
+                        if let Ok(v) = data.get::<bool>("on_ground") { c.on_ground = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Collider" => {
+                    if let Ok(mut c) = world.get::<&mut Collider>(entity) {
+                        if let Ok(v) = data.get::<f32>("half_w") { c.half_w = v; }
+                        if let Ok(v) = data.get::<f32>("half_h") { c.half_h = v; }
+                        if let Ok(v) = data.get::<f32>("half_d") { c.half_d = v; }
+                        if let Ok(v) = data.get::<u32>("layer") { c.layer = v; }
+                        if let Ok(v) = data.get::<u32>("mask") { c.mask = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "OrientedBoxCollider" => {
+                    if let Ok(mut c) = world.get::<&mut OrientedBoxCollider>(entity) {
+                        if let Ok(v) = data.get::<f32>("half_w") { c.half_w = v; }
+                        if let Ok(v) = data.get::<f32>("half_h") { c.half_h = v; }
+                        if let Ok(v) = data.get::<f32>("half_d") { c.half_d = v; }
+                        if let Ok(v) = data.get::<f32>("angle_rad") { c.angle_rad = v; }
+                        if let Ok(v) = data.get::<u32>("layer") { c.layer = v; }
+                        if let Ok(v) = data.get::<u32>("mask") { c.mask = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Renderable" => {
+                    if let Ok(mut c) = world.get::<&mut Renderable>(entity) {
+                        if let Ok(v) = data.get::<f32>("color_r") { c.color[0] = v; }
+                        if let Ok(v) = data.get::<f32>("color_g") { c.color[1] = v; }
+                        if let Ok(v) = data.get::<f32>("color_b") { c.color[2] = v; }
+                        if let Ok(v) = data.get::<f32>("metallic") { c.metallic = v; }
+                        if let Ok(v) = data.get::<f32>("roughness") { c.roughness = v; }
+                        if let Ok(v) = data.get::<f32>("ao") { c.ao = v; }
+                        if let Ok(v) = data.get::<f32>("scale_x") { c.scale[0] = v; }
+                        if let Ok(v) = data.get::<f32>("scale_y") { c.scale[1] = v; }
+                        if let Ok(v) = data.get::<f32>("scale_z") { c.scale[2] = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "MaterialTexture" => {
+                    if let Ok(mut c) = world.get::<&mut MaterialTexture>(entity) {
+                        if let Ok(v) = data.get::<String>("path") { c.path = v; }
+                        if let Ok(v) = data.get::<String>("normal_path") { c.normal_path = v; }
+                        if let Ok(v) = data.get::<String>("metallic_roughness_path") { c.metallic_roughness_path = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "Health" => {
+                    if let Ok(mut c) = world.get::<&mut Health>(entity) {
+                        if let Ok(v) = data.get::<i32>("current") { c.current = v; }
+                        if let Ok(v) = data.get::<i32>("max") { c.max = v; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            Ok(ok)
+        })?;
+        globals.set("set_component", sc)?;
 
         // ── Entity lifetime ───────────────────────────────────────────────
         // destroy(entity) — deferred removal, processed after scripting_system.
@@ -566,12 +1117,73 @@ impl ScriptEngine {
         })?;
         globals.set("clamp", clamp_f)?;
 
+        // ── Camera control ───────────────────────────────────────────────
+        // get_camera() -> px, py, pz, tx, ty, tz
+        let gc = self.lua.create_function(move |_, ()| {
+            Ok((
+                camera_pos_copy[0],
+                camera_pos_copy[1],
+                camera_pos_copy[2],
+                camera_target_copy[0],
+                camera_target_copy[1],
+                camera_target_copy[2],
+            ))
+        })?;
+        globals.set("get_camera", gc)?;
+        // set_camera(px, py, pz, tx, ty, tz)
+        let cam_ptr = self.pending_camera_set.get() as usize;
+        let scam = self.lua.create_function(
+            move |_, (px, py, pz, tx, ty, tz): (f32, f32, f32, f32, f32, f32)| {
+                let slot = unsafe { &mut *(cam_ptr as *mut Option<([f32; 3], [f32; 3])>) };
+                *slot = Some(([px, py, pz], [tx, ty, tz]));
+                Ok(())
+            },
+        )?;
+        globals.set("set_camera", scam)?;
+        // look_at(tx, ty, tz) keeps current camera position.
+        let cam_ptr2 = self.pending_camera_set.get() as usize;
+        let lka = self.lua.create_function(move |_, (tx, ty, tz): (f32, f32, f32)| {
+            let slot = unsafe { &mut *(cam_ptr2 as *mut Option<([f32; 3], [f32; 3])>) };
+            *slot = Some((camera_pos_copy, [tx, ty, tz]));
+            Ok(())
+        })?;
+        globals.set("look_at", lka)?;
+        // skip_next_frames(n) asks runtime to skip simulation for N frames.
+        let skip_ptr = self.pending_frame_skip.get() as usize;
+        let sk = self.lua.create_function(move |_, n: u32| {
+            let slot = unsafe { &mut *(skip_ptr as *mut u32) };
+            *slot = (*slot).max(n.min(600));
+            Ok(())
+        })?;
+        globals.set("skip_next_frames", sk)?;
+
         // ── Δt passthrough ────────────────────────────────────────────────
         // Scripts receive dt as the second argument to update(entity, dt),
         // but also expose it as a global so helper functions can read it.
         globals.set("dt", dt)?;
 
         // ── Call entity-local update(entity_id, dt) ───────────────────────
+        let mut needs_mark_started = false;
+        {
+            let instance = self.instances.get(&entity_bits).ok_or_else(|| {
+                LuaError::RuntimeError("Script instance missing after build".to_string())
+            })?;
+            if !instance.started {
+                if let Some(start_key) = instance.start_key.as_ref() {
+                    let start_fn: LuaFunction = self.lua.registry_value(start_key)?;
+                    let env: LuaTable = self.lua.registry_value(&instance.env_key)?;
+                    start_fn.set_environment(env)?;
+                    start_fn.call::<()>(entity_bits)?;
+                }
+                needs_mark_started = true;
+            }
+        }
+        if needs_mark_started {
+            if let Some(inst) = self.instances.get_mut(&entity_bits) {
+                inst.started = true;
+            }
+        }
+
         let instance = self.instances.get(&entity_bits).ok_or_else(|| {
             LuaError::RuntimeError("Script instance missing after build".to_string())
         })?;
@@ -580,6 +1192,59 @@ impl ScriptEngine {
         update_fn.set_environment(env)?;
         update_fn.call::<()>((entity_bits, dt))?;
 
+        Ok(())
+    }
+
+    pub fn dispatch_collision_events(&mut self, collisions: &[CollisionPair]) -> LuaResult<()> {
+        for collision in collisions {
+            self.dispatch_collision_for_entity(
+                collision.entity_a,
+                collision.entity_b,
+                collision.phase,
+                collision.normal,
+                collision.penetration,
+            )?;
+            self.dispatch_collision_for_entity(
+                collision.entity_b,
+                collision.entity_a,
+                collision.phase,
+                [-collision.normal[0], -collision.normal[1], -collision.normal[2]],
+                collision.penetration,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_collision_for_entity(
+        &mut self,
+        entity: Entity,
+        other: Entity,
+        phase: CollisionPhase,
+        normal: [f32; 3],
+        penetration: f32,
+    ) -> LuaResult<()> {
+        let Some(instance) = self.instances.get(&entity.to_bits().get()) else {
+            return Ok(());
+        };
+        let callback_key = match phase {
+            CollisionPhase::Started => instance.collision_enter_key.as_ref(),
+            CollisionPhase::Ongoing => instance.collision_stay_key.as_ref(),
+            CollisionPhase::Ended => instance.collision_exit_key.as_ref(),
+        };
+        let Some(callback_key) = callback_key else {
+            return Ok(());
+        };
+        let env: LuaTable = self.lua.registry_value(&instance.env_key)?;
+        let callback: LuaFunction = self.lua.registry_value(callback_key)?;
+        callback.set_environment(env)?;
+        callback.call::<()>((
+            entity.to_bits().get(),
+            other.to_bits().get(),
+            normal[0],
+            normal[1],
+            normal[2],
+            penetration,
+        ))?;
         Ok(())
     }
 }

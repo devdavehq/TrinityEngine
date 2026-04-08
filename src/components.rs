@@ -28,21 +28,142 @@ pub struct Velocity {
 }
 
 // RigidBody — physics simulation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyType {
+    Static,
+    Dynamic,
+    Kinematic,
+}
+
+#[derive(Clone, Copy)]
 pub struct RigidBody {
+    pub body_type:   BodyType,
     pub velocity_x:  f32,
     pub velocity_y:  f32,
-    pub _velocity_z: f32,  // Reserved for future 3D
+    pub _velocity_z: f32,
+    pub angular_velocity: f32,
+    pub angular_damping: f32,
+    pub torque: f32,
     pub on_ground:   bool,
     pub use_gravity: bool,
+    pub mass:        f32,
+    pub inertia:     f32,
+    pub restitution: f32,
+    pub friction:    f32,
+    pub linear_damping: f32,
+    pub lock_rotation: bool,
+    pub can_sleep:   bool,
+    pub sleeping:    bool,
+    pub sleep_timer: f32,
+}
+
+impl RigidBody {
+    pub fn dynamic() -> Self {
+        Self {
+            body_type: BodyType::Dynamic,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            _velocity_z: 0.0,
+            angular_velocity: 0.0,
+            angular_damping: 0.16,
+            torque: 0.0,
+            on_ground: false,
+            use_gravity: true,
+            mass: 1.0,
+            inertia: 1.0,
+            restitution: 0.0,
+            friction: 0.55,
+            linear_damping: 0.08,
+            lock_rotation: false,
+            can_sleep: true,
+            sleeping: false,
+            sleep_timer: 0.0,
+        }
+    }
+
+    pub fn kinematic() -> Self {
+        let mut body = Self::dynamic();
+        body.body_type = BodyType::Kinematic;
+        body.use_gravity = false;
+        body.on_ground = true;
+        body.lock_rotation = true;
+        body.can_sleep = false;
+        body
+    }
+
+    #[allow(dead_code)]
+    pub fn static_body() -> Self {
+        let mut body = Self::dynamic();
+        body.body_type = BodyType::Static;
+        body.use_gravity = false;
+        body.on_ground = true;
+        body.mass = 0.0;
+        body.inertia = 0.0;
+        body.lock_rotation = true;
+        body.can_sleep = false;
+        body
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct HingeJoint {
+    pub connected: hecs::Entity,
+    pub rest_length: f32,
+    pub stiffness: f32,
+    pub anchor_a: [f32; 3],
+    pub anchor_b: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+pub struct FixedJoint {
+    pub connected: hecs::Entity,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub stiffness: f32,
+    pub anchor_a: [f32; 3],
+    pub anchor_b: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+pub struct SpringJoint {
+    pub connected: hecs::Entity,
+    pub rest_length: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+    pub anchor_a: [f32; 3],
+    pub anchor_b: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+pub struct RopeConstraint {
+    pub connected: hecs::Entity,
+    pub max_length: f32,
+    pub stiffness: f32,
+    pub anchor_a: [f32; 3],
+    pub anchor_b: [f32; 3],
 }
 
 // Collider — axis-aligned bounding box.
+#[derive(Clone, Copy)]
 pub struct Collider {
     pub half_w: f32,
     pub half_h: f32,
     #[allow(dead_code)]
     pub half_d: f32,  // depth for 3D
+    pub layer: u32,
+    pub mask: u32,
+}
 
+// OrientedBoxCollider — 2D rotation-aware physics box (X/Y plane).
+// Angle is in radians. Used by SAT overlap tests in physics.
+#[derive(Clone, Copy)]
+pub struct OrientedBoxCollider {
+    pub half_w: f32,
+    pub half_h: f32,
+    pub half_d: f32,
+    pub angle_rad: f32,
+    pub layer: u32,
+    pub mask: u32,
 }
 
 // FoliageWind stores base pose and wind sway parameters for vegetation.
@@ -59,6 +180,7 @@ pub struct Script {
 }
 
 // MaterialTexture keeps the content texture path assigned by editor/tools.
+#[derive(Clone)]
 pub struct MaterialTexture {
     pub path: String,
     pub normal_path: String,
@@ -120,4 +242,14 @@ impl Health {
 pub struct CollisionPair {
     pub entity_a: hecs::Entity,
     pub entity_b: hecs::Entity,
+    pub normal: [f32; 3],
+    pub penetration: f32,
+    pub phase: CollisionPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionPhase {
+    Started,
+    Ongoing,
+    Ended,
 }

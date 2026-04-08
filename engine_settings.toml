@@ -71,3 +71,43 @@ script_hot_reload_enabled = true
 preferred_script_editor = ""
 # Watch Content/ for .obj/.png/.jpg changes and hot-reload assets.
 asset_hot_reload_enabled = true
+# Fast-object safety mode (substeps) to reduce bullet tunneling.
+physics_ccd_enabled = false
+# Upper bound for CCD substeps.
+physics_max_substeps = 2
+# Spatial hash broadphase reduces pair counts on larger scenes.
+physics_broadphase_enabled = true
+# Bucket size used by the broadphase hash.
+physics_broadphase_cell_size = 2.5
+# More iterations improve stability but cost more CPU.
+physics_solver_iterations = 2
+# Push intersecting bodies apart after contact solve.
+physics_position_correction_enabled = true
+# Sliding / wall friction response.
+physics_friction_enabled = true
+# Let idle bodies sleep to save CPU.
+physics_sleeping_enabled = true
+# Track collision started/stay/ended phases.
+physics_collision_events_enabled = false
+# Move foliage with smoothing instead of hard snapping.
+physics_smooth_foliage_motion = false
+# Enable spin / torque integration.
+physics_angular_dynamics_enabled = true
+# Advanced articulated constraints are heavier; keep off on this laptop.
+physics_advanced_constraints_enabled = false
+# Extra passes for joint / rope stability when advanced constraints are enabled.
+physics_constraint_iterations = 1
+# Use local anchor offsets when solving joints.
+physics_local_anchor_constraints_enabled = false
+# Enable full 3D OBB contact testing for rotated boxes.
+physics_3d_obb_contacts_enabled = false
+# Experimental articulated impulse solver path.
+physics_articulated_impulse_solver_enabled = false
+# Experimental manifold caching and warm starting.
+physics_manifold_warm_start_enabled = false
+# Experimental full 3-axis angular dynamics path.
+physics_full_angular_3d_enabled = false
+# GPU profile scaffold: auto, low, balanced, high, experimental.
+gpu_scalability_tier = "auto"
+# Old floating Hierarchy/Details panels instead of the docking workspace (deprecated).
+legacy_editor_ui = false

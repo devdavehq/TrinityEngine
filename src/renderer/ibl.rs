@@ -28,19 +28,15 @@ pub struct IblMaps {
 }
 
 impl IblMaps {
-    // from_hdr() loads an equirectangular .hdr file and produces all three maps.
+    // from_hdr() loads an equirectangular HDR-like image (.hdr/.exr) and produces all maps.
     pub fn from_hdr(
         device: &Device,
         queue:  &Queue,
         path:   &str,
     ) -> Result<IblMaps, String> {
 
-        // Read the raw HDR bytes from disk.
-        let hdr_data = std::fs::read(path)
-            .map_err(|e| format!("Cannot read HDR {}: {}", path, e))?;
-
-        let dyn_img = image::load_from_memory_with_format(&hdr_data, image::ImageFormat::Hdr)
-            .map_err(|e| format!("Cannot decode HDR: {}", e))?;
+        let dyn_img = image::open(path)
+            .map_err(|e| format!("Cannot open sky image {}: {}", path, e))?;
         let rgb = dyn_img.to_rgb32f();
         let width = rgb.width();
         let height = rgb.height();

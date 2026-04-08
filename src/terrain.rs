@@ -142,20 +142,18 @@ pub fn spawn_foliage_ring(
         ));
 
         if with_tree_physics {
+            let mut foliage_body = RigidBody::kinematic();
+            foliage_body.friction = 0.85;
             let _ = world.insert(
                 e,
                 (
-                    RigidBody {
-                        velocity_x: 0.0,
-                        velocity_y: 0.0,
-                        _velocity_z: 0.0,
-                        on_ground: true,
-                        use_gravity: false,
-                    },
+                    foliage_body,
                     Collider {
                         half_w: scale * 0.5,
                         half_h: scale * 1.5,
                         half_d: scale * 0.5,
+                        layer: 1,
+                        mask: 1,
                     },
                     FoliageWind {
                         base_x: x,
@@ -190,4 +188,3 @@ pub fn remove_nearby_foliage(world: &mut World, center_x: f32, center_z: f32, ra
     }
     count
 }
-

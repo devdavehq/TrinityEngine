@@ -90,6 +90,20 @@ impl MaterialLibrary {
         Self { masters, instances }
     }
 
+    /// Names of material instances (for editor buttons).
+    pub fn instance_names(&self) -> Vec<&'static str> {
+        let mut v: Vec<_> = self.instances.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    /// Registered master material ids.
+    pub fn master_names(&self) -> Vec<&'static str> {
+        let mut v: Vec<_> = self.masters.keys().copied().collect();
+        v.sort();
+        v
+    }
+
     pub fn print_help() {
         println!("[Materials] Master + Instance workflow (no node graph):");
         println!("  1 = apply 'matte_black' to selected entity");

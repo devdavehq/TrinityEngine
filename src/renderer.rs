@@ -33,6 +33,11 @@ pub struct DrawStats {
     pub drawn: usize,
 }
 
+/// Shared staging vertex buffer: one mesh is copied here per draw call.
+/// Capsules and other procedurals easily exceed the old 1024 cap; keep this generous
+/// until meshes use dedicated GPU buffers.
+const MAX_VERTICES_PER_DRAW: usize = 262_144;
+
 // ── GpuUniforms ──────────────────────────────────────────────────────────────
 // Mirrors the Uniforms struct in shader.wgsl exactly.
 // repr(C) + Pod + Zeroable: required for bytemuck::bytes_of().
@@ -138,6 +143,58 @@ impl RenderFeatures {
             sun_intensity: 0.9,
         }
     }
+
+    pub fn balanced() -> Self {
+        Self::default()
+    }
+
+    pub fn high_end() -> Self {
+        Self {
+            shadows_enabled: true,
+            pcf_enabled: true,
+            pcss_enabled: true,
+            ibl_enabled: true,
+            probes_enabled: true,
+            volumetric_enabled: true,
+            shadow_resolution: 4096,
+            pcf_samples: 16,
+            culling_enabled: true,
+            culling_distance: 220.0,
+            frustum_culling_enabled: true,
+            bloom_enabled: true,
+            bloom_strength: 0.25,
+            ssao_enabled: true,
+            ssao_strength: 0.5,
+            volumetric_fog_enabled: true,
+            fog_density: 0.04,
+            voxel_gi_enabled: true,
+            voxel_gi_strength: 0.3,
+            sun_azimuth_deg: 35.0,
+            sun_elevation_deg: 42.0,
+            sun_intensity: 1.0,
+        }
+    }
+
+    pub fn experimental() -> Self {
+        let mut f = Self::high_end();
+        f.shadow_resolution = 8192;
+        f.pcf_samples = 25;
+        f.culling_distance = 280.0;
+        f.bloom_strength = 0.32;
+        f.ssao_strength = 0.62;
+        f.fog_density = 0.055;
+        f.voxel_gi_strength = 0.4;
+        f
+    }
+
+    pub fn from_tier_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "low" => Self::low_end(),
+            "high" => Self::high_end(),
+            "experimental" => Self::experimental(),
+            "balanced" | "auto" | _ => Self::balanced(),
+        }
+    }
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
@@ -155,6 +212,7 @@ pub struct Renderer {
     vertex_buffer: wgpu::Buffer,
     uniform_buf:   wgpu::Buffer,
     bind_group:    wgpu::BindGroup,
+    global_bgl:    wgpu::BindGroupLayout,
     depth_texture: wgpu::Texture,
     depth_view:    wgpu::TextureView,
     scene_color:   wgpu::Texture,
@@ -268,10 +326,11 @@ impl Renderer {
         let (bloom_b, bloom_b_view) = make_bloom_texture(&device, &config, "Bloom B");
 
         // ── Vertex buffer ─────────────────────────────────────────────────
-        // 1024 vertices × size_of Vertex. Overwritten per entity each frame.
+        // Staging buffer overwritten once per mesh draw (see MAX_VERTICES_PER_DRAW).
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("Vertices"),
-            size:               (1024 * std::mem::size_of::<crate::assets::mesh::Vertex>()) as u64,
+            size:               (MAX_VERTICES_PER_DRAW as u64)
+                * (std::mem::size_of::<crate::assets::mesh::Vertex>() as u64),
             usage:              wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -434,6 +493,7 @@ impl Renderer {
             vertex_buffer,
             uniform_buf,
             bind_group,
+            global_bgl,
             depth_texture,
             depth_view,
             scene_color,
@@ -714,20 +774,30 @@ impl Renderer {
                     let dy = pos.y - cam_pos.y;
                     let dz = pos.z - cam_pos.z;
                     let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-                    let lod_band = if distance > 160.0 {
+                    let max_scale = renderable.scale[0]
+                        .abs()
+                        .max(renderable.scale[1].abs())
+                        .max(renderable.scale[2].abs())
+                        .max(0.25);
+                    // Scale-aware LOD: larger objects hold detail longer than tiny props.
+                    let lod_metric = distance / max_scale;
+                    let lod_band = if lod_metric > 300.0 {
+                        4u8
+                    } else if lod_metric > 180.0 {
                         3u8
-                    } else if distance > 90.0 {
+                    } else if lod_metric > 95.0 {
                         2u8
-                    } else if distance > 45.0 {
+                    } else if lod_metric > 48.0 {
                         1u8
                     } else {
                         0u8
                     };
                     let lod_ratio = match lod_band {
                         0 => 1.0,
-                        1 => 0.70,
-                        2 => 0.45,
-                        _ => 0.28,
+                        1 => 0.78,
+                        2 => 0.56,
+                        3 => 0.34,
+                        _ => 0.20,
                     };
 
                     let lod_vertices: Vec<crate::assets::mesh::Vertex> = if lod_band == 0 {
@@ -792,9 +862,10 @@ impl Renderer {
                         stats.drawn += 1;
                     } else {
                         eprintln!(
-                            "[Renderer] Mesh too large ({} verts), skipping. \
-                             Increase vertex buffer size.",
-                            colored_verts.len()
+                            "[Renderer] Mesh too large ({} verts); max {} per draw. \
+                             Import a lower-poly mesh or raise MAX_VERTICES_PER_DRAW in renderer.rs.",
+                            colored_verts.len(),
+                            MAX_VERTICES_PER_DRAW
                         );
                     }
                 }
@@ -938,6 +1009,15 @@ impl Renderer {
         &self.scene_view
     }
 
+    pub fn invalidate_texture_path(&self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let mut cache = self.texture_cache.borrow_mut();
+        cache.remove(&format!("srgb|{}", path));
+        cache.remove(&format!("lin|{}", path));
+    }
+
     fn get_or_load_texture(&self, path: &str, srgb: bool) -> Option<(wgpu::TextureView, wgpu::Sampler)> {
         if path.is_empty() {
             return None;
@@ -991,6 +1071,58 @@ impl Renderer {
             .borrow_mut()
             .insert(cache_key, (view.clone(), sampler.clone()));
         Some((view, sampler))
+    }
+
+    pub fn apply_sky_environment(&mut self, path: &str) -> Result<(), String> {
+        let p = path.trim();
+        let make_bg = if p.is_empty() {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   Some("Global BG (fallback sky)"),
+                layout:  &self.global_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding:  0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
+                    wgpu::BindGroupEntry { binding: 7, resource: self._shadow_fallback_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self._shadow_fallback_sampler) },
+                ],
+            })
+        } else {
+            let ibl_maps = ibl::IblMaps::from_hdr(&self.device, &self.queue, p)?;
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   Some("Global BG (custom sky hdr)"),
+                layout:  &self.global_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding:  0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&ibl_maps.irradiance_view)  },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&ibl_maps.irradiance_sampler)  },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ibl_maps.prefilter_view)  },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&ibl_maps.prefilter_sampler)  },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&ibl_maps.brdf_lut_view)  },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&ibl_maps.brdf_lut_sampler)  },
+                    wgpu::BindGroupEntry { binding: 7, resource: self._shadow_fallback_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self._shadow_fallback_sampler) },
+                ],
+            })
+        };
+        self.bind_group = make_bg;
+        Ok(())
     }
 }
 

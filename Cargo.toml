@@ -17,7 +17,7 @@ log      = "0.4"
 hecs     = "0.11.0"
 # image   = "0.25"   # loads PNG, JPG textures
 # For HDR loading we use image's hdr feature:
-image   = { version = "0.25", features = ["hdr"] }
+image   = { version = "0.25", features = ["hdr", "exr"] }
 gilrs = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
@@ -25,7 +25,9 @@ rayon = "1"
 egui = "0.34.1"
 egui-wgpu = "0.34.1"
 egui-winit = "0.34.1"
-egui_dock = "0.19.1"
+egui_dock = { version = "0.19.1", features = ["serde"] }
+serde_json = "1"
+gltf = "1.4.1"
 
 
 [lib]

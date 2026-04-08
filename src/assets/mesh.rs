@@ -44,6 +44,14 @@ impl Mesh {
     // load() reads an OBJ file and returns a Mesh.
     // This version reads vertex positions, normals, and face indices.
     pub fn load(path: &str) -> Result<Mesh, String> {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext == "gltf" || ext == "glb" {
+            return Self::load_gltf(path);
+        }
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Cannot read {}: {}", path, e))?;
 
@@ -113,6 +121,50 @@ impl Mesh {
             return Err(format!("No geometry in {}", path));
         }
         Ok(Mesh { vertices })
+    }
+
+    fn load_gltf(path: &str) -> Result<Mesh, String> {
+        let (doc, buffers, _) = gltf::import(path)
+            .map_err(|e| format!("Cannot import glTF {}: {}", path, e))?;
+        let mut out: Vec<Vertex> = Vec::new();
+        for mesh in doc.meshes() {
+            for prim in mesh.primitives() {
+                let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+                let Some(positions_iter) = reader.read_positions() else {
+                    continue;
+                };
+                let positions: Vec<[f32; 3]> = positions_iter.collect();
+                if positions.is_empty() {
+                    continue;
+                }
+                let normals: Vec<[f32; 3]> = reader
+                    .read_normals()
+                    .map(|n| n.collect())
+                    .unwrap_or_else(|| vec![[0.0, 0.0, 1.0]; positions.len()]);
+                if let Some(indices) = reader.read_indices() {
+                    let idx: Vec<u32> = indices.into_u32().collect();
+                    for tri in idx.chunks_exact(3) {
+                        for i in tri {
+                            let ii = *i as usize;
+                            let p = positions.get(ii).copied().unwrap_or([0.0; 3]);
+                            let n = normals.get(ii).copied().unwrap_or([0.0, 0.0, 1.0]);
+                            out.push(Vertex::new(p, n, [1.0, 1.0, 1.0]));
+                        }
+                    }
+                } else {
+                    for tri in positions.chunks_exact(3).zip(normals.chunks_exact(3)) {
+                        let (pp, nn) = tri;
+                        out.push(Vertex::new(pp[0], nn[0], [1.0, 1.0, 1.0]));
+                        out.push(Vertex::new(pp[1], nn[1], [1.0, 1.0, 1.0]));
+                        out.push(Vertex::new(pp[2], nn[2], [1.0, 1.0, 1.0]));
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("No mesh primitives found in {}", path));
+        }
+        Ok(Mesh { vertices: out })
     }
 
     pub fn make_plane(size_x: f32, size_z: f32) -> Mesh {

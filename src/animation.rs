@@ -15,6 +15,7 @@ pub struct Animator {
     pub speed: f32,
     pub phase: f32,
     pub base_scale_y: f32,
+    pub base_pos_y: f32,
 }
 
 impl Animator {
@@ -24,6 +25,7 @@ impl Animator {
             speed: 1.0,
             phase: 0.0,
             base_scale_y: 1.0,
+            base_pos_y: f32::NAN,
         }
     }
 }
@@ -33,6 +35,9 @@ pub fn animation_system(world: &mut World, dt: f32, jobs: &JobSystem) {
     let _parallel_enabled = jobs.enabled();
 
     for (anim, pos, renderable) in world.query_mut::<(&mut Animator, &mut Position, &mut Renderable)>() {
+        if anim.base_pos_y.is_nan() {
+            anim.base_pos_y = pos.y;
+        }
         let rate = match anim.state {
             AnimState::Idle => 1.0,
             AnimState::Walk => 2.0,
@@ -43,16 +48,17 @@ pub fn animation_system(world: &mut World, dt: f32, jobs: &JobSystem) {
         match anim.state {
             AnimState::Idle => {
                 // Gentle breathing/sway.
+                pos.y = anim.base_pos_y + (anim.phase * 1.1).sin() * 0.005;
                 renderable.scale[1] = anim.base_scale_y + (anim.phase * 2.0).sin() * 0.02;
             }
             AnimState::Walk => {
                 // Slight bob + sway.
-                pos.y += (anim.phase * 6.0).sin() * 0.004;
+                pos.y = anim.base_pos_y + (anim.phase * 6.0).sin() * 0.03;
                 renderable.scale[1] = anim.base_scale_y + (anim.phase * 4.0).sin() * 0.03;
             }
             AnimState::Run => {
                 // Stronger bob for running.
-                pos.y += (anim.phase * 9.0).sin() * 0.007;
+                pos.y = anim.base_pos_y + (anim.phase * 9.0).sin() * 0.05;
                 renderable.scale[1] = anim.base_scale_y + (anim.phase * 7.0).sin() * 0.05;
             }
         }
