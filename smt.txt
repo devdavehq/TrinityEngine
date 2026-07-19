@@ -1,156 +1,558 @@
-// src/scene/loader.rs
-// Reads .scene files and returns a list of entity descriptions.
-// The engine spawns ECS entities from these descriptions.
+PHASE 1 - CORE INFRASTRUCTURE (Build These First)
+═══════════════════════════════════════════════════
+  ✅ Platform       (winit + wgpu)
+  ⚠️ Core           (partially - need event bus, VFS, reflection)
+  ⚠️ Math           (using glam, but need transform/bounds utilities)
+  ❌ Memory         (custom allocators)
+  ✅ Thread Pool    (rayon)
+  ⚠️ Job System     (exists but thin)
+  ❌ Event System   (CRITICAL - everything needs this)
+  ❌ Reflection     (needed for editor inspector, serialization)
+  ❌ Serialization  (needed for scene save, prefabs)
+  ❌ VFS            (needed for asset pipeline)
 
-use std::collections::HashMap;
+PHASE 2 - ASSET PIPELINE
+═══════════════════════════════════════════════════
+  ⚠️ Asset Pipeline (basic store exists, need proper pipeline)
+  ❌ Asset Manager  (proper loading/caching/streaming)
 
-// EntityDesc holds everything needed to spawn one entity.
-// All fields have defaults — you only write what you need in the scene file.
-#[derive(Debug, Clone)]
-pub struct EntityDesc {
-    pub name:      String,
-    pub mesh:      String,          // path to .obj file
-    pub position:  [f32; 3],
-    pub scale:     [f32; 3],        // non-uniform scale: x, y, z
-    pub color:     [f32; 3],
-    pub metallic:  f32,
-    pub roughness: f32,
-    pub ao:        f32,
-    pub script:    Option<String>,  // optional Lua script path
-}
+PHASE 3 - SCENE + ECS
+═══════════════════════════════════════════════════
+  ⚠️ Scene System   (load works, need save + prefab)
+  ⚠️ ECS            (hecs works, need system ordering + registration)
 
-impl Default for EntityDesc {
-    fn default() -> Self {
-        Self {
-            name:      "entity".to_string(),
-            mesh:      "meshes/cube.obj".to_string(),
-            position:  [0.0, 0.0, 0.0],
-            scale:     [1.0, 1.0, 1.0],   // default: no scaling
-            color:     [1.0, 1.0, 1.0],   // default: white
-            metallic:  0.0,
-            roughness: 0.5,
-            ao:        1.0,
-            script:    None,
-        }
-    }
-}
+PHASE 4 - RENDERING
+═══════════════════════════════════════════════════
+  ⚠️ Renderer       (forward PBR exists, need render graph)
+  ❌ Shader System  (need compilation/management)
+  ⚠️ Materials      (master+instance exists, need serialization)
+  ⚠️ Lighting       (basic exists, need CSM)
+  ❌ Tone Mapping
+  ❌ Color Grading
+  ❌ SSR
+  ❌ GPU Instancing
+  ❌ Deferred option
 
-// parse_scene() reads a .scene file and returns all entity descriptions.
-// Returns an error string if the file can't be read.
-pub fn parse_scene(path: &str) -> Result<Vec<EntityDesc>, String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| format!("Cannot read scene {}: {}", path, e))?;
+PHASE 5 - ENVIRONMENT
+═══════════════════════════════════════════════════
+  ❌ Procedural Sky
+  ❌ Sun/Moon
+  ❌ Stars
+  ❌ Clouds (layered then volumetric)
+  ❌ Weather
+  ❌ Day/Night Cycle
+  ❌ Atmospheric Scattering
 
-    let mut entities: Vec<EntityDesc> = Vec::new();
-    // current holds the entity being built right now.
-    // When we hit a new [entity] line, we push current and start fresh.
-    let mut current: Option<EntityDesc> = None;
+PHASE 6 - ANIMATION
+═══════════════════════════════════════════════════
+  ❌ Skeletal Animation
+  ❌ Animation Clips
+  ❌ Blend Trees
+  ❌ State Machine
 
-    for line in contents.lines() {
-        let line = line.trim();
+PHASE 7 - PHYSICS (Enhancements)
+═══════════════════════════════════════════════════
+  ✅ Core physics works
+  ❌ Shape variety (sphere, capsule, mesh collider)
+  ❌ CCD (continuous collision detection)
+  ❌ Physics material system
 
-        // Skip blank lines and comments.
-        if line.is_empty() || line.starts_with('#') { continue; }
+PHASE 8 - LUA (Enhancements)
+═══════════════════════════════════════════════════
+  ✅ Core Lua works
+  ❌ Physics API in Lua
+  ❌ Audio API in Lua
+  ❌ UI API in Lua (partial)
+  ❌ Particle API in Lua
 
-        if line == "[entity]" {
-            // Starting a new entity block.
-            // If we were building one, save it.
-            if let Some(desc) = current.take() {
-                entities.push(desc);
-            }
-            // Start fresh with defaults.
-            current = Some(EntityDesc::default());
-            continue;
-        }
+PHASE 9 - AUDIO
+═══════════════════════════════════════════════════
+  ❌ Audio System (rodio or similar)
+  ❌ 3D Spatial Audio
+  ❌ Music/SFX management
 
-        // Parse "key = value" lines.
-        // splitn(2, '=') splits on the first '=' only.
-        let mut parts = line.splitn(2, '=');
-        let key   = parts.next().unwrap_or("").trim();
-        let value = parts.next().unwrap_or("").trim();
+PHASE 10 - PARTICLES
+═══════════════════════════════════════════════════
+  ❌ Particle System (CPU then GPU)
 
-        // If we're not inside an [entity] block, skip.
-        let desc = match current.as_mut() {
-            Some(d) => d,
-            None    => continue,
-        };
+PHASE 11 - UI
+═══════════════════════════════════════════════════
+  ⚠️ egui exists
+  ❌ Custom widget system
+  ❌ UI layout files
 
-        // Parse the value based on the key.
-        // parse_floats() is a helper defined below.
-        match key {
-            "name"      => desc.name      = value.to_string(),
-            "mesh"      => desc.mesh      = value.to_string(),
-            "script"    => desc.script    = Some(value.to_string()),
-            "metallic"  => desc.metallic  = value.parse().unwrap_or(0.0),
-            "roughness" => desc.roughness = value.parse().unwrap_or(0.5),
-            "ao"        => desc.ao        = value.parse().unwrap_or(1.0),
+PHASE 12 - EDITOR (Enhancements)
+═══════════════════════════════════════════════════
+  ✅ Core editor works
+  ❌ Animation Timeline
+  ❌ Material Editor (visual nodes)
+  ❌ Multi-select
+  ❌ Snap/Grid
+  ❌ Scene serialization (save)
+  ❌ Prefab workflow
 
-            "position" => {
-                // "0.0  1.0  0.0" → [0.0, 1.0, 0.0]
-                let v = parse_floats(value);
-                if v.len() >= 3 { desc.position = [v[0], v[1], v[2]]; }
-            }
-            "scale" => {
-                let v = parse_floats(value);
-                if v.len() >= 3 { desc.scale = [v[0], v[1], v[2]]; }
-                // If only one value given, use it uniformly.
-                else if v.len() == 1 { desc.scale = [v[0], v[0], v[0]]; }
-            }
-            "color" => {
-                let v = parse_floats(value);
-                if v.len() >= 3 { desc.color = [v[0], v[1], v[2]]; }
-            }
-            _ => {
-                // Unknown key — silently ignore.
-                // This lets you add comments like "# todo = fix this" without crashing.
-            }
-        }
-    }
+PHASE 13 - TERRAIN (Enhancements)
+═══════════════════════════════════════════════════
+  ⚠️ Basic terrain exists
+  ❌ Texture splatting
+  ❌ LOD terrain
+  ❌ Multi-layer materials
+  ❌ Water rendering
 
-    // Don't forget the last entity — push it if we were building one.
-    if let Some(desc) = current {
-        entities.push(desc);
-    }
-
-    Ok(entities)
-}
-
-// parse_floats() splits a whitespace-separated string into f32 values.
-// "0.5  1.0  -2.0" → [0.5, 1.0, -2.0]
-fn parse_floats(s: &str) -> Vec<f32> {
-    s.split_whitespace()
-        .map(|tok| tok.parse::<f32>().unwrap_or(0.0))
-        .collect()
-}
-
-[package]
-name = "Triengine"
-version = "0.1.0"
-edition = "2024"   # Always use 2024, it's the modern Rust edition
-
-[dependencies]
-# We'll add libraries here as we need them, one phase at a time
-winit = "0.30.13"     # Creates and manages the OS window
-wgpu = "29.0.1"      # Cross-platform GPU rendering
-notify = "8.2.0"
-mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
-glam = { version = "0.32.1", features = ["bytemuck"] }
-pollster = "0.4.0"
-bytemuck = { version = "1.14", features = ["derive"] }
-env_logger = "0.11"
-log      = "0.4"
-hecs     = "0.11.0"
-# image   = "0.25"   # loads PNG, JPG textures
-# For HDR loading we use image's hdr feature:
-image   = { version = "0.25", features = ["hdr"] }
-
-
-[lib]
-name = "triengine"
-crate-type = ["rlib"]  # "rlib" means reusable library
+PHASE 14 - PACKAGING + OPTIMIZATION
+═══════════════════════════════════════════════════
+  ⚠️ Basic packaging exists
+  ❌ Profiling-driven optimization
+  ❌ Memory budgeting
+  ❌ Asset bundling
 
 
 
-heres my toml 
 
-u were using the old versions of rust and packages please before we proceed lets fix all the bugs and bad synatx issues
+  next
+
+i need to know how snow behaves in this engine hope its good and realistic like the one in reddead redemption2 is it only texture its missing also the water system too do we have a wind system u knoq that wind can affect water and snow and trees and foilage depending on its strength hope u know and make it realistic i think we should be able to add places where the wind would be and it dir  in dunno about therest tho
+
+is the data driven architecture being followed and also how does postprocessing work and level creation work 
+
+is the wate realistic not and transparent and does water when deopped into a place act ike water and takes the shape of whateverand wherever its placed
+=========================================================
+INSTANCING, STATIC MESHES & MESH OPTIMIZATION
+=========================================================
+
+This engine should prioritize intelligent rendering performance while remaining intuitive and flexible for developers and artists.
+
+The engine should automatically reduce unnecessary draw calls whenever possible without changing the user's workflow.
+
+Users should not be forced to manually optimize every scene.
+
+The renderer should intelligently batch compatible objects automatically.
+
+=========================================================
+STATIC MESH ACTORS
+=========================================================
+
+A Static Mesh Actor represents a single independent object placed inside the scene.
+
+Each Static Mesh Actor owns:
+
+• Transform
+• Mesh
+• Materials
+• Physics Components
+• Lua Components
+• Metadata
+• Tags
+• Layers
+
+Every Static Mesh Actor has its own Position, Rotation and Scale.
+
+Every Static Mesh Actor can be modified independently.
+
+Static Mesh Actors are ideal for:
+
+Buildings
+
+Props
+
+Furniture
+
+Rocks
+
+Vehicles
+
+Bridges
+
+Decorations
+
+=========================================================
+INSTANCED STATIC MESHES
+=========================================================
+
+The engine should support Instanced Static Meshes (ISM).
+
+Instancing allows one mesh to be rendered thousands of times while sharing the same geometry and materials.
+
+Each instance should maintain its own independent transform.
+
+Every instance must support:
+
+• Position
+
+• Rotation
+
+• Scale
+
+• Visibility
+
+• Selection
+
+• Layer
+
+• Tags
+
+Additionally, every instance should support per-instance rendering data such as:
+
+• Color Tint
+
+• Wind Strength
+
+• Random Seed
+
+• Material Parameters (where supported)
+
+This allows each instance to appear visually unique while still sharing the same mesh and material resources.
+
+Examples:
+
+Tree A
+
+Rotation = 15°
+
+Scale = 1.1
+
+Random Seed = 42
+
+Tree B
+
+Rotation = -18°
+
+Scale = 0.85
+
+Random Seed = 99
+
+Tree C
+
+Rotation = 63°
+
+Scale = 1.35
+
+Random Seed = 14
+
+Although every tree looks slightly different, they all use the same underlying mesh and are rendered efficiently through GPU instancing.
+
+=========================================================
+HIERARCHICAL INSTANCED STATIC MESHES (HISM)
+=========================================================
+
+For extremely large scenes, support Hierarchical Instanced Static Meshes.
+
+Examples:
+
+Large Forests
+
+Grass
+
+Rocks
+
+Street Lights
+
+Fences
+
+Buildings
+
+The renderer should spatially organize instances into hierarchical clusters.
+
+Only visible clusters should be rendered.
+
+This minimizes CPU work and GPU draw calls.
+
+=========================================================
+AUTOMATIC GPU INSTANCING
+=========================================================
+
+The engine should automatically detect compatible objects.
+
+If multiple objects share:
+
+• Same Mesh
+
+• Same Material
+
+• Same Rendering Settings
+
+The renderer should automatically batch them internally.
+
+This optimization should happen automatically whenever possible.
+
+Artists should not be forced to manually create instance groups for common cases.
+
+The editor should continue to display individual objects for easy editing.
+
+Rendering optimizations should remain transparent to the user.
+
+=========================================================
+INSTANCE VARIATION
+=========================================================
+
+Instances should never be limited to looking identical.
+
+The engine should support per-instance variation using shader data.
+
+Supported variation includes:
+
+• Random Rotation
+
+• Random Scale
+
+• Color Tint
+
+• Wind Animation
+
+• Material Parameters
+
+• Random Seed
+
+• Custom Instance Data
+
+Shaders should be capable of reading this data to create natural visual variation without creating duplicate meshes.
+
+This is especially useful for:
+
+Trees
+
+Grass
+
+Flowers
+
+Rocks
+
+Props
+
+Crowds
+
+Vegetation
+
+=========================================================
+CONVERT INSTANCE TO UNIQUE OBJECT
+=========================================================
+
+Artists should be able to select any instance and choose:
+
+Convert to Unique Object
+
+Only that instance becomes an independent Static Mesh Actor.
+
+All remaining instances continue using GPU instancing.
+
+The newly created object can then be modified freely without affecting the original instanced group.
+
+=========================================================
+MESH MERGING
+=========================================================
+
+Mesh Merging should exist as a manual optimization tool.
+
+It should never happen automatically.
+
+Mesh Merging permanently combines multiple meshes into one new mesh asset.
+
+Merged meshes reduce draw calls but lose independent transforms.
+
+Use Mesh Merge only for geometry that will never move independently.
+
+Examples:
+
+Building Walls
+
+Architecture
+
+Ruins
+
+Large Decorative Structures
+
+Static Environment Pieces
+
+Do not use Mesh Merge for:
+
+Doors
+
+Characters
+
+Interactive Objects
+
+Physics Objects
+
+Moving Platforms
+
+Animated Props
+
+=========================================================
+EDITOR WORKFLOW
+=========================================================
+
+Inside the Hierarchy Panel, users should be able to:
+
+Create Empty Object
+
+Create Folder
+
+Create Group
+
+Import Mesh
+
+Create Primitive Geometry
+
+Create Camera
+
+Create Lights
+
+Create Water
+
+Create Terrain
+
+Create Sky
+
+Create Environment Objects
+
+Convert selected objects into:
+
+Prefab
+
+Mesh Merge
+
+Instanced Mesh Group
+
+Hierarchical Instanced Mesh Group
+
+Ungroup
+
+Separate Meshes
+
+Convert Instance to Unique Object
+
+=========================================================
+GROUPS
+=========================================================
+
+Groups exist purely for scene organization and editing.
+
+Groups own a Transform.
+
+Children inherit that Transform.
+
+Moving a Group moves all children.
+
+Rotating a Group rotates all children.
+
+Scaling a Group scales all children.
+
+Groups are editor conveniences.
+
+Groups are not rendering optimizations.
+
+Groups do not reduce draw calls.
+
+Groups may contain:
+
+Meshes
+
+Lights
+
+Cameras
+
+Effects
+
+Audio
+
+Other Groups
+
+Folders
+
+=========================================================
+FOLDERS
+=========================================================
+
+Folders exist only for organization.
+
+Folders have no Transform.
+
+Folders cannot affect gameplay.
+
+Folders simply organize the Hierarchy.
+
+Folders support:
+
+Rename
+
+Move
+
+Delete
+
+Duplicate
+
+Search
+
+Color Labels
+
+Visibility
+
+Lock
+
+Nested Folders
+
+=========================================================
+RENDERING PHILOSOPHY
+=========================================================
+
+The engine should always prioritize:
+
+Automatic GPU optimization
+
+Minimal draw calls
+
+Minimal CPU overhead
+
+Minimal memory duplication
+
+High scalability
+
+Ease of use
+
+Developers should spend their time creating games rather than manually optimizing every scene.
+
+The renderer should intelligently optimize compatible objects automatically while preserving complete editing flexibility inside the editor.
+
+Optimization should remain largely invisible to the user.
+
+=========================================================
+ENGINE PHILOSOPHY
+=========================================================
+
+Everything should remain data-driven.
+
+Everything should integrate naturally with ECS.
+
+Everything should support hot reload where appropriate.
+
+Everything should be modular.
+
+Everything should be scalable.
+
+Everything should be maintainable.
+
+Every optimization should preserve usability.
+
+The engine should feel modern, elegant, responsive, and approachable for beginners while still providing the performance expected from a professional AAA-quality engine. 
+hope that the necessary things needed for the editor and scripting and are available 
+and how good is the physics system compared to smth like chaos physics and can it actually build games like devilmay cry5 hope the physics system is optimized
+also hope that the game rendering supports vulcan direct x and others and not just vulkan
+
+do we also have a widget builder that can design any widget we want and its updatable while game is running
+
+for the skeletal what if i add a car or any other things like horse or other animal or a jet wil it be smart enough to know
+
+hope no system or calculation or stuff will crash my pc when used or will fail or cause error when used/
+
+
+What you'd need textures for:
+- Fire: A soft flame alpha mask (black background, white flame shape). One 256x256 PNG.
+- Snow/rain polish: Optional soft circle or droplet masks. One 64x64 PNG each.
+Where to get them (free, royalty-free):
+- Kenney.nl — CC0, best source. kenney.nl/particles has fire, smoke, rain, snow, explosion packs
+- AmbientCG — CC0 textures
+- OpenGameArt.org — various licenses, check each
+- Or generate them in-engine — I can write a procedural fire shader (like we did for lava) that needs zero textures
+
+
+do i have smthing that can allow me to move parts of the terrain or level easily and it auto dectets and arranges foilage and others things dynamically and accurately as we move things like roads, paths and massive changse not just small things 

@@ -2,6 +2,8 @@ use crate::components::{Position, Renderable};
 use crate::jobs::JobSystem;
 use hecs::World;
 
+pub mod skeletal;
+
 #[derive(Clone, Copy, Debug)]
 pub enum AnimState {
     Idle,

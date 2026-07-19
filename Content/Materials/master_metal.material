@@ -1,0 +1,10 @@
+# Master Material: Metal
+# Base material for metallic surfaces (steel, aluminum, gold, etc.)
+# High metallic, moderate roughness.
+
+[material]
+name = "master_metal"
+base_color = [0.82, 0.82, 0.82]
+metallic = 1.0
+roughness = 0.3
+ao = 1.0

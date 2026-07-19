@@ -1,0 +1,8 @@
+# Concrete Floor Prefab
+# Static floor tile. Mass = 0 means it won't move.
+
+name     = concrete_floor
+mesh     = meshes/cube.obj
+material = concrete
+scale    = 5.0  0.2  5.0
+rigidbody = 0

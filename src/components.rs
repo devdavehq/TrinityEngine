@@ -19,6 +19,12 @@ pub struct Rotation {
     pub roll: f32,
 }
 
+impl Default for Rotation {
+    fn default() -> Self {
+        Self { pitch: 0.0, yaw: 0.0, roll: 0.0 }
+    }
+}
+
 // Velocity in world units per second.
 #[allow(dead_code)]
 pub struct Velocity {
@@ -166,6 +172,114 @@ pub struct OrientedBoxCollider {
     pub mask: u32,
 }
 
+// SphereCollider — sphere primitive for physics.
+// Supports trigger mode (generates events without velocity response).
+#[derive(Clone, Copy)]
+pub struct SphereCollider {
+    pub radius: f32,
+    pub layer: u32,
+    pub mask: u32,
+    pub is_trigger: bool,
+}
+
+impl SphereCollider {
+    pub fn new(radius: f32) -> Self {
+        Self { radius, layer: 1, mask: u32::MAX, is_trigger: false }
+    }
+}
+
+impl Default for SphereCollider {
+    fn default() -> Self {
+        Self::new(0.5)
+    }
+}
+
+// CapsuleCollider — cylinder with hemispherical caps along a local axis.
+// half_height is the distance from center to the start of the cap (not total half-height).
+// total height = 2 * (half_height + radius).
+#[derive(Clone, Copy)]
+pub struct CapsuleCollider {
+    pub radius: f32,
+    pub half_height: f32,
+    pub layer: u32,
+    pub mask: u32,
+    pub is_trigger: bool,
+}
+
+impl CapsuleCollider {
+    pub fn new(radius: f32, half_height: f32) -> Self {
+        Self { radius, half_height, layer: 1, mask: u32::MAX, is_trigger: false }
+    }
+}
+
+impl Default for CapsuleCollider {
+    fn default() -> Self {
+        Self::new(0.3, 0.5)
+    }
+}
+
+// CharacterController — first/third-person movement with slope, step, wall handling.
+#[derive(Clone, Copy)]
+pub struct CharacterController {
+    /// Maximum walkable slope angle in radians (default ~50°).
+    pub max_slope_angle: f32,
+    /// Maximum step height the character can climb in one frame.
+    pub step_height: f32,
+    /// Skin width for depenetration (small value prevents jitter).
+    pub skin_width: f32,
+    /// Movement speed in world units/second.
+    pub speed: f32,
+    /// Initial upward velocity when jumping.
+    pub jump_force: f32,
+    /// How far down to cast for ground detection.
+    pub ground_detect_dist: f32,
+    /// Whether the character is currently on the ground.
+    pub on_ground: bool,
+    /// Gravity multiplier (1.0 = normal, 0.0 = no gravity like kinematic).
+    pub gravity_scale: f32,
+    /// Whether jump is held this frame.
+    pub jump_pressed: bool,
+}
+
+impl Default for CharacterController {
+    fn default() -> Self {
+        Self {
+            max_slope_angle: 0.8727, // ~50 degrees in radians
+            step_height: 0.35,
+            skin_width: 0.02,
+            speed: 6.0,
+            jump_force: 8.0,
+            ground_detect_dist: 0.15,
+            on_ground: false,
+            gravity_scale: 1.0,
+            jump_pressed: false,
+        }
+    }
+}
+
+// Ragdoll — marks an entity as the root of a ragdoll.
+// The physics system will drive all bones with ball-socket constraints.
+#[derive(Clone)]
+pub struct Ragdoll {
+    /// The bones that make up this ragdoll, in order from root to extremities.
+    pub bones: Vec<RagdollBone>,
+}
+
+/// A single bone in a ragdoll chain.
+#[derive(Clone, Copy)]
+pub struct RagdollBone {
+    /// The entity that represents this bone's rigid body.
+    pub entity: hecs::Entity,
+    /// Index of the parent bone in Ragdoll.bones (-1 = root).
+    pub parent_index: i32,
+    /// Offset from parent bone center to this bone's center (in parent local space).
+    pub local_offset: [f32; 3],
+    /// Maximum angle the joint can swing (radians, cone limit).
+    pub swing_limit: f32,
+    /// Damping applied to the joint spring.
+    pub damping: f32,
+}
+
 // FoliageWind stores base pose and wind sway parameters for vegetation.
 pub struct FoliageWind {
     pub base_x: f32,
@@ -179,6 +293,12 @@ pub struct Script {
     pub path: String,
 }
 
+impl Default for Script {
+    fn default() -> Self {
+        Self { path: String::new() }
+    }
+}
+
 // MaterialTexture keeps the content texture path assigned by editor/tools.
 #[derive(Clone)]
 pub struct MaterialTexture {
@@ -190,12 +310,32 @@ pub struct MaterialTexture {
 // PlayerStart marks where player-controlled entities spawn in Game Preview.
 pub struct PlayerStart;
 
-// PointLight is a simple movable local light source.
+// PointLight — a local light source (point, spot, or directional).
+// Multiple lights are supported via the multi-light uniform buffer (up to 16).
 #[derive(Clone, Copy)]
 pub struct PointLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub range: f32,
+    /// 0 = directional (sun), 1 = point (omnidirectional), 2 = spot (cone).
+    pub light_type: f32,
+    /// Spot cone angle in degrees (only used when light_type == 2).
+    pub spot_angle: f32,
+    /// Whether this light casts shadows.
+    pub shadow_casting: bool,
+}
+
+impl Default for PointLight {
+    fn default() -> Self {
+        Self {
+            color: [1.0, 0.95, 0.85],
+            intensity: 1.5,
+            range: 12.0,
+            light_type: 1.0,     // point
+            spot_angle: 45.0,    // 45° cone
+            shadow_casting: false,
+        }
+    }
 }
 
 // Renderable — everything the renderer needs to draw an entity.
@@ -220,6 +360,12 @@ pub struct Renderable {
 pub struct Health {
     pub current: i32,
     pub max:     i32,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self { current: 100, max: 100 }
+    }
 }
 
 #[allow(dead_code)]
@@ -252,4 +398,342 @@ pub enum CollisionPhase {
     Started,
     Ongoing,
     Ended,
+}
+
+// SceneMeta — stores the original entity name and mesh path for scene save.
+// Attached to every entity spawned from a .scene file so we can round-trip.
+pub struct SceneMeta {
+    pub name: String,
+    pub mesh_path: String,
+}
+
+// WaterSurface — marks an entity as a water body.
+// The water renderer draws these with a special shader that handles:
+//   - Gerstner wave vertex displacement
+//   - Fresnel-based reflection/refraction blending
+//   - Depth-based colour absorption
+//   - Foam at wave peaks
+//   - Transparency and refraction of the scene below
+#[derive(Clone, Copy)]
+pub struct WaterSurface {
+    /// Wave height (metres). 0 = flat calm, 2+ = stormy.
+    pub wave_height: f32,
+    /// Wave speed multiplier.
+    pub wave_speed: f32,
+    /// Deep water colour (RGB 0-1).
+    pub deep_color: [f32; 3],
+    /// Shallow water colour (RGB 0-1).
+    pub shallow_color: [f32; 3],
+    /// Surface opacity (0 = fully transparent, 1 = fully opaque).
+    pub opacity: f32,
+    /// Foam intensity at wave crests (0 = none).
+    pub foam_intensity: f32,
+    /// Specular highlight power (higher = tighter highlight).
+    pub specular_power: f32,
+}
+
+impl Default for WaterSurface {
+    fn default() -> Self {
+        Self {
+            wave_height: 0.3,
+            wave_speed: 1.0,
+            deep_color: [0.01, 0.06, 0.15],
+            shallow_color: [0.05, 0.25, 0.35],
+            opacity: 0.85,
+            foam_intensity: 0.15,
+            specular_power: 256.0,
+        }
+    }
+}
+
+// LavaSurface — marks an entity as a lava/magma body.
+// The lava renderer draws these with a special shader that handles:
+//   - Animated emissive flow patterns (scrolling noise)
+//   - Molten crack patterns with bright glow
+//   - Dark rocky base with hot cracks
+//   - Heat distortion via vertex displacement
+//   - Glow bloom contribution
+#[derive(Clone, Copy)]
+pub struct LavaSurface {
+    /// Base colour of cooled rock (RGB 0-1).
+    pub rock_color: [f32; 3],
+    /// Emissive colour of molten cracks (RGB 0-1).
+    pub emissive_color: [f32; 3],
+    /// Emissive intensity multiplier (higher = brighter glow, drives bloom).
+    pub emissive_intensity: f32,
+    /// Flow speed of the crack pattern (UV scroll speed).
+    pub flow_speed: f32,
+    /// Scale of the crack pattern (smaller = larger cracks).
+    pub crack_scale: f32,
+    /// Brightness threshold for crack visibility (0-1).
+    pub crack_threshold: f32,
+    /// Vertex displacement amplitude for heat shimmer.
+    pub displacement_amp: f32,
+    /// Overall opacity (0 = invisible, 1 = fully opaque).
+    pub opacity: f32,
+}
+
+impl Default for LavaSurface {
+    fn default() -> Self {
+        Self {
+            rock_color:       [0.08, 0.02, 0.01],
+            emissive_color:   [1.0, 0.3, 0.02],
+            emissive_intensity: 3.0,
+            flow_speed:       0.15,
+            crack_scale:      3.0,
+            crack_threshold:  0.45,
+            displacement_amp: 0.08,
+            opacity:          1.0,
+        }
+    }
+}
+
+// FireSurface — marks an entity as a fire rendering surface.
+// The fire renderer draws these with a special shader that handles:
+//   - Animated procedural flame shape (scrolling FBM noise)
+//   - Height-based colour gradient (white-hot → orange → red tips)
+//   - Semi-transparent with additive blending
+//   - Flickering wind displacement
+//   - Emissive output that drives bloom
+#[derive(Clone, Copy)]
+pub struct FireSurface {
+    /// Base flame colour (RGB 0-1). Bright = white-hot, orange = typical fire.
+    pub base_color: [f32; 3],
+    /// Tip colour (RGB 0-1). Darker red = dying flame tips.
+    pub tip_color: [f32; 3],
+    /// Emissive intensity multiplier (higher = brighter glow, drives bloom).
+    pub intensity: f32,
+    /// Flame animation speed (UV scroll rate).
+    pub flame_speed: f32,
+    /// Noise scale (smaller = larger flame features).
+    pub noise_scale: f32,
+    /// How much the flame flickers sideways.
+    pub flicker_strength: f32,
+    /// Height of the flame in world units.
+    pub flame_height: f32,
+    /// Overall opacity (0 = invisible, 1 = fully visible).
+    pub opacity: f32,
+}
+
+impl Default for FireSurface {
+    fn default() -> Self {
+        Self {
+            base_color:       [1.0, 0.7, 0.15],
+            tip_color:        [0.8, 0.15, 0.02],
+            intensity:        4.0,
+            flame_speed:      0.3,
+            noise_scale:      2.5,
+            flicker_strength: 0.15,
+            flame_height:     2.0,
+            opacity:          0.9,
+        }
+    }
+}
+
+// WaterTrigger — marks an entity as a water surface that detects entry.
+// When another entity's collider enters this volume, a WaterSplashEvent fires.
+#[derive(Clone, Copy)]
+pub struct WaterTrigger {
+    /// Splash intensity multiplier (0-1).
+    pub splash_intensity: f32,
+    /// Whether this trigger is currently active.
+    pub active: bool,
+}
+
+impl Default for WaterTrigger {
+    fn default() -> Self {
+        Self {
+            splash_intensity: 1.0,
+            active: true,
+        }
+    }
+}
+
+// FireSource — marks an entity as a fire emitter.
+// The particle system spawns fire, smoke, and ember particles from this entity.
+// A PointLight component on the same entity provides dynamic firelight.
+#[derive(Clone, Copy)]
+pub struct FireSource {
+    /// Fire intensity (0 = dying embers, 1 = roaring blaze).
+    pub intensity: f32,
+    /// Radius of the fire effect in world units.
+    pub radius: f32,
+    /// Height of the flame column.
+    pub flame_height: f32,
+    /// How much smoke is produced (0 = clean flame, 1 = heavy smoke).
+    pub smoke_amount: f32,
+    /// How many embers float upward (0 = none, 1 = many).
+    pub ember_amount: f32,
+    /// Wind susceptibility (0 = campfire不受风, 1 = fully wind-driven).
+    pub wind_susceptibility: f32,
+    /// Whether the fire damages entities that enter it.
+    pub damaging: bool,
+    /// Damage per second when inside the fire radius.
+    pub damage_per_second: f32,
+}
+
+impl Default for FireSource {
+    fn default() -> Self {
+        Self {
+            intensity: 1.0,
+            radius: 1.0,
+            flame_height: 1.5,
+            smoke_amount: 0.3,
+            ember_amount: 0.15,
+            wind_susceptibility: 0.4,
+            damaging: true,
+            damage_per_second: 10.0,
+        }
+    }
+}
+
+// WeatherZone — a spherical region where weather differs from the global default.
+// Entities inside the zone receive the zone's weather; entities outside get global.
+// Zones blend at their edges for smooth transitions.
+#[derive(Clone, Copy)]
+pub struct WeatherZone {
+    /// Weather condition within this zone.
+    pub condition: crate::environment::weather::WeatherCondition,
+    /// Weather intensity within this zone (0-1).
+    pub intensity: f32,
+    /// Radius of the zone in world units.
+    pub radius: f32,
+    /// Falloff distance at the edge for smooth blending (0 = hard edge).
+    pub falloff: f32,
+    /// Whether this zone is active.
+    pub active: bool,
+}
+
+impl Default for WeatherZone {
+    fn default() -> Self {
+        Self {
+            condition: crate::environment::weather::WeatherCondition::Clear,
+            intensity: 0.5,
+            radius: 50.0,
+            falloff: 10.0,
+            active: true,
+        }
+    }
+}
+
+// WindZone — a spherical region with localized wind direction and strength.
+// Entities inside receive this wind instead of the global wind.
+// Affects water (wave direction), foliage (sway), and particles (drift).
+#[derive(Clone, Copy)]
+pub struct WindZone {
+    /// Wind direction (will be normalized internally).
+    pub direction: [f32; 3],
+    /// Wind strength in m/s (0 = calm, 1 = strong).
+    pub strength: f32,
+    /// Radius of influence in world units.
+    pub radius: f32,
+    /// Falloff distance at the edge for smooth blending.
+    pub falloff: f32,
+    /// Whether this zone is active.
+    pub active: bool,
+}
+
+impl Default for WindZone {
+    fn default() -> Self {
+        Self {
+            direction: [1.0, 0.0, 0.0],
+            strength: 0.5,
+            radius: 30.0,
+            falloff: 10.0,
+            active: true,
+        }
+    }
+}
+
+// SplashEffect — marks an entity as having splash effects when entities enter its water.
+#[derive(Clone, Copy)]
+pub struct SplashEffect {
+    /// Maximum number of concurrent splash particle systems.
+    pub max_splashes: u32,
+    /// Duration of each splash in seconds.
+    pub splash_duration: f32,
+    /// Ripple ring scale multiplier.
+    pub ripple_scale: f32,
+    /// Whether this effect is active.
+    pub active: bool,
+}
+
+impl Default for SplashEffect {
+    fn default() -> Self {
+        Self {
+            max_splashes: 8,
+            splash_duration: 1.0,
+            ripple_scale: 1.0,
+            active: true,
+        }
+    }
+}
+
+// ── Entity Hierarchy ──────────────────────────────────────────────────────
+// Parent/Children components for scene graph hierarchy.
+
+/// Marks this entity as a child of another entity.
+/// The parent must exist in the world.
+#[derive(Clone, Copy, Debug)]
+pub struct Parent {
+    /// The parent entity.
+    pub entity: hecs::Entity,
+}
+
+/// Marks this entity as a parent with children.
+/// Children list is stored here for fast iteration.
+#[derive(Clone, Debug)]
+pub struct Children {
+    /// Ordered list of child entities.
+    pub entities: Vec<hecs::Entity>,
+}
+
+impl Children {
+    pub fn new() -> Self {
+        Self {
+            entities: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+}
+
+impl Default for Children {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Marks an entity as a "folder" or "group" node in the hierarchy.
+/// Folder nodes don't have renderables — they're purely organizational.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupNode {
+    /// Display name for this group.
+    pub name: [u8; 32],
+    /// Whether this group is expanded in the editor outliner.
+    pub expanded: bool,
+}
+
+impl GroupNode {
+    pub fn new(name: &str) -> Self {
+        let mut bytes = [0u8; 32];
+        let name_bytes = name.as_bytes();
+        let len = name_bytes.len().min(32);
+        bytes[..len].copy_from_slice(&name_bytes[..len]);
+        Self {
+            name: bytes,
+            expanded: true,
+        }
+    }
+
+    pub fn name_str(&self) -> String {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(32);
+        String::from_utf8_lossy(&self.name[..end]).to_string()
+    }
 }

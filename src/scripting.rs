@@ -59,6 +59,187 @@ use crate::components::{
 use crate::input::InputState;
 use hecs::{Entity, World};
 
+use crate::ai::{
+    AiAgent, AiRegistry, BehaviorTree, BehaviorNode,
+    BlackboardValue,
+    Sequence, Selector, Parallel, Inverter, Repeater, Cooldown,
+    MoveTo, Patrol, Wait, Log,
+};
+use crate::navigation::NavGrid;
+
+// ── BTBuilder: deferred behavior tree construction ─────────────────────────
+// Instead of manipulating Box<dyn BehaviorNode> directly (which requires
+// modifying private fields in Sequence/Selector/etc.), we store build
+// instructions in a flat node list indexed by usize.  The stack tracks
+// parent-child relationships during construction.  At bt.assign() time,
+// BTBuilder::build() recursively converts the flat list into a real tree
+// of BehaviorNode trait objects.
+//
+// Stack model:
+//   Composites (Sequence/Selector/Parallel):
+//     1. Create new node
+//     2. Add as child of current stack top
+//     3. Push onto stack (subsequent nodes become children of this composite)
+//   Leaf nodes (MoveTo/Patrol/Wait/Log):
+//     1. Create new node
+//     2. Add as child of current stack top
+//     3. Do NOT push (leaves have no children)
+//   Decorators (Inverter/Repeater/Cooldown):
+//     1. Pop the top node (this becomes the decorator's child)
+//     2. Create decorator wrapping that child
+//     3. Add decorator as child of new stack top
+//     4. Push decorator onto stack
+
+#[derive(Clone)]
+enum BTNodeKind {
+    Sequence,
+    Selector,
+    Parallel { success_threshold: usize },
+    Inverter,
+    Repeater { max_times: u32 },
+    Cooldown { duration: f32 },
+    MoveTo { speed: f32 },
+    Patrol { speed: f32, waypoints_key: String },
+    Wait { duration: f32 },
+    Log { message: String },
+}
+
+struct BTBuilderNode {
+    kind: BTNodeKind,
+    children: Vec<usize>,
+}
+
+pub struct BTBuilder {
+    nodes: Vec<BTBuilderNode>,
+    root: usize,
+    stack: Vec<usize>,
+    /// Auto-incrementing ID for generating unique blackboard keys.
+    next_wp_id: usize,
+    /// Patrol waypoints to inject into the entity's blackboard at assign time.
+    /// Each entry is (blackboard_key, waypoints).
+    patrol_data: Vec<(String, Vec<[f32; 3]>)>,
+}
+
+impl BTBuilder {
+    fn new() -> Self {
+        let root = BTBuilderNode {
+            kind: BTNodeKind::Sequence,
+            children: Vec::new(),
+        };
+        let mut b = Self {
+            nodes: Vec::new(),
+            root: 0,
+            stack: Vec::new(),
+            next_wp_id: 0,
+            patrol_data: Vec::new(),
+        };
+        b.nodes.push(root);
+        b.stack.push(0);
+        b
+    }
+
+    /// Push a composite node (Sequence/Selector/Parallel) onto the tree.
+    /// The composite becomes a child of the current stack top, then is
+    /// itself pushed so subsequent calls add children to it.
+    fn push_composite(&mut self, kind: BTNodeKind) {
+        let idx = self.nodes.len();
+        self.nodes.push(BTBuilderNode { kind, children: Vec::new() });
+        if let Some(&parent) = self.stack.last() {
+            self.nodes[parent].children.push(idx);
+        }
+        self.stack.push(idx);
+    }
+
+    /// Add a leaf node (action) as a child of the current stack top.
+    /// Leans are NOT pushed — they have no children.
+    fn add_leaf(&mut self, kind: BTNodeKind) {
+        let idx = self.nodes.len();
+        self.nodes.push(BTBuilderNode { kind, children: Vec::new() });
+        if let Some(&parent) = self.stack.last() {
+            self.nodes[parent].children.push(idx);
+        }
+    }
+
+    /// Wrap the most recently added child of the current stack top
+    /// in a decorator.
+    /// 1. Pop the last child from the current stack top.
+    /// 2. Create the decorator wrapping that child.
+    /// 3. Add the decorator as a child of the current stack top (replacing the original).
+    /// 4. Push the decorator onto the stack.
+    fn wrap_decorator(&mut self, kind: BTNodeKind) {
+        let parent_idx = *self.stack.last().expect("BT stack underflow in decorator");
+        let child_idx = self.nodes[parent_idx].children.pop()
+            .expect("No child to wrap with decorator");
+        let idx = self.nodes.len();
+        self.nodes.push(BTBuilderNode {
+            kind,
+            children: vec![child_idx],
+        });
+        self.nodes[parent_idx].children.push(idx);
+        self.stack.push(idx);
+    }
+
+    /// Recursively convert the flat node list into a real BehaviorNode tree.
+    fn build(&self) -> Box<dyn BehaviorNode> {
+        self.build_node(self.root)
+    }
+
+    fn build_node(&self, idx: usize) -> Box<dyn BehaviorNode> {
+        let node = &self.nodes[idx];
+        let name = format!("bt_{}", idx);
+
+        match &node.kind {
+            BTNodeKind::Sequence => {
+                let children = self.build_children(&node.children);
+                Box::new(Sequence::new(&name, children))
+            }
+            BTNodeKind::Selector => {
+                let children = self.build_children(&node.children);
+                Box::new(Selector::new(&name, children))
+            }
+            BTNodeKind::Parallel { success_threshold } => {
+                let children = self.build_children(&node.children);
+                let failure_threshold = children.len();
+                Box::new(Parallel::new(&name, children, *success_threshold, failure_threshold))
+            }
+            BTNodeKind::Inverter => {
+                let child = self.build_first_child(&node.children);
+                Box::new(Inverter::new(&name, child))
+            }
+            BTNodeKind::Repeater { max_times } => {
+                let child = self.build_first_child(&node.children);
+                Box::new(Repeater::new(&name, child, *max_times))
+            }
+            BTNodeKind::Cooldown { duration } => {
+                let child = self.build_first_child(&node.children);
+                Box::new(Cooldown::new(&name, child, *duration))
+            }
+            BTNodeKind::MoveTo { speed } => {
+                Box::new(MoveTo::new(&name, *speed, "target_pos"))
+            }
+            BTNodeKind::Patrol { speed, waypoints_key } => {
+                Box::new(Patrol::new(&name, *speed, waypoints_key))
+            }
+            BTNodeKind::Wait { duration } => {
+                Box::new(Wait::new(&name, *duration))
+            }
+            BTNodeKind::Log { message } => {
+                Box::new(Log::new(&name, message))
+            }
+        }
+    }
+
+    fn build_children(&self, indices: &[usize]) -> Vec<Box<dyn BehaviorNode>> {
+        indices.iter().map(|&i| self.build_node(i)).collect()
+    }
+
+    fn build_first_child(&self, indices: &[usize]) -> Box<dyn BehaviorNode> {
+        indices.first()
+            .map(|&i| self.build_node(i))
+            .unwrap_or_else(|| Box::new(Wait::new("placeholder", 0.0)))
+    }
+}
+
 struct ScriptInstance {
     path: String,
     revision: u64,
@@ -85,8 +266,19 @@ pub struct ScriptEngine {
     script_revisions: HashMap<String, u64>,
     ui_values: HashMap<String, f32>,
     ui_texts: HashMap<String, String>,
+    ui_visibility: HashMap<String, bool>,
     pending_camera_set: std::cell::UnsafeCell<Option<([f32; 3], [f32; 3])>>,
     pending_frame_skip: std::cell::UnsafeCell<u32>,
+    // ── Behavior tree Lua bindings ──────────────────────────────────────
+    // Named BT builders — one per bt.create() call.  Each builder stores a
+    // flat node list that is converted to real BehaviorNode objects at
+    // bt.assign() time via BTBuilder::build().
+    bt_trees: HashMap<String, BTBuilder>,
+    // Raw pointer to NavGrid for nav.find_path / nav.is_walkable.
+    // Set via set_external_refs() before each run_update() call.
+    nav_grid_ptr: usize,
+    // Raw pointer to AiRegistry for bt.assign() tree registration.
+    ai_registry_ptr: usize,
 }
 
 // SAFETY: ScriptEngine is only ever used on the main thread.
@@ -102,8 +294,12 @@ impl ScriptEngine {
             script_revisions: HashMap::new(),
             ui_values: HashMap::new(),
             ui_texts: HashMap::new(),
+            ui_visibility: HashMap::new(),
             pending_camera_set: std::cell::UnsafeCell::new(None),
             pending_frame_skip: std::cell::UnsafeCell::new(0),
+            bt_trees: HashMap::new(),
+            nav_grid_ptr: 0,
+            ai_registry_ptr: 0,
         }
     }
 
@@ -127,6 +323,39 @@ impl ScriptEngine {
         self.ui_texts.get(id).cloned()
     }
 
+    /// Set a numeric value for a UI widget (called from Lua or editor).
+    pub fn set_ui_value(&mut self, id: &str, value: f32) {
+        self.ui_values.insert(id.to_string(), value);
+    }
+
+    /// Set a text override for a UI widget (called from Lua or editor).
+    pub fn set_ui_text(&mut self, id: &str, text: &str) {
+        self.ui_texts.insert(id.to_string(), text.to_string());
+    }
+
+    /// Check if a UI widget is hidden via Lua (set_ui_visible).
+    pub fn ui_visible(&self, id: &str) -> bool {
+        // None = visible by default; Some(true) = visible; Some(false) = hidden.
+        *self.ui_visibility.get(id).unwrap_or(&true)
+    }
+
+    /// Set visibility of a UI widget.
+    pub fn set_ui_visible(&mut self, id: &str, visible: bool) {
+        self.ui_visibility.insert(id.to_string(), visible);
+    }
+
+    /// Store raw pointers to external engine systems so Lua closures can
+    /// access them.  Must be called before run_update() each frame.
+    pub fn set_external_refs(&mut self, nav: &NavGrid, ai_reg: &mut AiRegistry) {
+        self.nav_grid_ptr = nav as *const NavGrid as usize;
+        self.ai_registry_ptr = ai_reg as *mut AiRegistry as usize;
+    }
+
+    /// Expose the Lua instance so external code can set globals (e.g., ui_click_event).
+    pub fn lua_create(&self) -> &Lua {
+        &self.lua
+    }
+
     // register_api() sets up engine-wide Lua globals (logging, print).
     // Call once at startup before loading any scripts.
     pub fn register_api(&mut self) -> LuaResult<()> {
@@ -134,13 +363,13 @@ impl ScriptEngine {
 
         // Override Lua's built-in print to route through our logging.
         let print_fn = self.lua.create_function(|_, msg: String| {
-            println!("[Lua] {}", msg);
+            tracing::info!("[Lua] {}", msg);
             Ok(())
         })?;
         globals.set("print", print_fn)?;
 
         let log_fn = self.lua.create_function(|_, msg: String| {
-            println!("[Script] {}", msg);
+            tracing::info!("[Script] {}", msg);
             Ok(())
         })?;
         globals.set("log", log_fn)?;
@@ -254,14 +483,14 @@ impl ScriptEngine {
                 format!("Could not load script {}: {}", path, e)
             ))?;
         self.lua.load(&code).set_name(path).into_function()?;
-        println!("[Scripting] Loaded: {}", path);
+        tracing::info!("[Scripting] Loaded: {}", path);
         Ok(())
     }
 
     // reload_script() hot-reloads a changed file.
     // New function definitions replace the old ones in Lua globals.
     pub fn reload_script(&mut self, path: &str) -> LuaResult<()> {
-        println!("[Scripting] Reloading: {}", path);
+        tracing::info!("[Scripting] Reloading: {}", path);
         self.load_script(path)?;
         let rev = self.script_revisions.entry(path.to_string()).or_insert(0);
         *rev += 1;
@@ -321,7 +550,7 @@ impl ScriptEngine {
                             }
                         }
                     }
-                    Ok(Err(e)) => eprintln!("[HotReload] Watcher error: {}", e),
+                    Ok(Err(e)) => tracing::error!("[HotReload] Watcher error: {}", e),
                     Err(_) => break,
                 }
             }
@@ -409,6 +638,7 @@ impl ScriptEngine {
         entity: Entity,
         script_path: &str,
         dt: f32,
+        audio: Option<&mut crate::audio::AudioSystem>,
     ) -> LuaResult<()> {
         let globals   = self.lua.globals();
         let script_ptr = self as *mut ScriptEngine as usize;
@@ -811,6 +1041,14 @@ impl ScriptEngine {
         })?;
         globals.set("get_ui_text", gut)?;
 
+        // set_ui_visible(id, bool) — show/hide a HUD widget at runtime.
+        let suv2 = self.lua.create_function(move |_, (id, visible): (String, bool)| {
+            let scripts = unsafe { &mut *(script_ptr as *mut ScriptEngine) };
+            scripts.ui_visibility.insert(id, visible);
+            Ok(())
+        })?;
+        globals.set("set_ui_visible", suv2)?;
+
         // has_component(entity, name) — lightweight reflection helper.
         let hc = self.lua.create_function(move |_, (eid, name): (u64, String)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
@@ -1162,6 +1400,474 @@ impl ScriptEngine {
         // but also expose it as a global so helper functions can read it.
         globals.set("dt", dt)?;
 
+        // ── Audio API ────────────────────────────────────────────────────
+        // Exposed as global functions: audio_play_sfx, audio_play_music,
+        // audio_stop_all, audio_set_volume, audio_is_music_playing.
+        if let Some(audio_ref) = audio {
+            let audio_ptr = audio_ref as *mut crate::audio::AudioSystem as usize;
+            let ap_sfx = audio_ptr;
+            let play_sfx_fn = self.lua.create_function(move |_, (path, volume, looping): (String, Option<f32>, Option<bool>)| {
+                let audio = unsafe { &mut *(ap_sfx as *mut crate::audio::AudioSystem) };
+                audio.play_sfx(&path, volume.unwrap_or(1.0), looping.unwrap_or(false));
+                Ok(())
+            })?;
+            globals.set("audio_play_sfx", play_sfx_fn)?;
+
+            let ap_music = audio_ptr;
+            let play_music_fn = self.lua.create_function(move |_, (path, volume, looping): (String, Option<f32>, Option<bool>)| {
+                let audio = unsafe { &mut *(ap_music as *mut crate::audio::AudioSystem) };
+                audio.play_music(&path, volume, looping.unwrap_or(true));
+                Ok(())
+            })?;
+            globals.set("audio_play_music", play_music_fn)?;
+
+            let ap_stop = audio_ptr;
+            let stop_all_fn = self.lua.create_function(move |_, ()| {
+                let audio = unsafe { &mut *(ap_stop as *mut crate::audio::AudioSystem) };
+                audio.stop_all();
+                Ok(())
+            })?;
+            globals.set("audio_stop_all", stop_all_fn)?;
+
+            let ap_vol = audio_ptr;
+            let set_volume_fn = self.lua.create_function(move |_, (channel, volume): (String, f32)| {
+                let audio = unsafe { &mut *(ap_vol as *mut crate::audio::AudioSystem) };
+                use crate::audio::Channel;
+                let ch = match channel.as_str() {
+                    "music" => Channel::Music,
+                    "sfx" => Channel::Sfx,
+                    "ambient" => Channel::Ambient,
+                    _ => return Ok(()),
+                };
+                audio.set_channel_volume(ch, volume);
+                Ok(())
+            })?;
+            globals.set("audio_set_volume", set_volume_fn)?;
+
+            let ap_master = audio_ptr;
+            let set_master_fn = self.lua.create_function(move |_, volume: f32| {
+                let audio = unsafe { &mut *(ap_master as *mut crate::audio::AudioSystem) };
+                audio.set_master_volume(volume);
+                Ok(())
+            })?;
+            globals.set("audio_set_master_volume", set_master_fn)?;
+
+            let ap_playing = audio_ptr;
+            let is_music_fn = self.lua.create_function(move |_, ()| {
+                let audio = unsafe { &*(ap_playing as *const crate::audio::AudioSystem) };
+                Ok(audio.is_music_playing())
+            })?;
+            globals.set("audio_is_music_playing", is_music_fn)?;
+
+            let ap_active = audio_ptr;
+            let active_count_fn = self.lua.create_function(move |_, ()| {
+                let audio = unsafe { &*(ap_active as *const crate::audio::AudioSystem) };
+                Ok(audio.active_count())
+            })?;
+            globals.set("audio_active_count", active_count_fn)?;
+        }
+
+        // ── Behavior Tree (bt) API ─────────────────────────────────────
+        // Provides Lua functions for building behavior trees declaratively.
+        // Trees are built via a flat node list (BTBuilder) and converted to
+        // real BehaviorNode objects at bt.assign() time.
+        {
+            let bt_table = self.lua.create_table()?;
+
+            // bt.create(name) → name
+            // Creates a fresh BTBuilder for the named tree.  Any previous
+            // builder with the same name is replaced.
+            let sp = script_ptr;
+            let bt_create = self.lua.create_function(move |_, name: String| {
+                let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                scripts.bt_trees.insert(name.clone(), BTBuilder::new());
+                Ok(name)
+            })?;
+            bt_table.set("create", bt_create)?;
+
+            // bt.sequence(tree_name)
+            // Adds a Sequence composite as a child of the current stack top,
+            // then pushes it so subsequent calls add children to it.
+            let sp = script_ptr;
+            let bt_sequence = self.lua.create_function(move |_, tree_name: String| {
+                let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                    builder.push_composite(BTNodeKind::Sequence);
+                }
+                Ok(())
+            })?;
+            bt_table.set("sequence", bt_sequence)?;
+
+            // bt.selector(tree_name)
+            // Adds a Selector composite (try children until one succeeds).
+            let sp = script_ptr;
+            let bt_selector = self.lua.create_function(move |_, tree_name: String| {
+                let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                    builder.push_composite(BTNodeKind::Selector);
+                }
+                Ok(())
+            })?;
+            bt_table.set("selector", bt_selector)?;
+
+            // bt.parallel(tree_name, success_threshold)
+            // Adds a Parallel composite that ticks all children every frame.
+            let sp = script_ptr;
+            let bt_parallel = self.lua.create_function(
+                move |_, (tree_name, threshold): (String, usize)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        builder.push_composite(BTNodeKind::Parallel {
+                            success_threshold: threshold,
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("parallel", bt_parallel)?;
+
+            // bt.move_to(tree_name)
+            // Adds a MoveTo leaf that uses NavGrid A* pathfinding.
+            // Reads the target position from blackboard key "target_pos".
+            let sp = script_ptr;
+            let bt_move_to = self.lua.create_function(move |_, tree_name: String| {
+                let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                    builder.add_leaf(BTNodeKind::MoveTo { speed: 2.0 });
+                }
+                Ok(())
+            })?;
+            bt_table.set("move_to", bt_move_to)?;
+
+            // bt.patrol(tree_name, waypoints_table)
+            // Adds a Patrol leaf that cycles through waypoints.
+            // waypoints_table is a Lua array of {x=, y=, z=} tables.
+            // Waypoints are stored in the builder and injected into the
+            // entity's blackboard at bt.assign() time.
+            let sp = script_ptr;
+            let bt_patrol = self.lua.create_function(
+                move |_lua, (tree_name, waypoints_lua): (String, LuaTable)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        // Parse waypoints from the Lua table.
+                        let mut waypoints = Vec::new();
+                        let len = waypoints_lua.len().unwrap_or(0);
+                        for i in 1..=len {
+                            if let Ok(wp) = waypoints_lua.get::<LuaTable>(i) {
+                                let x = wp.get::<f32>("x").unwrap_or(0.0);
+                                let y = wp.get::<f32>("y").unwrap_or(0.0);
+                                let z = wp.get::<f32>("z").unwrap_or(0.0);
+                                waypoints.push([x, y, z]);
+                            }
+                        }
+                        // Generate a unique blackboard key for these waypoints.
+                        let wp_key = format!("patrol_wp_{}", builder.next_wp_id);
+                        builder.next_wp_id += 1;
+                        builder.patrol_data.push((wp_key.clone(), waypoints));
+                        builder.add_leaf(BTNodeKind::Patrol {
+                            speed: 2.0,
+                            waypoints_key: wp_key,
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("patrol", bt_patrol)?;
+
+            // bt.wait(tree_name, duration)
+            // Adds a Wait leaf that returns Running for `duration` seconds,
+            // then returns Success.
+            let sp = script_ptr;
+            let bt_wait = self.lua.create_function(
+                move |_, (tree_name, duration): (String, f32)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        builder.add_leaf(BTNodeKind::Wait { duration });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("wait", bt_wait)?;
+
+            // bt.log(tree_name, message)
+            // Adds a Log leaf that prints a debug message and returns Success.
+            let sp = script_ptr;
+            let bt_log = self.lua.create_function(
+                move |_, (tree_name, message): (String, String)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        builder.add_leaf(BTNodeKind::Log { message });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("log", bt_log)?;
+
+            // bt.inverter(tree_name)
+            // Wraps the current top-of-stack node in an Inverter decorator,
+            // which flips Success ↔ Failure.
+            let sp = script_ptr;
+            let bt_inverter = self.lua.create_function(move |_, tree_name: String| {
+                let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                    builder.wrap_decorator(BTNodeKind::Inverter);
+                }
+                Ok(())
+            })?;
+            bt_table.set("inverter", bt_inverter)?;
+
+            // bt.repeater(tree_name, max_times)
+            // Wraps the current top-of-stack node in a Repeater decorator.
+            // max_times=0 means infinite repetition.
+            let sp = script_ptr;
+            let bt_repeater = self.lua.create_function(
+                move |_, (tree_name, max_times): (String, u32)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        builder.wrap_decorator(BTNodeKind::Repeater { max_times });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("repeater", bt_repeater)?;
+
+            // bt.cooldown(tree_name, duration)
+            // Wraps the current top-of-stack in a Cooldown decorator.
+            // The child is only ticked once every `duration` seconds.
+            let sp = script_ptr;
+            let bt_cooldown = self.lua.create_function(
+                move |_, (tree_name, duration): (String, f32)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    if let Some(builder) = scripts.bt_trees.get_mut(&tree_name) {
+                        builder.wrap_decorator(BTNodeKind::Cooldown { duration });
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("cooldown", bt_cooldown)?;
+
+            // bt.assign(entity, tree_name)
+            // Finalizes the named tree, registers it in the AiRegistry,
+            // and adds an AiAgent component to the entity.
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_assign = self.lua.create_function(
+                move |_, (eid, tree_name): (u64, String)| {
+                    let scripts = unsafe { &mut *(sp as *mut ScriptEngine) };
+                    let world = unsafe { &mut *(wp as *mut World) };
+
+                    // Build the tree from the BTBuilder.
+                    let (root, patrol_data) = match scripts.bt_trees.get(&tree_name) {
+                        Some(builder) => (builder.build(), builder.patrol_data.clone()),
+                        None => {
+                            return Err(LuaError::RuntimeError(format!(
+                                "BT '{}' not found — call bt.create() first",
+                                tree_name
+                            )));
+                        }
+                    };
+
+                    // Register the built tree in the AiRegistry.
+                    if scripts.ai_registry_ptr != 0 {
+                        let ai_reg = unsafe {
+                            &mut *(scripts.ai_registry_ptr as *mut AiRegistry)
+                        };
+                        let bt = BehaviorTree::new(&tree_name, root);
+                        ai_reg.register(&tree_name, bt);
+                    }
+
+                    // Insert an AiAgent component on the entity.
+                    let entity = Entity::from_bits(eid).unwrap();
+                    let _ = world.insert(entity, (AiAgent::new(&tree_name),));
+
+                    // Inject patrol waypoints into the entity's blackboard.
+                    if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
+                        for (key, waypoints) in &patrol_data {
+                            agent
+                                .blackboard
+                                .set(key, BlackboardValue::Path(waypoints.clone()));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )?;
+            bt_table.set("assign", bt_assign)?;
+
+            // ── Blackboard access functions ─────────────────────────────
+            // bt.set_blackboard(entity, key, value)
+            // Generic set — accepts booleans.  For other types use the
+            // typed variants below.
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_set_bb = self.lua.create_function(
+                move |_, (eid, key, value): (u64, String, bool)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
+                        agent.blackboard.set(&key, BlackboardValue::Bool(value));
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("set_blackboard", bt_set_bb)?;
+
+            // bt.get_blackboard(entity, key) → bool
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_get_bb = self.lua.create_function(
+                move |_, (eid, key): (u64, String)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    let result = world
+                        .get::<&AiAgent>(entity)
+                        .ok()
+                        .and_then(|a| a.blackboard.get_bool(&key))
+                        .unwrap_or(false);
+                    Ok(result)
+                },
+            )?;
+            bt_table.set("get_blackboard", bt_get_bb)?;
+
+            // bt.set_blackboard_vec3(entity, key, x, y, z)
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_set_bb_vec3 = self.lua.create_function(
+                move |_, (eid, key, x, y, z): (u64, String, f32, f32, f32)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
+                        agent
+                            .blackboard
+                            .set(&key, BlackboardValue::Vec3([x, y, z]));
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("set_blackboard_vec3", bt_set_bb_vec3)?;
+
+            // bt.get_blackboard_vec3(entity, key) → x, y, z
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_get_bb_vec3 = self.lua.create_function(
+                move |_, (eid, key): (u64, String)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    let v = world
+                        .get::<&AiAgent>(entity)
+                        .ok()
+                        .and_then(|a| a.blackboard.get_vec3(&key))
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    Ok((v[0], v[1], v[2]))
+                },
+            )?;
+            bt_table.set("get_blackboard_vec3", bt_get_bb_vec3)?;
+
+            // bt.set_blackboard_float(entity, key, value)
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_set_bb_float = self.lua.create_function(
+                move |_, (eid, key, value): (u64, String, f32)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
+                        agent
+                            .blackboard
+                            .set(&key, BlackboardValue::Float(value));
+                    }
+                    Ok(())
+                },
+            )?;
+            bt_table.set("set_blackboard_float", bt_set_bb_float)?;
+
+            // bt.get_blackboard_float(entity, key) → float
+            let sp = script_ptr;
+            let wp = world_ptr;
+            let bt_get_bb_float = self.lua.create_function(
+                move |_, (eid, key): (u64, String)| {
+                    let world = unsafe { &mut *(wp as *mut World) };
+                    let entity = Entity::from_bits(eid).unwrap();
+                    let result = world
+                        .get::<&AiAgent>(entity)
+                        .ok()
+                        .and_then(|a| a.blackboard.get_float(&key))
+                        .unwrap_or(0.0);
+                    Ok(result)
+                },
+            )?;
+            bt_table.set("get_blackboard_float", bt_get_bb_float)?;
+
+            globals.set("bt", bt_table)?;
+        }
+
+        // ── Navigation (nav) API ────────────────────────────────────────
+        // Provides pathfinding and walkability queries through the NavGrid.
+        {
+            let nav_table = self.lua.create_table()?;
+            let np = self.nav_grid_ptr;
+
+            // nav.find_path(x1, y1, z1, x2, y2, z2)
+            // A* pathfinding in world space.  Returns a Lua table of
+            // {x, y, z} waypoints.  Returns empty table if no path exists.
+            let find_path = self.lua.create_function(move |lua, (x1, y1, z1, x2, y2, z2): (f32, f32, f32, f32, f32, f32)| {
+                let table = lua.create_table()?;
+                if np == 0 {
+                    return Ok(table);
+                }
+                let nav = unsafe { &*(np as *const NavGrid) };
+                let half_w = nav.width as f32 * 0.5;
+                let half_d = nav.depth as f32 * 0.5;
+
+                // Convert world coordinates to grid coordinates.
+                let sx = (x1 + half_w)
+                    .round()
+                    .clamp(0.0, (nav.width - 1) as f32) as usize;
+                let sz = (z1 + half_d)
+                    .round()
+                    .clamp(0.0, (nav.depth - 1) as f32) as usize;
+                let gx = (x2 + half_w)
+                    .round()
+                    .clamp(0.0, (nav.width - 1) as f32) as usize;
+                let gz = (z2 + half_d)
+                    .round()
+                    .clamp(0.0, (nav.depth - 1) as f32) as usize;
+
+                if let Some(path) = nav.find_path((sx, sz), (gx, gz)) {
+                    for (i, &(px, pz)) in path.iter().enumerate() {
+                        let wp = lua.create_table()?;
+                        wp.set("x", px as f32 - half_w)?;
+                        wp.set("y", y1)?; // preserve start height
+                        wp.set("z", pz as f32 - half_d)?;
+                        table.set(i + 1, wp)?; // Lua arrays are 1-indexed
+                    }
+                }
+                Ok(table)
+            })?;
+            nav_table.set("find_path", find_path)?;
+
+            // nav.is_walkable(x, y, z) → bool
+            // Checks whether the grid cell at the given world position
+            // is walkable (slope ≤ max_slope).
+            let is_walkable = self.lua.create_function(move |_, (x, _y, z): (f32, f32, f32)| {
+                if np == 0 {
+                    return Ok(false);
+                }
+                let nav = unsafe { &*(np as *const NavGrid) };
+                let half_w = nav.width as f32 * 0.5;
+                let half_d = nav.depth as f32 * 0.5;
+                let gx = (x + half_w).round() as isize;
+                let gz = (z + half_d).round() as isize;
+                if gx < 0 || gz < 0 || gx >= nav.width as isize || gz >= nav.depth as isize {
+                    return Ok(false);
+                }
+                let idx = gz as usize * nav.width + gx as usize;
+                Ok(nav.walkable[idx])
+            })?;
+            nav_table.set("is_walkable", is_walkable)?;
+
+            globals.set("nav", nav_table)?;
+        }
+
         // ── Call entity-local update(entity_id, dt) ───────────────────────
         let mut needs_mark_started = false;
         {
@@ -1246,5 +1952,152 @@ impl ScriptEngine {
             penetration,
         ))?;
         Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::behavior_tree::Status;
+    use crate::ai::blackboard::Blackboard;
+    use crate::components::Position;
+    use crate::navigation::NavGrid;
+    use crate::terrain::TerrainGrid;
+
+    fn test_nav() -> NavGrid {
+        NavGrid::from_terrain(&TerrainGrid::new(16, 16, 1.0), 1.0)
+    }
+
+    // ── Test 1: BTBuilder creates a tree with nested composites ────────
+    // Tree: Sequence [Selector [Wait(0.5), Log("hi"), Wait(1.0)]]
+    //
+    // push_composite(Selector) pushes it onto the stack, so all three
+    // add_leaf() calls become children of Selector, not root.
+    #[test]
+    fn bt_builder_nested_sequence_selector() {
+        let mut b = BTBuilder::new();
+        // Root is a Sequence (bt_0).
+        // bt.selector → bt_1 (child of root, pushed onto stack).
+        b.push_composite(BTNodeKind::Selector);
+        // All leaves are children of Selector (stack top).
+        b.add_leaf(BTNodeKind::Wait { duration: 0.5 });
+        b.add_leaf(BTNodeKind::Log {
+            message: "hi".to_string(),
+        });
+        b.add_leaf(BTNodeKind::Wait { duration: 1.0 });
+
+        let root = b.build();
+        // Root: Sequence has 1 child → Selector.
+        assert_eq!(root.name(), "bt_0");
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn((Position { x: 0.0, y: 0.0, z: 0.0 },));
+        let nav = test_nav();
+        let mut bb = Blackboard::new();
+        let mut tree = BehaviorTree::new("test", root);
+
+        let mut ctx = crate::ai::behavior_tree::BTContext {
+            entity,
+            world: &mut world,
+            dt: 0.1,
+            time_s: 0.0,
+            nav_grid: &nav,
+            blackboard: &mut bb,
+        };
+
+        // Selector tries Wait(0.5) → Running (0.1 < 0.5). Sequence returns Running.
+        assert_eq!(tree.tick(&mut ctx), Status::Running);
+
+        // Advance 0.4s more → Wait(0.5) succeeds → Selector succeeds →
+        // Sequence succeeds (Selector was its only child).
+        ctx.dt = 0.4;
+        assert_eq!(tree.tick(&mut ctx), Status::Success);
+    }
+
+    // ── Test 2: Decorator wrapping via BTBuilder ───────────────────────
+    // Tree: Sequence [Inverter [Wait(0.0)]]
+    // Wait(0.0) succeeds immediately → Inverter flips to Failure →
+    // Sequence returns Failure on first child.
+    #[test]
+    fn bt_builder_inverter_decorator() {
+        let mut b = BTBuilder::new();
+        // Root = Sequence (bt_0).
+        // Add Wait(0.0) as child of root.
+        b.add_leaf(BTNodeKind::Wait { duration: 0.0 });
+        // wrap_decorator pops the last child (Wait), wraps in Inverter,
+        // adds Inverter back as child of root, pushes Inverter.
+        b.wrap_decorator(BTNodeKind::Inverter);
+
+        let root = b.build();
+        let mut world = hecs::World::new();
+        let entity = world.spawn((Position { x: 0.0, y: 0.0, z: 0.0 },));
+        let nav = test_nav();
+        let mut bb = Blackboard::new();
+        let mut tree = BehaviorTree::new("test_invert", root);
+
+        let mut ctx = crate::ai::behavior_tree::BTContext {
+            entity,
+            world: &mut world,
+            dt: 0.016,
+            time_s: 0.0,
+            nav_grid: &nav,
+            blackboard: &mut bb,
+        };
+
+        assert_eq!(tree.tick(&mut ctx), Status::Failure);
+    }
+
+    // ── Test 3: BTBuilder → AiRegistry → AiAgent tick pipeline ────────
+    // Exercises the same path that bt.assign() takes from Lua:
+    // build a tree, register it, attach an AiAgent, tick and verify.
+    #[test]
+    fn bt_builder_assign_and_tick() {
+        // -- build --
+        let mut b = BTBuilder::new();
+        // Sequence [Wait(1.0), Log("guard active")]
+        b.add_leaf(BTNodeKind::Wait { duration: 1.0 });
+        b.add_leaf(BTNodeKind::Log {
+            message: "guard active".to_string(),
+        });
+        let root = b.build();
+        let mut tree = BehaviorTree::new("test_guard", root);
+
+        // -- register (takes ownership of tree) --
+        let mut ai_reg = AiRegistry::new();
+        ai_reg.register("test_guard", tree);
+
+        // -- attach to entity --
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            Position { x: 0.0, y: 0.0, z: 0.0 },
+            AiAgent::new("test_guard"),
+        ));
+
+        let nav = test_nav();
+        let mut bb = Blackboard::new();
+
+        // -- tick --
+        let mut bt_tree = ai_reg.get_mut("test_guard").unwrap();
+        let mut ctx = crate::ai::behavior_tree::BTContext {
+            entity,
+            world: &mut world,
+            dt: 0.5,
+            time_s: 0.0,
+            nav_grid: &nav,
+            blackboard: &mut bb,
+        };
+        // Wait(1.0) with dt=0.5 → Running.
+        assert_eq!(bt_tree.tick(&mut ctx), Status::Running);
+        // Next tick with dt=0.5 → Wait succeeds → Log succeeds → Sequence succeeds.
+        ctx.dt = 0.5;
+        assert_eq!(bt_tree.tick(&mut ctx), Status::Success);
+
+        // Verify the entity's AiAgent is still intact.
+        let agent = world.get::<&AiAgent>(entity).unwrap();
+        assert_eq!(agent.tree_name, "test_guard");
     }
 }

@@ -6,17 +6,15 @@
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
-    pub position:  [f32; 3],  // world-space position
-    pub normal:    [f32; 3],  // surface normal for lighting
-    pub color:     [f32; 3],  // albedo (base color)
-    pub metallic:  f32,       // 0 = non-metal, 1 = metal
-    pub roughness: f32,       // 0 = mirror, 1 = fully matte
-    pub ao:        f32,       // ambient occlusion (0 = occluded, 1 = open)
-    // Padding: GPU requires structs to align to 16-byte boundaries.
-    // Our struct so far: 3+3+3+1+1+1 = 12 f32s = 48 bytes.
-    // Next multiple of 16 = 48. We're fine — but add one f32 pad anyway
-    // in case the driver is strict. (Some are.)
-    _pad: f32,
+    pub position:  [f32; 3],  //  0 — world-space position
+    pub normal:    [f32; 3],  // 12 — surface normal for lighting
+    pub tangent:   [f32; 3],  // 24 — tangent direction (T in TBN)
+    pub bitangent: [f32; 3],  // 36 — bitangent direction (B in TBN)
+    pub color:     [f32; 3],  // 48 — albedo (base color)
+    pub metallic:  f32,       // 60 — 0 = non-metal, 1 = metal
+    pub roughness: f32,       // 64 — 0 = mirror, 1 = fully matte
+    pub ao:        f32,       // 68 — ambient occlusion (0 = occluded, 1 = open)
+    _pad: f32,                // 72 — total 76 bytes, aligns to 16
 }
 
 impl Vertex {
@@ -26,12 +24,79 @@ impl Vertex {
         Self {
             position,
             normal,
+            tangent:   [0.0, 1.0, 0.0],
+            bitangent: [1.0, 0.0, 0.0],
             color,
             metallic:  0.0,
             roughness: 0.5,
             ao:        1.0,
             _pad:      0.0,
         }
+    }
+}
+
+/// Compute tangent and bitangent for all vertices using a simplified
+/// position-based approximation (no UVs needed).
+/// For each triangle, tangent aligns with the first edge direction
+/// and bitangent is derived via cross(normal, tangent).
+pub fn compute_tangents(vertices: &mut [Vertex]) {
+    let count = vertices.len();
+    if count < 3 { return; }
+
+    // Zero out existing tangents/bitangents.
+    for v in vertices.iter_mut() {
+        v.tangent   = [0.0, 0.0, 0.0];
+        v.bitangent = [0.0, 0.0, 0.0];
+    }
+
+    // Process triangles (groups of 3 vertices).
+    for tri in vertices.chunks_exact_mut(3) {
+        let p0 = glam::Vec3::from_array(tri[0].position);
+        let p1 = glam::Vec3::from_array(tri[1].position);
+        let p2 = glam::Vec3::from_array(tri[2].position);
+
+        let edge1 = p1 - p0;
+        let edge2 = p2 - p0;
+
+        // Tangent = first edge direction (approximation without UVs).
+        let t = edge1;
+
+        // Bitangent = cross(normal, tangent) for a right-handed TBN frame.
+        let n0 = glam::Vec3::from_array(tri[0].normal);
+        let b = n0.cross(t);
+
+        tri[0].tangent   = (glam::Vec3::from_array(tri[0].tangent) + t).to_array();
+        tri[0].bitangent = (glam::Vec3::from_array(tri[0].bitangent) + b).to_array();
+        tri[1].tangent   = (glam::Vec3::from_array(tri[1].tangent) + t).to_array();
+        tri[1].bitangent = (glam::Vec3::from_array(tri[1].bitangent) + b).to_array();
+        tri[2].tangent   = (glam::Vec3::from_array(tri[2].tangent) + t).to_array();
+        tri[2].bitangent = (glam::Vec3::from_array(tri[2].bitangent) + b).to_array();
+    }
+
+    // Normalize and re-orthogonalize via Gram-Schmidt.
+    for v in vertices.iter_mut() {
+        let mut t = glam::Vec3::from_array(v.tangent);
+        let mut b = glam::Vec3::from_array(v.bitangent);
+        let n = glam::Vec3::from_array(v.normal);
+
+        if t.length_squared() < 1e-10 {
+            // Degenerate: pick an arbitrary tangent perpendicular to normal.
+            let up = if n.y.abs() < 0.99 {
+                glam::Vec3::Y
+            } else {
+                glam::Vec3::X
+            };
+            t = n.cross(up).normalize();
+        }
+
+        // Gram-Schmidt: orthogonalize tangent against normal.
+        t = (t - n * n.dot(t)).normalize();
+
+        // Recompute bitangent to ensure right-handed frame.
+        b = n.cross(t);
+
+        v.tangent   = t.to_array();
+        v.bitangent = b.to_array();
     }
 }
 
@@ -52,7 +117,7 @@ impl Mesh {
         if ext == "gltf" || ext == "glb" {
             return Self::load_gltf(path);
         }
-        let contents = std::fs::read_to_string(path)
+        let contents = crate::vfs::read_to_string(path)
             .map_err(|e| format!("Cannot read {}: {}", path, e))?;
 
         let mut positions: Vec<[f32; 3]> = Vec::new();

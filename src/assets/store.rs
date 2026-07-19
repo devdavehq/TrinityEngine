@@ -22,6 +22,13 @@ impl<T> Clone for Handle<T> {
     }
 }
 
+impl<T> Handle<T> {
+    /// Create a Handle with the given ID and a default PhantomData marker.
+    pub fn new(id: u32) -> Self {
+        Self { id, _marker: PhantomData }
+    }
+}
+
 // AssetStore<T> — a registry of assets indexed by Handle.
 pub struct AssetStore<T> {
     assets:  HashMap<u32, T>,

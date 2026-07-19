@@ -1,0 +1,8 @@
+# Grass Patch Prefab
+# Flat ground tile for outdoor environments.
+
+name     = grass_patch
+mesh     = meshes/cube.obj
+material = grass
+scale    = 4.0  0.1  4.0
+rigidbody = 0

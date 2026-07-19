@@ -1,0 +1,11 @@
+# Material Instance: Dark Wood
+# Inherits from master_surface, warm dark brown tint.
+# Use for furniture, floorboards, doors.
+
+[instance]
+name = "dark_wood"
+master = "master_surface"
+color_tint = [0.25, 0.15, 0.08]
+metallic_mul = 0.0
+roughness_mul = 1.3
+ao_mul = 0.95

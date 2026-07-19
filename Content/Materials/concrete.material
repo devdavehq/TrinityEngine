@@ -1,0 +1,11 @@
+# Material Instance: Concrete
+# Inherits from master_surface, neutral grey with high roughness.
+# Use for floors, walls, sidewalks, roads.
+
+[instance]
+name = "concrete"
+master = "master_surface"
+color_tint = [0.60, 0.60, 0.58]
+metallic_mul = 0.0
+roughness_mul = 1.4
+ao_mul = 0.9

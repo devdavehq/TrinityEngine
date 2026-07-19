@@ -92,6 +92,7 @@ pub fn create_bind_group_layouts(
                 depth_texture_entry(9), // t_shadow1
                 depth_texture_entry(10), // t_shadow2
                 comparison_sampler_entry(11), // s_shadow
+                uniform_entry(12), // LightUniforms (multi-light array, up to 16)
             ],
         },
     );
@@ -107,6 +108,7 @@ pub fn create_bind_group_layouts(
                 sampler_entry(3),
                 texture_entry(4), // t_metallic_roughness
                 sampler_entry(5),
+                uniform_entry(6), // MaterialExtras (subsurface, clearcoat, etc.)
             ],
         },
     );
@@ -139,19 +141,23 @@ pub fn create_pipeline(
     // Byte offsets for each field inside Vertex (must match mesh.rs exactly):
     //   position  [f32;3]  offset  0  (12 bytes)
     //   normal    [f32;3]  offset 12  (12 bytes)
-    //   color     [f32;3]  offset 24  (12 bytes)
-    //   metallic  f32      offset 36  ( 4 bytes)
-    //   roughness f32      offset 40  ( 4 bytes)
-    //   ao        f32      offset 44  ( 4 bytes)
-    //   _pad      f32      offset 48  ( 4 bytes)  — total 52 bytes, aligns to 16
+    //   tangent   [f32;3]  offset 24  (12 bytes)
+    //   bitangent [f32;3]  offset 36  (12 bytes)
+    //   color     [f32;3]  offset 48  (12 bytes)
+    //   metallic  f32      offset 60  ( 4 bytes)
+    //   roughness f32      offset 64  ( 4 bytes)
+    //   ao        f32      offset 68  ( 4 bytes)
+    //   _pad      f32      offset 72  ( 4 bytes)  — total 76 bytes, aligns to 16
     let vertex_attributes = [
         wgpu::VertexAttribute { shader_location: 0, format: wgpu::VertexFormat::Float32x3, offset:  0 },
         wgpu::VertexAttribute { shader_location: 1, format: wgpu::VertexFormat::Float32x3, offset: 12 },
         wgpu::VertexAttribute { shader_location: 2, format: wgpu::VertexFormat::Float32x3, offset: 24 },
-        wgpu::VertexAttribute { shader_location: 3, format: wgpu::VertexFormat::Float32,   offset: 36 },
-        wgpu::VertexAttribute { shader_location: 4, format: wgpu::VertexFormat::Float32,   offset: 40 },
-        wgpu::VertexAttribute { shader_location: 5, format: wgpu::VertexFormat::Float32,   offset: 44 },
-        // slot 6 = _pad, GPU reads it but shader ignores it
+        wgpu::VertexAttribute { shader_location: 3, format: wgpu::VertexFormat::Float32x3, offset: 36 },
+        wgpu::VertexAttribute { shader_location: 4, format: wgpu::VertexFormat::Float32x3, offset: 48 },
+        wgpu::VertexAttribute { shader_location: 5, format: wgpu::VertexFormat::Float32,   offset: 60 },
+        wgpu::VertexAttribute { shader_location: 6, format: wgpu::VertexFormat::Float32,   offset: 64 },
+        wgpu::VertexAttribute { shader_location: 7, format: wgpu::VertexFormat::Float32,   offset: 68 },
+        // slot 8 = _pad, GPU reads it but shader ignores it
     ];
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -164,22 +170,48 @@ pub fn create_pipeline(
             entry_point: Some("vs_main"),
             // ── wgpu 29: compilation_options is now required ──────────────
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as u64,
-                step_mode:    wgpu::VertexStepMode::Vertex,
-                attributes:   &vertex_attributes,
-            }],
+            buffers: &[
+                // Slot 0: per-vertex data (position, normal, color, metallic, roughness, ao)
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode:    wgpu::VertexStepMode::Vertex,
+                    attributes:   &vertex_attributes,
+                },
+                // Slot 1: per-instance data (model matrix, color_metallic, roughness_ao)
+                wgpu::VertexBufferLayout {
+                    array_stride: 96, // InstanceData: mat4(64) + vec4(16) + vec4(16) = 96
+                    step_mode:    wgpu::VertexStepMode::Instance,
+                    attributes:   &[
+                        // model matrix — 4 rows of float32x4
+                        wgpu::VertexAttribute { shader_location: 8,  format: wgpu::VertexFormat::Float32x4, offset:  0 },
+                        wgpu::VertexAttribute { shader_location: 9,  format: wgpu::VertexFormat::Float32x4, offset: 16 },
+                        wgpu::VertexAttribute { shader_location: 10, format: wgpu::VertexFormat::Float32x4, offset: 32 },
+                        wgpu::VertexAttribute { shader_location: 11, format: wgpu::VertexFormat::Float32x4, offset: 48 },
+                        // color_metallic (rgb + metallic)
+                        wgpu::VertexAttribute { shader_location: 12, format: wgpu::VertexFormat::Float32x4, offset: 64 },
+                        // roughness_ao_pad
+                        wgpu::VertexAttribute { shader_location: 13, format: wgpu::VertexFormat::Float32x4, offset: 80 },
+                    ],
+                },
+            ],
         },
 
         fragment: Some(wgpu::FragmentState {
             module:      shader,
             entry_point: Some("fs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format:     surf_fmt,
-                blend:      Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format:     surf_fmt,
+                    blend:      Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format:     wgpu::TextureFormat::Rgba16Float,
+                    blend:      Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
         }),
 
         primitive: wgpu::PrimitiveState {

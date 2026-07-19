@@ -48,7 +48,7 @@ fn main() -> Result<(), String> {
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
         .status();
 
-    println!("Installed TrinityEngine to {}", install_dir.to_string_lossy());
-    println!("Run app: {}", target_exe.to_string_lossy());
+    tracing::info!("Installed TrinityEngine to {}", install_dir.to_string_lossy());
+    tracing::info!("Run app: {}", target_exe.to_string_lossy());
     Ok(())
 }

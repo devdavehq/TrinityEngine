@@ -20,19 +20,19 @@ pub fn describe_toggle(name: &str) -> &'static str {
 }
 
 pub fn print_hierarchy(world: &World) {
-    println!("[Hierarchy] Entities:");
+    tracing::info!("[Hierarchy] Entities:");
     for entity in world.query::<hecs::Entity>().iter() {
-        println!("  - {:?}", entity);
+        tracing::info!("  - {:?}", entity);
     }
 }
 
 pub fn print_asset_browser() {
-    println!("[Assets] Browser:");
+    tracing::info!("[Assets] Browser:");
     for dir in ["meshes", "scenes", "scripts"] {
-        println!("  {}:", dir);
+        tracing::info!("  {}:", dir);
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
-                println!("    - {}", entry.path().display());
+                tracing::info!("    - {}", entry.path().display());
             }
         }
     }
@@ -77,14 +77,14 @@ impl EditorShell {
     }
 
     pub fn print_help() {
-        println!("[Editor] Controls:");
-        println!("  F10 -> toggle editor shell");
-        println!("  F11 -> toggle advanced section");
-        println!("  F5  -> cycle quality preset");
-        println!("  [ / ] -> bloom strength down/up");
-        println!("  H -> hierarchy panel, B -> asset browser, F -> add foliage patch");
-        println!("  N/M select renderable, 1/2/3 apply material instance presets");
-        println!("  J/K/L set animation state Idle/Walk/Run on selected entity");
+        tracing::info!("[Editor] Controls:");
+        tracing::info!("  F10 -> toggle editor shell");
+        tracing::info!("  F11 -> toggle advanced section");
+        tracing::info!("  F5  -> cycle quality preset");
+        tracing::info!("  [ / ] -> bloom strength down/up");
+        tracing::info!("  H -> hierarchy panel, B -> asset browser, F -> add foliage patch");
+        tracing::info!("  N/M select renderable, 1/2/3 apply material instance presets");
+        tracing::info!("  J/K/L set animation state Idle/Walk/Run on selected entity");
     }
 
     pub fn render_snapshot(
@@ -98,15 +98,15 @@ impl EditorShell {
             return;
         }
 
-        println!("==================================================");
-        println!(" Matte Black + Silver Editor Shell (Foundation) ");
-        println!("==================================================");
-        println!("[Theme] matte-black background + silver accents");
-        println!("[Layout] top/left/right/bottom + profiler dock");
+        tracing::info!("==================================================");
+        tracing::info!(" Matte Black + Silver Editor Shell (Foundation) ");
+        tracing::info!("==================================================");
+        tracing::info!("[Theme] matte-black background + silver accents");
+        tracing::info!("[Layout] top/left/right/bottom + profiler dock");
 
         if self.layout.top_toolbar {
-            println!("[TopBar] Preset: {:?}", settings.render.preset);
-            println!(
+            tracing::info!("[TopBar] Preset: {:?}", settings.render.preset);
+            tracing::info!(
                 "[TopBar] Bloom:{} SSAO:{} Fog:{} Voxel:{}",
                 settings.render.bloom_enabled,
                 settings.render.ssao_enabled,
@@ -116,20 +116,20 @@ impl EditorShell {
         }
 
         if self.layout.left_hierarchy {
-            println!("\n[Left Dock: Hierarchy]");
+            tracing::info!("\n[Left Dock: Hierarchy]");
             let mut count = 0usize;
             for e in world.query::<hecs::Entity>().iter() {
-                println!(" - {:?}", e);
+                tracing::info!(" - {:?}", e);
                 count += 1;
                 if count > 12 {
-                    println!(" ...");
+                    tracing::info!(" ...");
                     break;
                 }
             }
         }
 
         if self.layout.bottom_assets {
-            println!("\n[Bottom Dock: Asset Browser]");
+            tracing::info!("\n[Bottom Dock: Asset Browser]");
             for dir in ["meshes", "scenes", "scripts"] {
                 print!(" {}:", dir);
                 let mut shown = 0usize;
@@ -149,24 +149,24 @@ impl EditorShell {
         }
 
         if self.layout.right_inspector {
-            println!("\n[Right Dock: Inspector - Basic]");
-            println!(" shadows_enabled: {}", settings.render.shadows_enabled);
-            println!(" bloom_enabled:   {}", settings.render.bloom_enabled);
-            println!(" ssao_enabled:    {}", settings.render.ssao_enabled);
-            println!(" fog_enabled:     {}", settings.render.volumetric_fog_enabled);
-            println!(" voxel_enabled:   {}", settings.render.voxel_gi_enabled);
+            tracing::info!("\n[Right Dock: Inspector - Basic]");
+            tracing::info!(" shadows_enabled: {}", settings.render.shadows_enabled);
+            tracing::info!(" bloom_enabled:   {}", settings.render.bloom_enabled);
+            tracing::info!(" ssao_enabled:    {}", settings.render.ssao_enabled);
+            tracing::info!(" fog_enabled:     {}", settings.render.volumetric_fog_enabled);
+            tracing::info!(" voxel_enabled:   {}", settings.render.voxel_gi_enabled);
 
             if self.show_advanced {
-                println!("\n[Right Dock: Inspector - Advanced]");
-                println!(" pcss_enabled: {}", settings.render.pcss_enabled);
-                println!(" shadow_resolution: {}", settings.render.shadow_resolution);
-                println!(" pcf_samples: {}", settings.render.pcf_samples);
-                println!(" bloom_strength: {:.2}", settings.render.bloom_strength);
-                println!(" ssao_strength: {:.2}", settings.render.ssao_strength);
-                println!(" fog_density: {:.3}", settings.render.fog_density);
-                println!(" voxel_gi_strength: {:.2}", settings.render.voxel_gi_strength);
+                tracing::info!("\n[Right Dock: Inspector - Advanced]");
+                tracing::info!(" pcss_enabled: {}", settings.render.pcss_enabled);
+                tracing::info!(" shadow_resolution: {}", settings.render.shadow_resolution);
+                tracing::info!(" pcf_samples: {}", settings.render.pcf_samples);
+                tracing::info!(" bloom_strength: {:.2}", settings.render.bloom_strength);
+                tracing::info!(" ssao_strength: {:.2}", settings.render.ssao_strength);
+                tracing::info!(" fog_density: {:.3}", settings.render.fog_density);
+                tracing::info!(" voxel_gi_strength: {:.2}", settings.render.voxel_gi_strength);
                 if let Some(r) = renderer {
-                    println!(
+                    tracing::info!(
                         " culling: {} dist={:.1} frustum={}",
                         r.features.culling_enabled, r.features.culling_distance, r.features.frustum_culling_enabled
                     );
@@ -176,10 +176,10 @@ impl EditorShell {
 
         if self.layout.profiler_panel {
             if let Some(text) = profiler.overlay_text() {
-                println!("\n[Profiler Dock] {}", text);
+                tracing::info!("\n[Profiler Dock] {}", text);
             }
         }
-        println!("==================================================");
+        tracing::info!("==================================================");
     }
 }
 
@@ -199,7 +199,7 @@ pub fn add_foliage_patch(
                 h
             }
             Err(e) => {
-                eprintln!("[Foliage] Could not load {}: {}", mesh_path, e);
+                tracing::error!("[Foliage] Could not load {}: {}", mesh_path, e);
                 return;
             }
         }
@@ -227,6 +227,6 @@ pub fn add_foliage_patch(
         ));
     }
 
-    println!("[Foliage] Added foliage patch (64 instances).");
-    println!("[Foliage] Goal: one-click easy placement like UE foliage mode.");
+    tracing::info!("[Foliage] Added foliage patch (64 instances).");
+    tracing::info!("[Foliage] Goal: one-click easy placement like UE foliage mode.");
 }

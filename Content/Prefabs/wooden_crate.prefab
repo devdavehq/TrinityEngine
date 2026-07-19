@@ -1,0 +1,9 @@
+# Wooden Crate Prefab
+# Reusable template for breakable crates in the game world.
+# Place with: prefab = Content/Prefabs/wooden_crate.prefab
+
+name     = wooden_crate
+mesh     = meshes/cube.obj
+material = dark_wood
+scale    = 1.0  1.0  1.0
+rigidbody = 2.0

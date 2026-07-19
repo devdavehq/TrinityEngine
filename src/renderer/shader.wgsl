@@ -13,6 +13,8 @@ struct Uniforms {
     point_light_color_intensity: vec4<f32>,
     post_params0: vec4<f32>, // x=bloom_enabled, y=bloom_strength, z=ssao_enabled, w=ssao_strength
     post_params1: vec4<f32>, // x=fog_enabled, y=fog_density, z=voxel_enabled, w=voxel_strength
+    fog_color:    vec4<f32>, // rgb = dynamic fog color from TimeOfDay, w = elapsed time
+    wind_dir_strength: vec4<f32>, // xyz = wind direction (normalised), w = wind strength [0..1]
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -25,7 +27,34 @@ struct Uniforms {
 @group(0) @binding(5) var brdf_lut:                texture_2d<f32>;
 @group(0) @binding(6) var brdf_lut_sampler:        sampler;
 
-// ── Bind Group 1: per-material textures ───────────────────────────────────
+// ── Multi-light uniform buffer (group 0, binding 12) ────────────────────────
+// Up to 16 lights: directional sun, point lights, spot lights.
+// Populated each frame from the ECS world.
+const MAX_LIGHTS: u32 = 16u;
+
+struct LightData {
+    position: vec3<f32>,       // world-space position (point/spot) or direction (directional)
+    _pos_pad: f32,
+    color: vec3<f32>,          // light colour
+    _col_pad: f32,
+    intensity: f32,            // brightness multiplier
+    range: f32,                // attenuation range (0 = infinite / directional)
+    light_type: f32,           // 0 = directional, 1 = point, 2 = spot
+    spot_angle_cos: f32,       // cos of spot cone half-angle
+    shadow_index: i32,         // index into shadow cascade array (-1 = no shadow)
+    _pad: f32,
+};
+
+struct LightUniforms {
+    lights: array<LightData, 16>,
+    light_count: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+@group(0) @binding(12) var<uniform> light_uniforms: LightUniforms;
+
+// ── Bind Group 1: per-material textures + extras ────────────────────────────
 // This group changes per entity (each entity has its own material).
 @group(1) @binding(0) var t_albedo:             texture_2d<f32>;
 @group(1) @binding(1) var s_albedo:             sampler;
@@ -34,36 +63,124 @@ struct Uniforms {
 @group(1) @binding(4) var t_metallic_roughness: texture_2d<f32>;
 @group(1) @binding(5) var s_metallic_roughness: sampler;
 
+// ── Per-object material extras (subsurface, clearcoat, etc.) ─────────────────
+struct MaterialExtras {
+    subsurface:          f32,  // 0 = none, 1 = full SSS (leaves, skin, cloth)
+    clearcoat:           f32,  // 0-1 clearcoat layer strength (car paint, lacquer)
+    clearcoat_roughness: f32,  // 0-1 clearcoat roughness
+    anisotropy:          f32,  // anisotropic highlight stretch (brushed metal, hair)
+    emissive_strength:   f32,  // self-illumination multiplier
+    _pad: vec3<f32>,
+};
+@group(1) @binding(6) var<uniform> material_extras: MaterialExtras;
+
 // ── Vertex input/output ────────────────────────────────────────────────────
 struct VertIn {
     @location(0) position:  vec3<f32>,
     @location(1) normal:    vec3<f32>,
-    @location(2) color:     vec3<f32>,
-    @location(3) metallic:  f32,
-    @location(4) roughness: f32,
-    @location(5) ao:        f32,
+    @location(2) tangent:   vec3<f32>,
+    @location(3) bitangent: vec3<f32>,
+    @location(4) color:     vec3<f32>,
+    @location(5) metallic:  f32,
+    @location(6) roughness: f32,
+    @location(7) ao:        f32,
+}
+
+// ── Per-instance data (matches InstanceData in instancing.rs) ──────────────
+// Two buffers: slot 0 = per-vertex, slot 1 = per-instance.
+struct InstanceIn {
+    @location(8)  model_row0:     vec4<f32>,
+    @location(9)  model_row1:     vec4<f32>,
+    @location(10) model_row2:     vec4<f32>,
+    @location(11) model_row3:     vec4<f32>,
+    @location(12) color_metallic: vec4<f32>,
+    @location(13) roughness_ao:   vec4<f32>,
 }
 
 struct VertOut {
     @builtin(position) clip_pos:  vec4<f32>,
     @location(0)       world_pos: vec3<f32>,
     @location(1)       normal:    vec3<f32>,
-    @location(2)       color:     vec3<f32>,
-    @location(3)       metallic:  f32,
-    @location(4)       roughness: f32,
-    @location(5)       ao:        f32,
+    @location(2)       tangent:   vec3<f32>,
+    @location(3)       bitangent: vec3<f32>,
+    @location(4)       color:     vec3<f32>,
+    @location(5)       metallic:  f32,
+    @location(6)       roughness: f32,
+    @location(7)       ao:        f32,
 }
 
 @vertex
-fn vs_main(in: VertIn) -> VertOut {
+fn vs_main(in: VertIn, instance: InstanceIn) -> VertOut {
+    // Reconstruct model matrix from instance data.
+    let model = mat4x4<f32>(
+        instance.model_row0,
+        instance.model_row1,
+        instance.model_row2,
+        instance.model_row3,
+    );
+
+    // Transform vertex position by instance model matrix.
+    var world_pos = (model * vec4<f32>(in.position, 1.0)).xyz;
+
+    // ── Wind displacement ──────────────────────────────────────────────────
+    // Wind sways vertices based on their local-space height (Y position).
+    // Vertices at or below y=0 are anchored (ground level).
+    // Vertices above y=0 sway proportionally to height — taller parts of
+    // trees/plants move more, matching how real vegetation behaves.
+    // Two sine waves at different frequencies create organic-looking motion
+    // instead of a robotic back-and-forth.
+    {
+        let wind = uniforms.wind_dir_strength;
+        let strength = wind.w;
+        if (strength > 0.001) {
+            let height_factor = max(in.position.y, 0.0);
+            // Primary sway wave — driven by elapsed time.
+            let phase = uniforms.fog_color.w * 2.0
+                      + in.position.x * 0.5
+                      + in.position.z * 0.3;
+            // Secondary wave at different frequency for organic feel.
+            let phase2 = uniforms.fog_color.w * 3.3
+                       + in.position.x * 0.2
+                       + in.position.z * 0.7;
+            let sway = vec3<f32>(
+                sin(phase)  * strength * height_factor,
+                sin(phase2) * strength * height_factor * 0.15,
+                cos(phase * 0.7) * strength * height_factor * 0.5,
+            );
+            world_pos += sway;
+        }
+    }
+
+    // Transform normal by the upper-left 3x3 of the model matrix.
+    // For uniform scale this is just the rotation part; for non-uniform
+    // scale it should use the inverse transpose, but we approximate here.
+    let normal_matrix = mat3x3<f32>(
+        instance.model_row0.xyz,
+        instance.model_row1.xyz,
+        instance.model_row2.xyz,
+    );
+    var world_normal = normalize(normal_matrix * in.normal);
+
+    // Transform tangent and bitangent by the normal matrix (upper-left 3x3).
+    // These define the TBN frame in world space for tangent-space normal mapping.
+    var world_tangent   = normalize(normal_matrix * in.tangent);
+    var world_bitangent = normalize(normal_matrix * in.bitangent);
+    // Re-orthogonalize tangent w.r.t. normal (Gram-Schmidt).
+    world_tangent = normalize(world_tangent - dot(world_tangent, world_normal) * world_normal);
+    // Recompute bitangent to maintain right-handed frame.
+    world_bitangent = cross(world_normal, world_tangent);
+
     var out: VertOut;
-    out.clip_pos  = uniforms.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_pos = in.position;
-    out.normal    = in.normal;
-    out.color     = in.color;
-    out.metallic  = in.metallic;
-    out.roughness = in.roughness;
-    out.ao        = in.ao;
+    out.clip_pos  = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    out.world_pos = world_pos;
+    out.normal    = world_normal;
+    out.tangent   = world_tangent;
+    out.bitangent = world_bitangent;
+    // Use instance color/metallic/roughness/ao if present (non-zero color).
+    out.color     = select(in.color, instance.color_metallic.xyz, instance.color_metallic.xyz != vec3<f32>(0.0));
+    out.metallic  = select(in.metallic, instance.color_metallic.w, instance.color_metallic.w >= 0.0);
+    out.roughness = select(in.roughness, instance.roughness_ao.x, instance.roughness_ao.x > 0.0);
+    out.ao        = select(in.ao, instance.roughness_ao.y, instance.roughness_ao.y > 0.0);
     return out;
 }
 
@@ -95,6 +212,7 @@ struct ShadowData {
     normal_offset_bias: f32,
     pcf_radius:         f32,
     shadow_enabled:     f32,  // 0 or 1 — toggleable on old hardware
+    shadow_map_size:    f32,  // resolution of the shadow map (e.g. 2048.0)
 }
 
 @group(0) @binding(7)  var<uniform>    shadow_data:     ShadowData;
@@ -139,8 +257,8 @@ fn sample_shadow_pcf(
     );
 
     // Texel size in UV space: 1/resolution.
-    // We hardcode 2048 to match SHADOW_MAP_SIZE in shadow.rs.
-    let texel_size = pcf_radius / 2048.0;
+    // Uses shadow_data.shadow_map_size which is set from RenderFeatures.shadow_resolution.
+    let texel_size = pcf_radius / shadow_data.shadow_map_size;
 
     var shadow_sum = 0.0;
     for (var i = 0; i < 9; i++) {
@@ -263,9 +381,54 @@ fn fresnel_schlick_roughness(cosTheta: f32, F0: vec3<f32>, roughness: f32) -> ve
     return F0 + (smoother - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// ── Per-light PBR Cook-Torrance functions ───────────────────────────────────
+// These compute the direct lighting contribution from a single light,
+// used inside the multi-light loop.
+
+fn compute_directional_light(light: LightData, N: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>, metallic: f32, roughness: f32) -> vec3<f32> {
+    // Directional light: position field stores the light DIRECTION.
+    let L = normalize(-light.position);
+    let H = normalize(V + L);
+    let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let D = distribution_ggx(N, H, roughness);
+    let G = geometry_smith(N, V, L, roughness);
+    let F = fresnel_schlick(max(dot(H, V), 0.0), F0);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.0001);
+    let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
+    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    return (kD * albedo / PI + spec) * light.color * light.intensity * NdotL;
+}
+
+fn compute_point_light(light: LightData, N: vec3<f32>, V: vec3<f32>, world_pos: vec3<f32>, albedo: vec3<f32>, metallic: f32, roughness: f32) -> vec3<f32> {
+    let L_raw = light.position - world_pos;
+    let dist = length(L_raw);
+    let L = L_raw / max(dist, 0.001);
+    let H = normalize(V + L);
+    let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let D = distribution_ggx(N, H, roughness);
+    let G = geometry_smith(N, V, L, roughness);
+    let F = fresnel_schlick(max(dot(H, V), 0.0), F0);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.0001);
+    let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
+    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    return (kD * albedo / PI + spec) * light.color * light.intensity * NdotL;
+}
+
+fn compute_spot_light(light: LightData, N: vec3<f32>, V: vec3<f32>, world_pos: vec3<f32>, albedo: vec3<f32>, metallic: f32, roughness: f32) -> vec3<f32> {
+    var contrib = compute_point_light(light, N, V, world_pos, albedo, metallic, roughness);
+    // Cone attenuation: sharp falloff at the edge of the spot cone.
+    let L = normalize(light.position - world_pos);
+    // light.position doubles as spot direction for spot lights.
+    let spot_cos = dot(-L, normalize(light.position));
+    let spot_atten = smoothstep(light.spot_angle_cos, light.spot_angle_cos + 0.01, spot_cos);
+    return contrib * spot_atten;
+}
+
 // ── Fragment shader ────────────────────────────────────────────────────────
 @fragment
-fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertOut) -> (@location(0) vec4<f32>, @location(1) vec4<f32>) {
 
     // ── Sample textures ────────────────────────────────────────────────────
     // Sample albedo texture at the vertex's UV coordinates.
@@ -278,49 +441,97 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     // Normal maps store directions as RGB where (0.5, 0.5, 1.0) = flat.
     // Unpacking: multiply by 2 and subtract 1 maps (0..1) → (-1..1).
     let normal_sample = textureSample(t_normal, s_normal, world_uv).rgb;
-    // Unpack: (0,0,1) in texture = (0,0,1) in tangent space = flat surface.
-    // We're using object-space normals here for simplicity.
-    // A full implementation uses tangent-space normals + TBN matrix.
-    let N_from_map = normalize(normal_sample * 2.0 - vec3<f32>(1.0));
+    // Tangent-space normal from the map.
+    let normal_tangent = normal_sample * 2.0 - vec3<f32>(1.0);
+    // Build TBN matrix: transforms from tangent space to world space.
+    let TBN = mat3x3<f32>(in.tangent, in.bitangent, in.normal);
+    let N = normalize(TBN * normal_tangent);
 
-    // Blend between geometry normal and normal map.
-    // For now weight toward geometry normal for stability.
-    // A full TBN implementation would use N_from_map directly.
-    let N = normalize(in.normal * 0.3 + N_from_map * 0.7);
-
-    // Sample metallic-roughness texture.
+    // ── Sample metallic-roughness texture ─────────────────────────────────
     // glTF convention: B channel = metallic, G channel = roughness.
     let mr_sample  = textureSample(t_metallic_roughness, s_metallic_roughness, world_uv);
-    // Multiply by component values from vertex — allows scene-level override.
-    let metallic   = mr_sample.b * in.metallic  + (1.0 - in.metallic)  * mr_sample.b;
-    let roughness_raw  = mr_sample.g * in.roughness + (1.0 - in.roughness) * mr_sample.g;
+    // Take the higher of texture and vertex value — allows scene-level override.
+    let metallic   = max(mr_sample.b, in.metallic);
+    let roughness_raw = max(mr_sample.g, in.roughness);
     // Clamp roughness — pure 0.0 causes division by zero in GGX.
     let roughness  = clamp(roughness_raw, 0.04, 1.0);
 
     let V  = normalize(uniforms.camera_pos - in.world_pos);
-    let L  = normalize(uniforms.light_dir);
-    let H  = normalize(V + L);
     let F0 = mix(vec3<f32>(0.04), albedo, metallic);
-
-    // ── Direct lighting (same Cook-Torrance as before) ─────────────────────
-    let D      = distribution_ggx(N, H, roughness);
-    let G      = geometry_smith(N, V, L, roughness);
-    let F_dir  = fresnel_schlick(max(dot(H, V), 0.0), F0);
-    let NdotL  = max(dot(N, L), 0.0);
     let NdotV  = max(dot(N, V), 0.0);
-    let spec   = (D * G * F_dir) / max(4.0 * NdotV * NdotL, 0.0001);
-    let kS_dir = F_dir;
-    let kD_dir = (vec3<f32>(1.0) - kS_dir) * (1.0 - metallic);
-   // IBL is ambient — it comes from everywhere so shadows don't apply.
     let view_z = abs(in.clip_pos.z / max(in.clip_pos.w, 0.0001));
-    let shadow = compute_shadow(in.world_pos, N, view_z);
-    let Lo = (kD_dir * albedo / PI + spec) * uniforms.light_color * 3.0 * NdotL * shadow;
 
+    // ── Multi-light loop ────────────────────────────────────────────────────
+    // Iterates over all active lights (directional, point, spot) and accumulates
+    // their PBR Cook-Torrance contributions.  Includes per-light SSS and clearcoat
+    // contributions when material_extras enables them.
+    var total_lighting = vec3<f32>(0.0);
+
+    for (var i = 0u; i < light_uniforms.light_count; i++) {
+        let light = light_uniforms.lights[i];
+        var contrib = vec3<f32>(0.0);
+
+        if (light.light_type == 0.0) {
+            // ── Directional light (sun) ─────────────────────────────────
+            contrib = compute_directional_light(light, N, V, albedo, metallic, roughness);
+            // Apply cascaded shadow maps for the directional light.
+            if (light.shadow_index >= 0) {
+                contrib *= compute_shadow(in.world_pos, N, view_z);
+            }
+        } else if (light.light_type == 1.0) {
+            // ── Point light with range-based attenuation ────────────────
+            let attenuation = 1.0 - saturate(length(light.position - in.world_pos) / max(light.range, 0.001));
+            contrib = compute_point_light(light, N, V, in.world_pos, albedo, metallic, roughness)
+                    * attenuation * attenuation;
+        } else {
+            // ── Spot light ─────────────────────────────────────────────
+            let attenuation = 1.0 - saturate(length(light.position - in.world_pos) / max(light.range, 0.001));
+            contrib = compute_spot_light(light, N, V, in.world_pos, albedo, metallic, roughness)
+                    * attenuation * attenuation;
+        }
+
+        // ── Subsurface scattering (per-light) ──────────────────────────────
+        // Wrap lighting + view-dependent translucency for thin surfaces
+        // (leaves, cloth, skin).  Blends with standard diffuse via subsurface.
+        if (material_extras.subsurface > 0.01) {
+            var L_sss: vec3<f32>;
+            if (light.light_type == 0.0) {
+                L_sss = normalize(-light.position);
+            } else {
+                L_sss = normalize(light.position - in.world_pos);
+            }
+            let wrap = 0.5;
+            let wrap_lighting = max(0.0, (dot(N, L_sss) + wrap) / (1.0 + wrap));
+            let translucency = pow(max(0.0, dot(V, -L_sss)), 2.0);
+            let sss = albedo * (wrap_lighting + translucency * 0.5) * material_extras.subsurface;
+            contrib += sss * light.color * light.intensity;
+        }
+
+        // ── Clearcoat (per-light) ───────────────────────────────────────────
+        // Thin dielectric layer on top of the base material (car paint, lacquer).
+        // Uses a second GGX lobe with F0 = 0.04 (glass-like) and its own roughness.
+        if (material_extras.clearcoat > 0.01) {
+            var L_cc: vec3<f32>;
+            if (light.light_type == 0.0) {
+                L_cc = normalize(-light.position);
+            } else {
+                L_cc = normalize(light.position - in.world_pos);
+            }
+            let H_cc = normalize(V + L_cc);
+            let F0_cc = vec3<f32>(0.04);
+            let D_cc = distribution_ggx(N, H_cc, material_extras.clearcoat_roughness);
+            let G_cc = geometry_smith(N, V, L_cc, material_extras.clearcoat_roughness);
+            let F_cc = fresnel_schlick(max(dot(H_cc, V), 0.0), F0_cc);
+            let NdotL_cc = max(dot(N, L_cc), 0.0);
+            let NdotV_cc = max(dot(N, V), 0.0001);
+            let cc_spec = (D_cc * G_cc * F_cc) / max(4.0 * NdotV_cc * NdotL_cc, 0.0001);
+            contrib += cc_spec * light.color * light.intensity * NdotL_cc * material_extras.clearcoat;
+        }
+
+        total_lighting += contrib;
+    }
 
     // ── IBL: diffuse irradiance ────────────────────────────────────────────
-    // Sample the irradiance map in the surface normal direction.
-    // The irradiance map tells us: "total light arriving from the hemisphere
-    // around direction N." This is the diffuse contribution from the environment.
     let irr_uv      = dir_to_equirect(N);
     let irradiance  = textureSample(ibl_irradiance, ibl_irradiance_sampler, irr_uv).rgb;
     let F_ibl       = fresnel_schlick_roughness(NdotV, F0, roughness);
@@ -328,51 +539,33 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let diffuse_ibl = irradiance * albedo;
 
     // ── IBL: specular reflection ───────────────────────────────────────────
-    // Reflect the view direction off the surface to get the reflection direction.
-    // Sample the prefiltered env at a mip level matching roughness.
     let R           = reflect(-V, N);
     let refl_uv     = dir_to_equirect(R);
-    // Select mip level based on roughness: rougher = blurrier reflection.
-    // textureNumLevels gives the total mip count.
     let mip_count   = f32(textureNumLevels(ibl_prefilter));
     let prefiltered = textureSampleLevel(
-        ibl_prefilter,
-        ibl_prefilter_sampler,
-        refl_uv,
+        ibl_prefilter, ibl_prefilter_sampler, refl_uv,
         roughness * (mip_count - 1.0),
     ).rgb;
+    let brdf     = textureSample(brdf_lut, brdf_lut_sampler, vec2<f32>(NdotV, roughness)).rg;
+    let spec_ibl = prefiltered * (F_ibl * brdf.x + brdf.y);
 
-    // BRDF LUT lookup: gives scale and bias for the specular integral.
-    // X = NdotV (clamped to valid range), Y = roughness.
-    let brdf        = textureSample(brdf_lut, brdf_lut_sampler,
-                          vec2<f32>(NdotV, roughness)).rg;
-    let spec_ibl    = prefiltered * (F_ibl * brdf.x + brdf.y);
-
-    // Combine IBL diffuse + specular with ambient occlusion.
-    var ao = in.ao; // vertex AO — later add AO texture
+    // ── Combine ambient + direct lighting ─────────────────────────────────
+    var ao = in.ao;
     if uniforms.post_params0.z > 0.5 {
-        // Cheap SSAO-like approximation from normal orientation and distance.
         let horizon = 1.0 - max(N.y, 0.0);
         let dist_occ = clamp(view_z * 0.03, 0.0, 1.0);
         let approx = clamp((horizon * 0.6 + dist_occ * 0.4) * uniforms.post_params0.w, 0.0, 0.9);
         ao *= (1.0 - approx);
     }
-    let ambient     = (kD_ibl * diffuse_ibl + spec_ibl) * ao;
+    let ambient = (kD_ibl * diffuse_ibl + spec_ibl) * ao;
 
-    // Single movable point light.
-    let pl_pos = uniforms.point_light_pos_range.xyz;
-    let pl_range = max(uniforms.point_light_pos_range.w, 0.001);
-    let pl_color = uniforms.point_light_color_intensity.xyz;
-    let pl_intensity = uniforms.point_light_color_intensity.w;
-    let to_pl = pl_pos - in.world_pos;
-    let pl_dist = length(to_pl);
-    let pl_dir = normalize(to_pl);
-    let pl_nl = max(dot(N, pl_dir), 0.0);
-    let pl_att = clamp(1.0 - (pl_dist / pl_range), 0.0, 1.0);
-    let point_diff = (albedo / PI) * pl_color * (pl_nl * pl_att * pl_intensity);
+    // ── Emissive self-illumination ─────────────────────────────────────────
+    var emissive = vec3<f32>(0.0);
+    if material_extras.emissive_strength > 0.01 {
+        emissive = albedo * material_extras.emissive_strength;
+    }
 
-    // ── Final combination ──────────────────────────────────────────────────
-    var color = ambient + Lo + point_diff;
+    var color = ambient + total_lighting + emissive;
 
     // Voxel GI prototype (cheap approximation) — gives blocky bounced fill style.
     if uniforms.post_params1.z > 0.5 {
@@ -385,23 +578,14 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     // Volumetric fog approximation.
     if uniforms.post_params1.x > 0.5 {
         let fog = 1.0 - exp(-view_z * uniforms.post_params1.y);
-        let fog_color = vec3<f32>(0.52, 0.60, 0.70);
+        let fog_color = uniforms.fog_color.rgb;
         color = mix(color, fog_color, clamp(fog, 0.0, 0.9));
     }
 
-    // Tone mapping (Reinhard) — HDR → LDR.
-    color = color / (color + vec3<f32>(1.0));
-
-    // Gamma correction — linear → sRGB for display.
-    color = pow(color, vec3<f32>(1.0 / 2.2));
-
-    // Bloom approximation: boost highlights after tone map.
-    if uniforms.post_params0.x > 0.5 {
-        let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let glow = smoothstep(0.7, 1.0, lum) * uniforms.post_params0.y;
-        color += color * glow;
-    }
-
-    return vec4<f32>(color, 1.0);
+    // Output raw HDR linear + world-space normals (MRT target 1).
+    // Normals are encoded as (N * 0.5 + 0.5) so negative values map to [0,0.5]
+    // and positive values map to [0.5,1.0] — suitable for Rgba16Float.
+    // Tone mapping and gamma are applied by the post-process tonemap pass.
+    return (vec4<f32>(color, 1.0), vec4<f32>(N * 0.5 + vec3<f32>(0.5), 1.0));
 }
 

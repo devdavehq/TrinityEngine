@@ -1,0 +1,10 @@
+# Master Material: Surface
+# Base material for non-metallic surfaces (plastic, wood, stone, etc.)
+# Inherit from this in [instance] sections to create concrete materials.
+
+[material]
+name = "master_surface"
+base_color = [1.0, 1.0, 1.0]
+metallic = 0.0
+roughness = 0.7
+ao = 1.0

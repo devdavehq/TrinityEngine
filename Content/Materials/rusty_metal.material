@@ -1,0 +1,11 @@
+# Material Instance: Rusty Metal
+# Inherits from master_metal, applies warm rust tint.
+# Use for weathered iron, old pipes, abandoned machinery.
+
+[instance]
+name = "rusty_metal"
+master = "master_metal"
+color_tint = [0.65, 0.25, 0.15]
+metallic_mul = 0.85
+roughness_mul = 1.8
+ao_mul = 1.0

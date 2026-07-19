@@ -1,0 +1,10 @@
+# Master Material: Foliage
+# Base material for vegetation (leaves, grass, bark).
+# Non-metallic, high roughness for natural look.
+
+[material]
+name = "master_foliage"
+base_color = [0.18, 0.42, 0.20]
+metallic = 0.0
+roughness = 0.9
+ao = 1.0

@@ -1,0 +1,11 @@
+# Material Instance: Polished Chrome
+# Inherits from master_metal, very smooth mirror-like finish.
+# Use for car bumpers, faucets, trophies.
+
+[instance]
+name = "polished_chrome"
+master = "master_metal"
+color_tint = [0.95, 0.95, 0.97]
+metallic_mul = 1.0
+roughness_mul = 0.15
+ao_mul = 1.0

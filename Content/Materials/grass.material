@@ -1,0 +1,11 @@
+# Material Instance: Grass
+# Inherits from master_foliage, bright green.
+# Use for ground cover, lawns, meadows.
+
+[instance]
+name = "grass"
+master = "master_foliage"
+color_tint = [0.25, 0.65, 0.18]
+metallic_mul = 0.0
+roughness_mul = 1.1
+ao_mul = 1.0

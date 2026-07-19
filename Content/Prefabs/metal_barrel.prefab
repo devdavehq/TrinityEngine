@@ -1,0 +1,8 @@
+# Metal Barrel Prefab
+# Heavy, metallic barrel. Can be used as cover or decoration.
+
+name     = metal_barrel
+mesh     = meshes/cube.obj
+material = rusty_metal
+scale    = 0.8  1.2  0.8
+rigidbody = 5.0

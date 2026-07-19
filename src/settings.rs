@@ -46,6 +46,48 @@ pub struct RenderSettings {
     pub sun_intensity: f32,
     /// Optional path to an HDR sky environment map (.hdr).
     pub sky_hdr_path: String,
+    // ── Tone mapping + colour grading ───────────────────────────────────────
+    pub tonemap_enabled: bool,
+    pub tonemap_exposure: f32,
+    pub tonemap_temperature: f32,
+    pub tonemap_saturation: f32,
+    pub tonemap_contrast: f32,
+    pub tonemap_vibrance: f32,
+    pub tonemap_grain: f32,
+    // ── Wind ─────────────────────────────────────────────────────────────────
+    pub wind_dir_x: f32,
+    pub wind_dir_z: f32,
+    pub wind_strength: f32,
+    // ── Screen-Space Reflections ────────────────────────────────────────────
+    pub ssr_enabled: bool,
+    pub ssr_max_steps: u32,
+    pub ssr_max_distance: f32,
+    pub ssr_thickness: f32,
+    pub ssr_intensity: f32,
+    // ── Water rendering ─────────────────────────────────────────────────────
+    pub water_enabled: bool,
+    // ── Lava rendering ─────────────────────────────────────────────────────
+    pub lava_enabled: bool,
+    // ── Fire rendering ─────────────────────────────────────────────────────
+    pub fire_enabled: bool,
+    // ── Temporal Anti-Aliasing (TAA) ──────────────────────────────────────
+    pub taa_enabled: bool,
+    pub taa_blend_factor: f32,
+    // ── Motion Blur ───────────────────────────────────────────────────────
+    pub motion_blur_enabled: bool,
+    pub motion_blur_strength: f32,
+    // ── Depth of Field ────────────────────────────────────────────────────
+    pub dof_enabled: bool,
+    pub dof_focus_distance: f32,
+    pub dof_strength: f32,
+    pub dof_aperture: f32,
+    // ── God Rays ─────────────────────────────────────────────────────────
+    pub god_rays_enabled: bool,
+    pub god_rays_intensity: f32,
+    pub god_rays_decay: f32,
+    pub god_rays_density: f32,
+    pub god_rays_weight: f32,
+    pub god_rays_num_samples: u32,
 }
 
 impl Default for RenderSettings {
@@ -75,6 +117,48 @@ impl Default for RenderSettings {
             sun_elevation_deg: 42.0,
             sun_intensity: 1.0,
             sky_hdr_path: String::new(),
+            // Tone mapping defaults — neutral.
+            tonemap_enabled: true,
+            tonemap_exposure: 0.0,
+            tonemap_temperature: 0.0,
+            tonemap_saturation: 0.0,
+            tonemap_contrast: 0.0,
+            tonemap_vibrance: 0.0,
+            tonemap_grain: 0.0,
+            // Wind defaults.
+            wind_dir_x: 1.0,
+            wind_dir_z: 0.3,
+            wind_strength: 0.1,
+            // SSR defaults.
+            ssr_enabled: false,
+            ssr_max_steps: 64,
+            ssr_max_distance: 50.0,
+            ssr_thickness: 0.05,
+            ssr_intensity: 1.0,
+            // Water defaults.
+            water_enabled: true,
+            // Lava defaults.
+            lava_enabled: true,
+            // Fire defaults.
+            fire_enabled: true,
+            // TAA defaults — enabled by default for anti-aliasing.
+            taa_enabled: true,
+            taa_blend_factor: 0.1,
+            // Motion blur defaults — off by default.
+            motion_blur_enabled: false,
+            motion_blur_strength: 0.5,
+            // DOF defaults — off by default.
+            dof_enabled: false,
+            dof_focus_distance: 10.0,
+            dof_strength: 4.0,
+            dof_aperture: 0.02,
+            // God rays — off by default.
+            god_rays_enabled: false,
+            god_rays_intensity: 0.4,
+            god_rays_decay: 0.96,
+            god_rays_density: 1.2,
+            god_rays_weight: 0.04,
+            god_rays_num_samples: 32,
         }
     }
 }
@@ -202,13 +286,13 @@ impl Default for RuntimeSettings {
 
 impl EngineSettings {
     pub fn load(path: &str) -> Self {
-        let mut settings = match std::fs::read_to_string(path) {
+        let mut settings = match crate::vfs::read_to_string(path) {
             Ok(text) => toml::from_str::<Self>(&text).unwrap_or_else(|err| {
-                eprintln!("[Settings] Invalid settings file ({}): {}", path, err);
+                tracing::error!("[Settings] Invalid settings file ({}): {}", path, err);
                 Self::default()
             }),
             Err(_) => {
-                println!("[Settings] No settings file found. Using defaults.");
+                tracing::info!("[Settings] No settings file found. Using defaults.");
                 Self::default()
             }
         };
@@ -237,6 +321,26 @@ impl EngineSettings {
                 self.render.sun_elevation_deg = 38.0;
                 self.render.sun_azimuth_deg = 25.0;
                 self.render.sun_intensity = 0.95;
+                // Tone mapping always on — cheap and prevents washed-out HDR.
+                self.render.tonemap_enabled = true;
+                self.render.tonemap_exposure = 0.0;
+                self.render.tonemap_temperature = 0.0;
+                self.render.tonemap_saturation = 0.0;
+                self.render.tonemap_contrast = 0.0;
+                self.render.tonemap_vibrance = 0.0;
+                self.render.tonemap_grain = 0.0;
+                // No wind on mobile.
+                self.render.wind_strength = 0.0;
+                // No SSR on mobile.
+                self.render.ssr_enabled = false;
+                // No fire on mobile — too expensive.
+                self.render.fire_enabled = false;
+                // No TAA, motion blur, DOF on mobile.
+                self.render.taa_enabled = false;
+                self.render.motion_blur_enabled = false;
+                self.render.dof_enabled = false;
+                // No god rays on mobile.
+                self.render.god_rays_enabled = false;
             }
             RenderPreset::Balanced => {
                 self.render.shadows_enabled = true;
@@ -258,6 +362,16 @@ impl EngineSettings {
                 self.render.sun_elevation_deg = 46.0;
                 self.render.sun_azimuth_deg = 35.0;
                 self.render.sun_intensity = 1.0;
+                // TAA enabled on balanced — good anti-aliasing at moderate cost.
+                self.render.taa_enabled = true;
+                self.render.taa_blend_factor = 0.1;
+                // No motion blur or DOF on balanced.
+                self.render.motion_blur_enabled = false;
+                self.render.dof_enabled = false;
+                // God rays on balanced — moderate sample count.
+                self.render.god_rays_enabled = true;
+                self.render.god_rays_intensity = 0.3;
+                self.render.god_rays_num_samples = 24;
             }
             RenderPreset::Cinematic => {
                 self.render.shadows_enabled = true;
@@ -281,39 +395,188 @@ impl EngineSettings {
                 self.render.sun_elevation_deg = 28.0;
                 self.render.sun_azimuth_deg = 318.0;
                 self.render.sun_intensity = 1.15;
+                // Cinematic tone mapping — subtle warm film look.
+                self.render.tonemap_enabled = true;
+                self.render.tonemap_exposure = 0.1;
+                self.render.tonemap_temperature = 0.05;
+                self.render.tonemap_saturation = 0.1;
+                self.render.tonemap_contrast = 0.1;
+                self.render.tonemap_vibrance = 0.15;
+                self.render.tonemap_grain = 0.02;
+                // Full wind on cinematic.
+                self.render.wind_dir_x = 1.0;
+                self.render.wind_dir_z = 0.3;
+                self.render.wind_strength = 0.3;
+                // SSR on cinematic.
+                self.render.ssr_enabled = true;
+                self.render.ssr_max_steps = 64;
+                self.render.ssr_max_distance = 50.0;
+                self.render.ssr_thickness = 0.05;
+                self.render.ssr_intensity = 1.0;
+                // TAA on cinematic.
+                self.render.taa_enabled = true;
+                self.render.taa_blend_factor = 0.1;
+                // Motion blur on cinematic.
+                self.render.motion_blur_enabled = true;
+                self.render.motion_blur_strength = 0.5;
+                // DOF on cinematic.
+                self.render.dof_enabled = true;
+                self.render.dof_focus_distance = 10.0;
+                self.render.dof_strength = 4.0;
+                self.render.dof_aperture = 0.02;
+                // God rays on cinematic.
+                self.render.god_rays_enabled = true;
+                self.render.god_rays_intensity = 0.5;
+                self.render.god_rays_decay = 0.96;
+                self.render.god_rays_density = 1.0;
+                self.render.god_rays_weight = 0.05;
+                self.render.god_rays_num_samples = 48;
             }
         }
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, s).map_err(|e| e.to_string())
+        crate::vfs::write_string(path, &s).map_err(|e| e.to_string())
     }
 
     /// Keep `engine_settings.toml` fields aligned with live `RenderFeatures` after editor toggles.
     pub fn sync_render_from_renderer_features(&mut self, f: &crate::renderer::RenderFeatures) {
-        self.render.preset = RenderPreset::Custom;
-        self.render.shadows_enabled = f.shadows_enabled;
-        self.render.pcf_enabled = f.pcf_enabled;
-        self.render.pcss_enabled = f.pcss_enabled;
-        self.render.ibl_enabled = f.ibl_enabled;
-        self.render.probes_enabled = f.probes_enabled;
-        self.render.volumetric_enabled = f.volumetric_enabled;
-        self.render.shadow_resolution = f.shadow_resolution;
-        self.render.pcf_samples = f.pcf_samples;
-        self.render.culling_enabled = f.culling_enabled;
-        self.render.culling_distance = f.culling_distance;
-        self.render.frustum_culling_enabled = f.frustum_culling_enabled;
-        self.render.bloom_enabled = f.bloom_enabled;
-        self.render.bloom_strength = f.bloom_strength;
-        self.render.ssao_enabled = f.ssao_enabled;
-        self.render.ssao_strength = f.ssao_strength;
-        self.render.volumetric_fog_enabled = f.volumetric_fog_enabled;
-        self.render.fog_density = f.fog_density;
-        self.render.voxel_gi_enabled = f.voxel_gi_enabled;
-        self.render.voxel_gi_strength = f.voxel_gi_strength;
-        self.render.sun_azimuth_deg = f.sun_azimuth_deg;
-        self.render.sun_elevation_deg = f.sun_elevation_deg;
-        self.render.sun_intensity = f.sun_intensity;
+        self.render = RenderSettings::from_features(f);
+    }
+}
+
+impl RenderSettings {
+    /// Create RenderSettings from a live RenderFeatures snapshot (editor → settings sync).
+    pub fn from_features(f: &crate::renderer::RenderFeatures) -> Self {
+        Self {
+            preset: RenderPreset::Custom,
+            shadows_enabled: f.shadows_enabled,
+            pcf_enabled: f.pcf_enabled,
+            pcss_enabled: f.pcss_enabled,
+            ibl_enabled: f.ibl_enabled,
+            probes_enabled: f.probes_enabled,
+            volumetric_enabled: f.volumetric_enabled,
+            shadow_resolution: f.shadow_resolution,
+            pcf_samples: f.pcf_samples,
+            culling_enabled: f.culling_enabled,
+            culling_distance: f.culling_distance,
+            frustum_culling_enabled: f.frustum_culling_enabled,
+            bloom_enabled: f.bloom_enabled,
+            bloom_strength: f.bloom_strength,
+            ssao_enabled: f.ssao_enabled,
+            ssao_strength: f.ssao_strength,
+            volumetric_fog_enabled: f.volumetric_fog_enabled,
+            fog_density: f.fog_density,
+            voxel_gi_enabled: f.voxel_gi_enabled,
+            voxel_gi_strength: f.voxel_gi_strength,
+            sun_azimuth_deg: f.sun_azimuth_deg,
+            sun_elevation_deg: f.sun_elevation_deg,
+            sun_intensity: f.sun_intensity,
+            sky_hdr_path: String::new(),
+            tonemap_enabled: f.tonemap_enabled,
+            tonemap_exposure: f.tonemap_exposure,
+            tonemap_temperature: f.tonemap_temperature,
+            tonemap_saturation: f.tonemap_saturation,
+            tonemap_contrast: f.tonemap_contrast,
+            tonemap_vibrance: f.tonemap_vibrance,
+            tonemap_grain: f.tonemap_grain,
+            wind_dir_x: f.wind_dir[0],
+            wind_dir_z: f.wind_dir[2],
+            wind_strength: f.wind_strength,
+            ssr_enabled: f.ssr_enabled,
+            ssr_max_steps: f.ssr_max_steps,
+            ssr_max_distance: f.ssr_max_distance,
+            ssr_thickness: f.ssr_thickness,
+            ssr_intensity: f.ssr_intensity,
+            water_enabled: f.water_enabled,
+            lava_enabled: f.lava_enabled,
+            fire_enabled: f.fire_enabled,
+            // TAA.
+            taa_enabled: f.taa_enabled,
+            taa_blend_factor: f.taa_blend_factor,
+            // Motion blur.
+            motion_blur_enabled: f.motion_blur_enabled,
+            motion_blur_strength: f.motion_blur_strength,
+            // DOF.
+            dof_enabled: f.dof_enabled,
+            dof_focus_distance: f.dof_focus_distance,
+            dof_strength: f.dof_strength,
+            dof_aperture: f.dof_aperture,
+            // God rays.
+            god_rays_enabled: f.god_rays_enabled,
+            god_rays_intensity: f.god_rays_intensity,
+            god_rays_decay: f.god_rays_decay,
+            god_rays_density: f.god_rays_density,
+            god_rays_weight: f.god_rays_weight,
+            god_rays_num_samples: f.god_rays_num_samples,
+        }
+    }
+
+    /// Apply these settings to a live RenderFeatures (settings → renderer sync).
+    pub fn apply_to_features(&self, f: &mut crate::renderer::RenderFeatures) {
+        f.shadows_enabled = self.shadows_enabled;
+        f.pcf_enabled = self.pcf_enabled;
+        f.pcss_enabled = self.pcss_enabled;
+        f.ibl_enabled = self.ibl_enabled;
+        f.probes_enabled = self.probes_enabled;
+        f.volumetric_enabled = self.volumetric_enabled;
+        f.shadow_resolution = self.shadow_resolution;
+        f.pcf_samples = self.pcf_samples;
+        f.culling_enabled = self.culling_enabled;
+        f.culling_distance = self.culling_distance;
+        f.frustum_culling_enabled = self.frustum_culling_enabled;
+        f.bloom_enabled = self.bloom_enabled;
+        f.bloom_strength = self.bloom_strength;
+        f.ssao_enabled = self.ssao_enabled;
+        f.ssao_strength = self.ssao_strength;
+        f.volumetric_fog_enabled = self.volumetric_fog_enabled;
+        f.fog_density = self.fog_density;
+        f.voxel_gi_enabled = self.voxel_gi_enabled;
+        f.voxel_gi_strength = self.voxel_gi_strength;
+        f.sun_azimuth_deg = self.sun_azimuth_deg;
+        f.sun_elevation_deg = self.sun_elevation_deg;
+        f.sun_intensity = self.sun_intensity;
+        // Tone mapping.
+        f.tonemap_enabled = self.tonemap_enabled;
+        f.tonemap_exposure = self.tonemap_exposure;
+        f.tonemap_temperature = self.tonemap_temperature;
+        f.tonemap_saturation = self.tonemap_saturation;
+        f.tonemap_contrast = self.tonemap_contrast;
+        f.tonemap_vibrance = self.tonemap_vibrance;
+        f.tonemap_grain = self.tonemap_grain;
+        // Wind.
+        f.wind_dir = [self.wind_dir_x, 0.0, self.wind_dir_z];
+        f.wind_strength = self.wind_strength;
+        // SSR.
+        f.ssr_enabled = self.ssr_enabled;
+        f.ssr_max_steps = self.ssr_max_steps;
+        f.ssr_max_distance = self.ssr_max_distance;
+        f.ssr_thickness = self.ssr_thickness;
+        f.ssr_intensity = self.ssr_intensity;
+        // Water.
+        f.water_enabled = self.water_enabled;
+        // Lava.
+        f.lava_enabled = self.lava_enabled;
+        // Fire.
+        f.fire_enabled = self.fire_enabled;
+        // TAA.
+        f.taa_enabled = self.taa_enabled;
+        f.taa_blend_factor = self.taa_blend_factor;
+        // Motion blur.
+        f.motion_blur_enabled = self.motion_blur_enabled;
+        f.motion_blur_strength = self.motion_blur_strength;
+        // DOF.
+        f.dof_enabled = self.dof_enabled;
+        f.dof_focus_distance = self.dof_focus_distance;
+        f.dof_strength = self.dof_strength;
+        f.dof_aperture = self.dof_aperture;
+        // God rays.
+        f.god_rays_enabled = self.god_rays_enabled;
+        f.god_rays_intensity = self.god_rays_intensity;
+        f.god_rays_decay = self.god_rays_decay;
+        f.god_rays_density = self.god_rays_density;
+        f.god_rays_weight = self.god_rays_weight;
+        f.god_rays_num_samples = self.god_rays_num_samples;
     }
 }

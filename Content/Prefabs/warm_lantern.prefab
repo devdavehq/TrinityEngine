@@ -1,0 +1,7 @@
+# Point Light Prefab
+# A warm hanging lantern. Place in scenes for ambient lighting.
+
+name     = warm_lantern
+mesh     = meshes/cube.obj
+scale    = 0.2  0.2  0.2
+light    = point 1.0 0.9 0.8 2.0 15.0

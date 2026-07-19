@@ -80,7 +80,7 @@ impl FrameProfiler {
             0.0
         };
 
-        println!(
+        tracing::info!(
             "[Profiler][{}] avg_fps={:.1} frame={:.2}ms script={:.2}ms physics={:.2}ms render={:.2}ms assets={:.2}ms visible={:.1}%",
             if mt_enabled { "MT" } else { "ST" },
             avg_fps,

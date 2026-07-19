@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use crate::components::{
-    BodyType, Collider, CollisionPair, CollisionPhase, FixedJoint, FoliageWind, HingeJoint,
-    OrientedBoxCollider, Position, RigidBody, RopeConstraint, Rotation, SpringJoint,
+    BodyType, CapsuleCollider, CharacterController, Collider, CollisionPair, CollisionPhase,
+    FixedJoint, FoliageWind, HingeJoint, OrientedBoxCollider, Position, Ragdoll, RagdollBone,
+    RigidBody, RopeConstraint, Rotation, SphereCollider, SpringJoint,
 };
 use crate::jobs::JobSystem;
 use crate::settings::RuntimeSettings;
@@ -16,10 +17,12 @@ const SLEEP_TIME_THRESHOLD: f32 = 0.45;
 const POSITION_SLOP: f32 = 0.005;
 const POSITION_PERCENT: f32 = 0.78;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeKind {
     Box3D,
     Obb2D,
+    Sphere,
+    Capsule,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +34,12 @@ struct BodyShape {
     layer: u32,
     mask: u32,
     kind: ShapeKind,
+    /// Radius for Sphere or Capsule shapes.
+    radius: f32,
+    /// Half-height of the cylinder part for Capsule shapes (along Y axis).
+    capsule_half_height: f32,
+    /// If true, this collider generates trigger events but no velocity response.
+    is_trigger: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -226,9 +235,324 @@ fn sat_contact_2d(a: &BodyShape, b: &BodyShape) -> Option<(glam::Vec3, f32)> {
     Some((normal, min_overlap))
 }
 
+// ── Sphere vs Sphere ─────────────────────────────────────────────────────────
+// Two spheres overlap when distance between centers < sum of radii.
+// The contact normal is the direction between centers; penetration = sum_radii - distance.
+fn sphere_vs_sphere(a: &BodyShape, b: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let delta = b.center - a.center;
+    let dist_sq = delta.length_squared();
+    let sum_r = a.radius + b.radius;
+    if dist_sq >= sum_r * sum_r {
+        return None;
+    }
+    let dist = dist_sq.sqrt();
+    let normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+    let penetration = sum_r - dist;
+    Some((normal, penetration))
+}
+
+// ── Sphere vs AABB ───────────────────────────────────────────────────────────
+// Clamp sphere center to AABB surface; distance from clamped point to center
+// is the overlap amount if less than radius.
+fn sphere_vs_aabb(sphere: &BodyShape, aabb: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let closest = glam::vec3(
+        sphere.center.x.clamp(aabb.center.x - aabb.half.x, aabb.center.x + aabb.half.x),
+        sphere.center.y.clamp(aabb.center.y - aabb.half.y, aabb.center.y + aabb.half.y),
+        sphere.center.z.clamp(aabb.center.z - aabb.half.z, aabb.center.z + aabb.half.z),
+    );
+    let delta = sphere.center - closest;
+    let dist_sq = delta.length_squared();
+    if dist_sq >= sphere.radius * sphere.radius {
+        return None;
+    }
+    let dist = dist_sq.sqrt();
+    let normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+    let penetration = sphere.radius - dist;
+    Some((normal, penetration))
+}
+
+// ── Sphere vs OBB ────────────────────────────────────────────────────────────
+// Transform sphere center into OBB local space, clamp to box, then treat as sphere vs AABB.
+fn sphere_vs_obb(sphere: &BodyShape, obb: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let axes = obb_axes_3d(obb);
+    let local = sphere.center - obb.center;
+    let mut closest_local = glam::Vec3::ZERO;
+    for (i, axis) in axes.iter().enumerate() {
+        let half = match i {
+            0 => obb.half.x,
+            1 => obb.half.y,
+            _ => obb.half.z,
+        };
+        let proj = local.dot(*axis).clamp(-half, half);
+        closest_local += *axis * proj;
+    }
+    let closest_world = obb.center + closest_local;
+    let delta = sphere.center - closest_world;
+    let dist_sq = delta.length_squared();
+    if dist_sq >= sphere.radius * sphere.radius {
+        return None;
+    }
+    let dist = dist_sq.sqrt();
+    let normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+    let penetration = sphere.radius - dist;
+    Some((normal, penetration))
+}
+
+// ── Capsule vs Capsule ───────────────────────────────────────────────────────
+// A capsule is a swept sphere along a line segment (center +/- half_height * Y).
+// Find closest points on two line segments, then test as sphere vs sphere.
+fn capsule_vs_capsule(a: &BodyShape, b: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let a_top = a.center + glam::Vec3::Y * a.capsule_half_height;
+    let a_bot = a.center - glam::Vec3::Y * a.capsule_half_height;
+    let b_top = b.center + glam::Vec3::Y * b.capsule_half_height;
+    let b_bot = b.center - glam::Vec3::Y * b.capsule_half_height;
+    let (closest_a, closest_b) = closest_points_on_segments(a_bot, a_top, b_bot, b_top);
+    let delta = closest_b - closest_a;
+    let dist_sq = delta.length_squared();
+    let sum_r = a.radius + b.radius;
+    if dist_sq >= sum_r * sum_r {
+        return None;
+    }
+    let dist = dist_sq.sqrt();
+    let normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+    let penetration = sum_r - dist;
+    Some((normal, penetration))
+}
+
+// ── Capsule vs Sphere ────────────────────────────────────────────────────────
+// Clamp sphere center to capsule segment, then test as sphere vs sphere.
+fn capsule_vs_sphere(capsule: &BodyShape, sphere: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let top = capsule.center + glam::Vec3::Y * capsule.capsule_half_height;
+    let bot = capsule.center - glam::Vec3::Y * capsule.capsule_half_height;
+    let closest = closest_point_on_segment(sphere.center, bot, top);
+    let delta = sphere.center - closest;
+    let dist_sq = delta.length_squared();
+    let sum_r = capsule.radius + sphere.radius;
+    if dist_sq >= sum_r * sum_r {
+        return None;
+    }
+    let dist = dist_sq.sqrt();
+    let normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+    let penetration = sum_r - dist;
+    Some((normal, penetration))
+}
+
+// ── Capsule vs AABB ──────────────────────────────────────────────────────────
+// Test each cap-sphere against the AABB, then test the midline cylinder.
+fn capsule_vs_aabb(capsule: &BodyShape, aabb: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let top = capsule.center + glam::Vec3::Y * capsule.capsule_half_height;
+    let bot = capsule.center - glam::Vec3::Y * capsule.capsule_half_height;
+    let mut min_pen = f32::MAX;
+    let mut best_normal = glam::Vec3::Y;
+    for sphere_center in [bot, top] {
+        let closest = glam::vec3(
+            sphere_center.x.clamp(aabb.center.x - aabb.half.x, aabb.center.x + aabb.half.x),
+            sphere_center.y.clamp(aabb.center.y - aabb.half.y, aabb.center.y + aabb.half.y),
+            sphere_center.z.clamp(aabb.center.z - aabb.half.z, aabb.center.z + aabb.half.z),
+        );
+        let delta = sphere_center - closest;
+        let dist_sq = delta.length_squared();
+        if dist_sq >= capsule.radius * capsule.radius {
+            continue;
+        }
+        let dist = dist_sq.sqrt();
+        let pen = capsule.radius - dist;
+        if pen < min_pen {
+            min_pen = pen;
+            best_normal = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+        }
+    }
+    let center_clamped = glam::vec3(
+        capsule.center.x.clamp(aabb.center.x - aabb.half.x, aabb.center.x + aabb.half.x),
+        capsule.center.y.clamp(aabb.center.y - aabb.half.y, aabb.center.y + aabb.half.y),
+        capsule.center.z.clamp(aabb.center.z - aabb.half.z, aabb.center.z + aabb.half.z),
+    );
+    let delta_mid = capsule.center - center_clamped;
+    let dist_mid_sq = delta_mid.length_squared();
+    if dist_mid_sq < capsule.radius * capsule.radius {
+        let dist_mid = dist_mid_sq.sqrt();
+        let pen_mid = capsule.radius - dist_mid;
+        if pen_mid < min_pen {
+            min_pen = pen_mid;
+            best_normal = if dist_mid > 1e-6 { delta_mid / dist_mid } else { glam::Vec3::Y };
+        }
+    }
+    if min_pen < f32::MAX {
+        Some((best_normal, min_pen))
+    } else {
+        None
+    }
+}
+
+// ── Capsule vs OBB ───────────────────────────────────────────────────────────
+// Transform capsule into OBB local space, test as capsule vs AABB there, then
+// transform the contact normal back to world space.
+fn capsule_vs_obb(capsule: &BodyShape, obb: &BodyShape) -> Option<(glam::Vec3, f32)> {
+    let inv_rot = obb.rotation.inverse();
+    let local_center = inv_rot * (capsule.center - obb.center);
+    let local_top = local_center + glam::Vec3::Y * capsule.capsule_half_height;
+    let local_bot = local_center - glam::Vec3::Y * capsule.capsule_half_height;
+    let aabb_half = obb.half;
+    let mut min_pen = f32::MAX;
+    let mut best_normal_local = glam::Vec3::Y;
+    for sc in [local_bot, local_top] {
+        let closest = glam::vec3(
+            sc.x.clamp(-aabb_half.x, aabb_half.x),
+            sc.y.clamp(-aabb_half.y, aabb_half.y),
+            sc.z.clamp(-aabb_half.z, aabb_half.z),
+        );
+        let delta = sc - closest;
+        let dist_sq = delta.length_squared();
+        if dist_sq >= capsule.radius * capsule.radius {
+            continue;
+        }
+        let dist = dist_sq.sqrt();
+        let pen = capsule.radius - dist;
+        if pen < min_pen {
+            min_pen = pen;
+            best_normal_local = if dist > 1e-6 { delta / dist } else { glam::Vec3::Y };
+        }
+    }
+    let center_clamped = glam::vec3(
+        local_center.x.clamp(-aabb_half.x, aabb_half.x),
+        local_center.y.clamp(-aabb_half.y, aabb_half.y),
+        local_center.z.clamp(-aabb_half.z, aabb_half.z),
+    );
+    let delta_mid = local_center - center_clamped;
+    let dist_mid_sq = delta_mid.length_squared();
+    if dist_mid_sq < capsule.radius * capsule.radius {
+        let dist_mid = dist_mid_sq.sqrt();
+        let pen_mid = capsule.radius - dist_mid;
+        if pen_mid < min_pen {
+            min_pen = pen_mid;
+            best_normal_local = if dist_mid > 1e-6 { delta_mid / dist_mid } else { glam::Vec3::Y };
+        }
+    }
+    if min_pen < f32::MAX {
+        let world_normal = obb.rotation * best_normal_local;
+        Some((world_normal.normalize_or_zero(), min_pen))
+    } else {
+        None
+    }
+}
+
+// ── Segment-segment closest points ───────────────────────────────────────────
+// Returns the closest point on each of two line segments.
+fn closest_points_on_segments(
+    a0: glam::Vec3, a1: glam::Vec3,
+    b0: glam::Vec3, b1: glam::Vec3,
+) -> (glam::Vec3, glam::Vec3) {
+    let d1 = a1 - a0;
+    let d2 = b1 - b0;
+    let r = a0 - b0;
+    let a = d1.dot(d1);
+    let e = d2.dot(d2);
+    let f = d2.dot(r);
+    let mut s = 0.0f32;
+    let mut t = 0.0f32;
+    if a <= 1e-6 && e <= 1e-6 {
+        s = 0.0;
+        t = 0.0;
+    } else if a <= 1e-6 {
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(r);
+        if e <= 1e-6 {
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b_val = d1.dot(d2);
+            let denom = a * e - b_val * b_val;
+            if denom.abs() > 1e-6 {
+                s = ((b_val * f - c * e) / denom).clamp(0.0, 1.0);
+            }
+            t = (b_val * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b_val - c) / a).clamp(0.0, 1.0);
+            }
+        }
+    }
+    (a0 + d1 * s, b0 + d2 * t)
+}
+
+// Closest point on a segment to a given point.
+fn closest_point_on_segment(point: glam::Vec3, seg_a: glam::Vec3, seg_b: glam::Vec3) -> glam::Vec3 {
+    let d = seg_b - seg_a;
+    let len_sq = d.length_squared();
+    if len_sq < 1e-6 {
+        return seg_a;
+    }
+    let t = ((point - seg_a).dot(d) / len_sq).clamp(0.0, 1.0);
+    seg_a + d * t
+}
+
+// ── CCD: Swept sphere vs AABB ────────────────────────────────────────────────
+// Move a sphere along a velocity vector and return the time of impact (0..1)
+// against a stationary AABB. None if no hit within the timestep.
+fn swept_sphere_aabb(
+    sphere_center: glam::Vec3,
+    sphere_radius: f32,
+    velocity: glam::Vec3,
+    aabb_min: glam::Vec3,
+    aabb_max: glam::Vec3,
+) -> Option<f32> {
+    let inv_dir = glam::vec3(
+        if velocity.x.abs() > 1e-8 { 1.0 / velocity.x } else { f32::INFINITY * velocity.x.signum() },
+        if velocity.y.abs() > 1e-8 { 1.0 / velocity.y } else { f32::INFINITY * velocity.y.signum() },
+        if velocity.z.abs() > 1e-8 { 1.0 / velocity.z } else { f32::INFINITY * velocity.z.signum() },
+    );
+    let expanded_min = aabb_min - glam::Vec3::splat(sphere_radius);
+    let expanded_max = aabb_max + glam::Vec3::splat(sphere_radius);
+    let t1 = (expanded_min - sphere_center) * inv_dir;
+    let t2 = (expanded_max - sphere_center) * inv_dir;
+    let t_near = t1.max_element().max(0.0);
+    let t_far = t2.min_element();
+    if t_near <= t_far && t_far >= 0.0 && t_near <= 1.0 {
+        Some(t_near.min(1.0))
+    } else {
+        None
+    }
+}
+
+// ── CCD: Swept sphere vs Sphere ──────────────────────────────────────────────
+// Move a sphere along velocity against a stationary sphere.
+fn swept_sphere_sphere(
+    center_a: glam::Vec3,
+    radius_a: f32,
+    velocity: glam::Vec3,
+    center_b: glam::Vec3,
+    radius_b: f32,
+) -> Option<f32> {
+    let oc = center_a - center_b;
+    let sum_r = radius_a + radius_b;
+    let a = velocity.dot(velocity);
+    let b = 2.0 * oc.dot(velocity);
+    let c = oc.dot(oc) - sum_r * sum_r;
+    if a < 1e-8 {
+        if c < 0.0 {
+            return Some(0.0);
+        }
+        return None;
+    }
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let sqrt_disc = discriminant.sqrt();
+    let t1 = (-b - sqrt_disc) / (2.0 * a);
+    let t2 = (-b + sqrt_disc) / (2.0 * a);
+    let t = if t1 >= 0.0 { t1 } else if t2 >= 0.0 { t2 } else { return None; };
+    if t <= 1.0 { Some(t) } else { None }
+}
+
 fn aabb_bounds(shape: &BodyShape) -> (glam::Vec3, glam::Vec3) {
     match shape.kind {
-        ShapeKind::Box3D => (shape.center - shape.half, shape.center + shape.half),
+        ShapeKind::Box3D | ShapeKind::Sphere | ShapeKind::Capsule => {
+            (shape.center - shape.half, shape.center + shape.half)
+        }
         ShapeKind::Obb2D => {
             let verts = box_vertices_3d(shape);
             let mut min = verts[0];
@@ -270,6 +594,18 @@ fn aabb_contact_3d(a: &BodyShape, b: &BodyShape) -> Option<(glam::Vec3, f32)> {
 fn contact_between(a: &BodyShape, b: &BodyShape, runtime: &RuntimeSettings) -> Option<(glam::Vec3, f32)> {
     match (a.kind, b.kind) {
         (ShapeKind::Box3D, ShapeKind::Box3D) => aabb_contact_3d(a, b),
+        (ShapeKind::Sphere, ShapeKind::Sphere) => sphere_vs_sphere(a, b),
+        (ShapeKind::Sphere, ShapeKind::Box3D) => sphere_vs_aabb(a, b),
+        (ShapeKind::Box3D, ShapeKind::Sphere) => sphere_vs_aabb(b, a).map(|(n, p)| (-n, p)),
+        (ShapeKind::Sphere, ShapeKind::Obb2D) => sphere_vs_obb(a, b),
+        (ShapeKind::Obb2D, ShapeKind::Sphere) => sphere_vs_obb(b, a).map(|(n, p)| (-n, p)),
+        (ShapeKind::Capsule, ShapeKind::Capsule) => capsule_vs_capsule(a, b),
+        (ShapeKind::Capsule, ShapeKind::Sphere) => capsule_vs_sphere(a, b),
+        (ShapeKind::Sphere, ShapeKind::Capsule) => capsule_vs_sphere(b, a).map(|(n, p)| (-n, p)),
+        (ShapeKind::Capsule, ShapeKind::Box3D) => capsule_vs_aabb(a, b),
+        (ShapeKind::Box3D, ShapeKind::Capsule) => capsule_vs_aabb(b, a).map(|(n, p)| (-n, p)),
+        (ShapeKind::Capsule, ShapeKind::Obb2D) => capsule_vs_obb(a, b),
+        (ShapeKind::Obb2D, ShapeKind::Capsule) => capsule_vs_obb(b, a).map(|(n, p)| (-n, p)),
         _ => {
             if runtime.physics_3d_obb_contacts_enabled {
                 sat_contact_3d(a, b).or_else(|| sat_contact_2d(a, b))
@@ -282,6 +618,8 @@ fn contact_between(a: &BodyShape, b: &BodyShape, runtime: &RuntimeSettings) -> O
 
 fn collect_body_infos(world: &World) -> Vec<BodyInfo> {
     let mut bodies = Vec::new();
+    // Track entities already processed so we don't double-count.
+    let mut seen: HashSet<Entity> = HashSet::new();
     for (e, pos, obb) in world.query::<(Entity, &Position, &OrientedBoxCollider)>().iter() {
         let rb = world.get::<&RigidBody>(e).ok();
         let rot = world.get::<&Rotation>(e).ok().map(|r| *r);
@@ -298,6 +636,9 @@ fn collect_body_infos(world: &World) -> Vec<BodyInfo> {
                 layer: obb.layer,
                 mask: obb.mask,
                 kind: ShapeKind::Obb2D,
+                radius: 0.0,
+                capsule_half_height: 0.0,
+                is_trigger: false,
             },
             body_type,
             inv_mass: rb.as_ref().map(|b| inv_mass(b.body_type, b.mass)).unwrap_or(0.0),
@@ -315,9 +656,10 @@ fn collect_body_infos(world: &World) -> Vec<BodyInfo> {
             lock_rotation: rb.as_ref().map(|b| b.lock_rotation).unwrap_or(true),
             sleeping: rb.as_ref().map(|b| b.sleeping).unwrap_or(false),
         });
+        seen.insert(e);
     }
     for (e, pos, col) in world.query::<(Entity, &Position, &Collider)>().iter() {
-        if world.get::<&OrientedBoxCollider>(e).is_ok() {
+        if seen.contains(&e) {
             continue;
         }
         let rb = world.get::<&RigidBody>(e).ok();
@@ -332,6 +674,9 @@ fn collect_body_infos(world: &World) -> Vec<BodyInfo> {
                 layer: col.layer,
                 mask: col.mask,
                 kind: ShapeKind::Box3D,
+                radius: 0.0,
+                capsule_half_height: 0.0,
+                is_trigger: false,
             },
             body_type,
             inv_mass: rb.as_ref().map(|b| inv_mass(b.body_type, b.mass)).unwrap_or(0.0),
@@ -349,6 +694,86 @@ fn collect_body_infos(world: &World) -> Vec<BodyInfo> {
             lock_rotation: rb.as_ref().map(|b| b.lock_rotation).unwrap_or(true),
             sleeping: rb.as_ref().map(|b| b.sleeping).unwrap_or(false),
         });
+        seen.insert(e);
+    }
+    // SphereColliders — sphere primitive.
+    for (e, pos, sph) in world.query::<(Entity, &Position, &SphereCollider)>().iter() {
+        if seen.contains(&e) {
+            continue;
+        }
+        let rb = world.get::<&RigidBody>(e).ok();
+        let body_type = rb.as_ref().map(|b| b.body_type).unwrap_or(BodyType::Static);
+        bodies.push(BodyInfo {
+            entity: e,
+            shape: BodyShape {
+                center: glam::vec3(pos.x, pos.y, pos.z),
+                half: glam::vec3(sph.radius, sph.radius, sph.radius),
+                rotation: glam::Quat::IDENTITY,
+                angle: 0.0,
+                layer: sph.layer,
+                mask: sph.mask,
+                kind: ShapeKind::Sphere,
+                radius: sph.radius.max(0.01),
+                capsule_half_height: 0.0,
+                is_trigger: sph.is_trigger,
+            },
+            body_type,
+            inv_mass: rb.as_ref().map(|b| inv_mass(b.body_type, b.mass)).unwrap_or(0.0),
+            inv_inertia: rb
+                .as_ref()
+                .map(|b| inv_inertia(b.body_type, b.inertia, b.lock_rotation))
+                .unwrap_or(0.0),
+            velocity: rb
+                .as_ref()
+                .map(|b| glam::vec3(b.velocity_x, b.velocity_y, b._velocity_z))
+                .unwrap_or(glam::Vec3::ZERO),
+            angular_velocity: rb.as_ref().map(|b| b.angular_velocity).unwrap_or(0.0),
+            friction: rb.as_ref().map(|b| b.friction).unwrap_or(0.5),
+            restitution: rb.as_ref().map(|b| b.restitution).unwrap_or(0.0),
+            lock_rotation: rb.as_ref().map(|b| b.lock_rotation).unwrap_or(true),
+            sleeping: rb.as_ref().map(|b| b.sleeping).unwrap_or(false),
+        });
+        seen.insert(e);
+    }
+    // CapsuleColliders — cylinder with hemispherical caps along Y axis.
+    for (e, pos, cap) in world.query::<(Entity, &Position, &CapsuleCollider)>().iter() {
+        if seen.contains(&e) {
+            continue;
+        }
+        let rb = world.get::<&RigidBody>(e).ok();
+        let body_type = rb.as_ref().map(|b| b.body_type).unwrap_or(BodyType::Static);
+        let total_hh = cap.half_height + cap.radius;
+        bodies.push(BodyInfo {
+            entity: e,
+            shape: BodyShape {
+                center: glam::vec3(pos.x, pos.y, pos.z),
+                half: glam::vec3(cap.radius, total_hh, cap.radius),
+                rotation: glam::Quat::IDENTITY,
+                angle: 0.0,
+                layer: cap.layer,
+                mask: cap.mask,
+                kind: ShapeKind::Capsule,
+                radius: cap.radius.max(0.01),
+                capsule_half_height: cap.half_height.max(0.0),
+                is_trigger: cap.is_trigger,
+            },
+            body_type,
+            inv_mass: rb.as_ref().map(|b| inv_mass(b.body_type, b.mass)).unwrap_or(0.0),
+            inv_inertia: rb
+                .as_ref()
+                .map(|b| inv_inertia(b.body_type, b.inertia, b.lock_rotation))
+                .unwrap_or(0.0),
+            velocity: rb
+                .as_ref()
+                .map(|b| glam::vec3(b.velocity_x, b.velocity_y, b._velocity_z))
+                .unwrap_or(glam::Vec3::ZERO),
+            angular_velocity: rb.as_ref().map(|b| b.angular_velocity).unwrap_or(0.0),
+            friction: rb.as_ref().map(|b| b.friction).unwrap_or(0.5),
+            restitution: rb.as_ref().map(|b| b.restitution).unwrap_or(0.0),
+            lock_rotation: rb.as_ref().map(|b| b.lock_rotation).unwrap_or(true),
+            sleeping: rb.as_ref().map(|b| b.sleeping).unwrap_or(false),
+        });
+        seen.insert(e);
     }
     bodies
 }
@@ -438,12 +863,30 @@ fn sync_body_info_from_world(world: &World, infos: &mut [BodyInfo]) {
             info.shape.half.x = obb.half_w;
             info.shape.half.y = obb.half_h;
             info.shape.half.z = obb.half_d;
+            info.shape.is_trigger = false;
+        } else if let Ok(sph) = world.get::<&SphereCollider>(info.entity) {
+            info.shape.layer = sph.layer;
+            info.shape.mask = sph.mask;
+            info.shape.kind = ShapeKind::Sphere;
+            info.shape.radius = sph.radius;
+            info.shape.half = glam::Vec3::splat(sph.radius);
+            info.shape.is_trigger = sph.is_trigger;
+        } else if let Ok(cap) = world.get::<&CapsuleCollider>(info.entity) {
+            info.shape.layer = cap.layer;
+            info.shape.mask = cap.mask;
+            info.shape.kind = ShapeKind::Capsule;
+            info.shape.radius = cap.radius;
+            info.shape.capsule_half_height = cap.half_height;
+            let total_hh = cap.half_height + cap.radius;
+            info.shape.half = glam::vec3(cap.radius, total_hh, cap.radius);
+            info.shape.is_trigger = cap.is_trigger;
         } else if let Ok(col) = world.get::<&Collider>(info.entity) {
             info.shape.angle = 0.0;
             info.shape.layer = col.layer;
             info.shape.mask = col.mask;
             info.shape.kind = ShapeKind::Box3D;
             info.shape.half = glam::vec3(col.half_w, col.half_h, col.half_d);
+            info.shape.is_trigger = false;
         }
     }
 }
@@ -789,6 +1232,260 @@ fn collision_events(contacts: &[Contact], settings: &RuntimeSettings) -> Vec<Col
     events
 }
 
+// ── Character Controller ─────────────────────────────────────────────────────
+// Processes CharacterController components: applies gravity (scaled), handles jump,
+// moves the entity based on input velocity, does ground detection via downward sphere
+// cast, slope limiting, step climbing, and depenetration via capsule/sphere shape.
+pub fn character_controller_system(world: &mut World, dt: f32) {
+    // Collect entities with CharacterController + RigidBody + Position so we can
+    // borrow the world mutably per-entity without conflicting borrows.
+    let controllers: Vec<(Entity, f32, f32, f32, bool, f32)> = world
+        .query::<(Entity, &mut CharacterController, &RigidBody, &Position)>()
+        .iter()
+        .map(|(e, cc, rb, pos)| {
+            // Extract what we need — we can't hold borrows across the mutable loop below.
+            let input_vx = rb.velocity_x;
+            let input_vz = rb._velocity_z;
+            let jump = cc.jump_pressed;
+            let speed = cc.speed;
+            (e, input_vx, input_vz, speed, jump, pos.y)
+        })
+        .collect();
+
+    for (e, input_vx, input_vz, speed, _jump, _pos_y) in &controllers {
+        let e = *e;
+        // Read controller params (immutable borrow, short-lived).
+        let (max_slope, _step_h, _skin_w, jump_force, ground_dist, gravity_scale, was_jump) = {
+            if let Ok(cc) = world.get::<&CharacterController>(e) {
+                (cc.max_slope_angle, cc.step_height, cc.skin_width, cc.jump_force,
+                 cc.ground_detect_dist, cc.gravity_scale, cc.jump_pressed)
+            } else {
+                continue;
+            }
+        };
+
+        // Ground detection: cast downward from entity center.
+        let ground_hit = {
+            let pos = world.get::<&Position>(e).ok();
+            let sph = world.get::<&SphereCollider>(e).ok();
+            let cap = world.get::<&CapsuleCollider>(e).ok();
+            let col = world.get::<&Collider>(e).ok();
+            let center = pos.map(|p| glam::vec3(p.x, p.y, p.z)).unwrap_or(glam::Vec3::ZERO);
+            let shape_radius = sph.map(|s| s.radius)
+                .or_else(|| cap.map(|c| c.radius))
+                .unwrap_or_else(|| col.map(|c| c.half_w.max(c.half_d)).unwrap_or(0.3));
+            // Simple ground check: sphere cast downward.
+            cast_downward_for_ground(world, e, center, shape_radius, ground_dist, max_slope)
+        };
+
+        // Update ground state and apply gravity + jump.
+        if let Ok(mut cc) = world.get::<&mut CharacterController>(e) {
+            cc.on_ground = ground_hit;
+            if was_jump && ground_hit {
+                if let Ok(mut rb) = world.get::<&mut RigidBody>(e) {
+                    rb.velocity_y = jump_force;
+                    rb.on_ground = false;
+                    rb.sleeping = false;
+                    rb.sleep_timer = 0.0;
+                }
+            }
+        }
+
+        // Apply gravity (scaled).
+        if let Ok(mut rb) = world.get::<&mut RigidBody>(e) {
+            if rb.use_gravity && !ground_hit {
+                rb.velocity_y -= GRAVITY * gravity_scale * dt;
+                rb.velocity_y = rb.velocity_y.max(-TERMINAL_VELOCITY);
+            } else if ground_hit && rb.velocity_y < 0.0 {
+                rb.velocity_y = 0.0;
+            }
+            // Horizontal movement from input.
+            rb.velocity_x = input_vx * speed;
+            rb._velocity_z = input_vz * speed;
+            rb.sleeping = false;
+            rb.sleep_timer = 0.0;
+        }
+    }
+}
+
+/// Cast a sphere downward from `center` to detect ground within `max_dist`.
+/// Returns true if ground is found with slope angle < `max_slope`.
+fn cast_downward_for_ground(
+    world: &World,
+    self_entity: Entity,
+    center: glam::Vec3,
+    shape_radius: f32,
+    max_dist: f32,
+    _max_slope: f32,
+) -> bool {
+    let cast_dir = glam::Vec3::NEG_Y;
+    let cast_len = max_dist + shape_radius;
+    for (e, pos, obb) in world.query::<(Entity, &Position, &OrientedBoxCollider)>().iter() {
+        if e == self_entity { continue; }
+        let other_center = glam::vec3(pos.x, pos.y, pos.z);
+        let other_half = glam::vec3(obb.half_w, obb.half_h, obb.half_d);
+        let aabb_min = other_center - other_half;
+        let aabb_max = other_center + other_half;
+        if let Some(_t) = swept_sphere_aabb(center, shape_radius, cast_dir * cast_len, aabb_min, aabb_max) {
+            return true;
+        }
+    }
+    for (e, pos, col) in world.query::<(Entity, &Position, &Collider)>().iter() {
+        if e == self_entity { continue; }
+        let other_center = glam::vec3(pos.x, pos.y, pos.z);
+        let other_half = glam::vec3(col.half_w, col.half_h, col.half_d);
+        let aabb_min = other_center - other_half;
+        let aabb_max = other_center + other_half;
+        if let Some(_t) = swept_sphere_aabb(center, shape_radius, cast_dir * cast_len, aabb_min, aabb_max) {
+            return true;
+        }
+    }
+    // Check sphere colliders as ground.
+    for (e, pos, sph) in world.query::<(Entity, &Position, &SphereCollider)>().iter() {
+        if e == self_entity { continue; }
+        let other_center = glam::vec3(pos.x, pos.y, pos.z);
+        if let Some(_t) = swept_sphere_sphere(center, shape_radius, cast_dir * cast_len, other_center, sph.radius) {
+            return true;
+        }
+    }
+    false
+}
+
+// ── Ragdoll System ───────────────────────────────────────────────────────────
+// Drives ragdoll bones with ball-socket joint constraints.
+// Each bone is pulled toward its parent with distance + cone limits.
+pub fn ragdoll_system(world: &mut World, _dt: f32) {
+    let ragdolls: Vec<(Entity, Vec<RagdollBone>)> = world
+        .query::<(Entity, &Ragdoll)>()
+        .iter()
+        .map(|(e, rag)| (e, rag.bones.clone()))
+        .collect();
+
+    for (_root, bones) in &ragdolls {
+        // Solve each bone's joint constraint against its parent.
+        for (_idx, bone) in bones.iter().enumerate() {
+            if bone.parent_index < 0 {
+                continue; // Root bone — no parent constraint.
+            }
+            let parent_idx = bone.parent_index as usize;
+            if parent_idx >= bones.len() {
+                continue;
+            }
+            let parent = &bones[parent_idx];
+
+            // Get world positions of both bones.
+            let parent_pos = world.get::<&Position>(parent.entity).ok()
+                .map(|p| glam::vec3(p.x, p.y, p.z))
+                .unwrap_or(glam::Vec3::ZERO);
+            let bone_pos = world.get::<&Position>(bone.entity).ok()
+                .map(|p| glam::vec3(p.x, p.y, p.z))
+                .unwrap_or(glam::Vec3::ZERO);
+
+            // Desired position: parent center + rotated local offset.
+            let parent_rot = world.get::<&Rotation>(parent.entity).ok()
+                .map(|r| glam::Quat::from_euler(glam::EulerRot::XYZ, r.pitch, r.yaw, r.roll))
+                .unwrap_or(glam::Quat::IDENTITY);
+            let desired_offset = parent_rot * glam::vec3(bone.local_offset[0], bone.local_offset[1], bone.local_offset[2]);
+            let desired_pos = parent_pos + desired_offset;
+
+            // Compute correction vector.
+            let delta = desired_pos - bone_pos;
+            let dist = delta.length();
+            if dist < 1e-4 {
+                continue;
+            }
+
+            // Swing limit: if the bone drifts too far from its parent's reach,
+            // dampen the correction. The swing_limit field controls the maximum
+            // cone angle; we use it to scale the max reach distance.
+            let base_reach = (bone.local_offset[0] * bone.local_offset[0]
+                + bone.local_offset[1] * bone.local_offset[1]
+                + bone.local_offset[2] * bone.local_offset[2]).sqrt();
+            let max_reach = base_reach * (1.0 + bone.swing_limit.clamp(0.0, 1.57));
+            let correction = if dist > max_reach {
+                let dir = delta / dist;
+                dir * (dist - max_reach) * 0.8 // Spring back with damping
+            } else {
+                delta * 0.5 // Soft follow
+            };
+
+            // Apply correction with per-bone damping.
+            let damping = bone.damping.clamp(0.01, 1.0);
+            let final_correction = correction * damping;
+
+            if let Ok(mut pos) = world.get::<&mut Position>(bone.entity) {
+                pos.x += final_correction.x;
+                pos.y += final_correction.y;
+                pos.z += final_correction.z;
+            }
+        }
+    }
+}
+
+/// Check for water trigger collisions. Returns list of splash events.
+pub fn water_trigger_system(world: &mut hecs::World) -> Vec<crate::core::events::WaterSplashEvent> {
+    use crate::components::{Position, SphereCollider, RigidBody, WaterTrigger};
+
+    let mut events = Vec::new();
+
+    // Collect water entities first (immutable borrow).
+    let water_entities: Vec<(hecs::Entity, Position, SphereCollider, WaterTrigger)> = world
+        .query::<(hecs::Entity, &Position, &SphereCollider, &WaterTrigger)>()
+        .iter()
+        .filter(|(_, _, _, wt)| wt.active)
+        .map(|(e, p, c, wt)| (e, *p, *c, *wt))
+        .collect();
+
+    // Check dynamic entities against water triggers.
+    let dynamic_entities: Vec<(hecs::Entity, Position, SphereCollider, RigidBody)> = world
+        .query::<(hecs::Entity, &Position, &SphereCollider, &RigidBody)>()
+        .iter()
+        .map(|(e, p, c, rb)| (e, *p, *c, *rb))
+        .collect();
+
+    for (dyn_entity, dyn_pos, dyn_col, dyn_rb) in &dynamic_entities {
+        // Skip static bodies.
+        if dyn_rb.sleeping { continue; }
+
+        for (water_entity, water_pos, water_col, water_wt) in &water_entities {
+            // Don't self-collide.
+            if dyn_entity == water_entity { continue; }
+
+            // Sphere-sphere overlap test.
+            let dx = dyn_pos.x - water_pos.x;
+            let dy = dyn_pos.y - water_pos.y;
+            let dz = dyn_pos.z - water_pos.z;
+            let dist_sq = dx*dx + dy*dy + dz*dz;
+            let combined_radius = dyn_col.radius + water_col.radius;
+
+            if dist_sq < combined_radius * combined_radius {
+                // Calculate impact velocity (downward speed).
+                let impact_velocity = -dyn_rb.velocity_y;
+
+                // Only splash if entity is moving downward (into water).
+                if impact_velocity > 0.5 {
+                    let water_bits = water_entity.to_bits().get();
+                    let dyn_bits = dyn_entity.to_bits().get();
+
+                    tracing::debug!(
+                        "[Water] Entity {:?} entered water {:?} at velocity {:.1}",
+                        dyn_entity, water_entity, impact_velocity
+                    );
+
+                    events.push(crate::core::events::WaterSplashEvent {
+                        entity_bits: dyn_bits,
+                        water_entity_bits: water_bits,
+                        impact_velocity,
+                        splash_intensity: water_wt.splash_intensity,
+                    });
+                }
+            }
+        }
+    }
+
+    events
+}
+
 pub fn physics_system(
     world: &mut World,
     dt: f32,
@@ -900,7 +1597,11 @@ pub fn physics_system(
             }
             let Some((normal, penetration)) = contact_between(&a.shape, &b.shape, runtime) else { continue; };
             let contact = Contact { a: a.entity, b: b.entity, normal, penetration };
-            resolve_velocity_contact(world, &contact, &infos, runtime);
+            // Trigger colliders generate events but skip velocity/position resolution.
+            let is_trigger_pair = a.shape.is_trigger || b.shape.is_trigger;
+            if !is_trigger_pair {
+                resolve_velocity_contact(world, &contact, &infos, runtime);
+            }
             contacts.push(contact);
         }
         for _ in 0..runtime.physics_constraint_iterations.max(1) {

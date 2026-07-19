@@ -27,11 +27,34 @@ use winit::window::Window;
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SPLASH_LOGO_PATH: &str = "assets/branding/splash_logo.png";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiWidgetKind {
     HealthBar,
     Counter,
     Label,
+    Button,
+    Slider,
+    Toggle,
+    Panel,
+    ProgressRing,
+    Meter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum UiAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl Default for UiAnchor {
+    fn default() -> Self { Self::TopLeft }
 }
 
 #[derive(Clone)]
@@ -41,6 +64,13 @@ struct UiWidgetSpec {
     x: f32,
     y: f32,
     w: f32,
+    h: f32,
+    visible: bool,
+    z_order: i32,
+    color: [f32; 4],
+    bg_color: [f32; 4],
+    font_size: f32,
+    anchor: UiAnchor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,6 +243,9 @@ pub struct UiFrameArgs<'a> {
     pub available_scene_paths: &'a [String],
     pub requested_scene_switch: &'a mut Option<String>,
     pub camera_nav_speed: f32,
+    pub time_of_day: &'a mut crate::environment::time_of_day::TimeOfDay,
+    pub weather: &'a mut crate::environment::weather::WeatherState,
+    pub audio: &'a mut Option<crate::audio::AudioSystem>,
 }
 
 fn nearly_eq(a: f32, b: f32) -> bool {
@@ -438,8 +471,8 @@ impl EditorUi {
             undock_asset_browser: false,
             undock_viewport: false,
             widget_specs: vec![
-                UiWidgetSpec { id: "player_health".to_string(), kind: UiWidgetKind::HealthBar, x: 24.0, y: 24.0, w: 280.0 },
-                UiWidgetSpec { id: "coins".to_string(), kind: UiWidgetKind::Counter, x: 24.0, y: 56.0, w: 180.0 },
+                UiWidgetSpec { id: "player_health".to_string(), kind: UiWidgetKind::HealthBar, x: 24.0, y: 24.0, w: 280.0, h: 24.0, visible: true, z_order: 0, color: [1.0, 1.0, 1.0, 1.0], bg_color: [0.0, 0.0, 0.0, 0.5], font_size: 14.0, anchor: UiAnchor::TopLeft },
+                UiWidgetSpec { id: "coins".to_string(), kind: UiWidgetKind::Counter, x: 24.0, y: 56.0, w: 180.0, h: 24.0, visible: true, z_order: 0, color: [1.0, 1.0, 1.0, 1.0], bg_color: [0.0, 0.0, 0.0, 0.5], font_size: 14.0, anchor: UiAnchor::TopLeft },
             ],
             widget_new_id: "new_widget".to_string(),
             widget_new_kind: UiWidgetKind::Label,
@@ -1731,6 +1764,14 @@ fn build_ui(
                                 save_dock_layout(dock_state, workspace_preset);
                                 ui.close();
                             }
+                            if ui.button("Save Scene").clicked() {
+                                let path = args.scene_path.clone();
+                                match crate::scene::save_scene(&path, args.world) {
+                                    Ok(()) => args.error_log.push(format!("[Scene] Saved {}", path)),
+                                    Err(e) => args.error_log.push(format!("[Scene] Save failed: {}", e)),
+                                }
+                                ui.close();
+                            }
                         });
                     }
                     ui.separator();
@@ -2010,8 +2051,8 @@ fn build_ui(
                             editor_tool_card(ui, "Material Instances", |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     for name in args.materials.instance_names() {
-                                        if ui.button(name).clicked() {
-                                            if let Err(e) = args.materials.apply_instance(name, &mut rend) {
+                                        if ui.button(&name).clicked() {
+                                            if let Err(e) = args.materials.apply_instance(&name, &mut rend) {
                                                 args.error_log.push(format!("[Material] {}", e));
                                             }
                                         }
@@ -2518,7 +2559,7 @@ fn build_ui(
 
         egui::Window::new("Widget Designer")
             .default_pos([108.0, 520.0])
-            .default_size([340.0, 240.0])
+            .default_size([380.0, 420.0])
             .collapsible(true)
             .show(ctx, |ui| {
                 editor_tool_window_header(ui, "Widget Designer", "Author runtime HUD widgets driven by Lua values.");
@@ -2526,10 +2567,19 @@ fn build_ui(
                     ui.label("Id");
                     ui.text_edit_singleline(widget_new_id);
                 });
-                ui.horizontal(|ui| {
-                    ui.selectable_value(widget_new_kind, UiWidgetKind::HealthBar, "Health");
-                    ui.selectable_value(widget_new_kind, UiWidgetKind::Counter, "Counter");
-                    ui.selectable_value(widget_new_kind, UiWidgetKind::Label, "Label");
+                ui.label(RichText::new("Type").small().strong());
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::HealthBar, "Health");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Counter, "Counter");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Label, "Label");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Button, "Button");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Slider, "Slider");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Toggle, "Toggle");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Panel, "Panel");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::ProgressRing, "Ring");
+                        ui.selectable_value(widget_new_kind, UiWidgetKind::Meter, "Meter");
+                    });
                 });
                 if ui.button("Add widget").clicked() && !widget_new_id.trim().is_empty() {
                     widget_specs.push(UiWidgetSpec {
@@ -2538,6 +2588,21 @@ fn build_ui(
                         x: 30.0,
                         y: 90.0 + widget_specs.len() as f32 * 26.0,
                         w: 240.0,
+                        h: match *widget_new_kind {
+                            UiWidgetKind::Panel => 120.0,
+                            UiWidgetKind::Meter => 28.0,
+                            UiWidgetKind::ProgressRing => 64.0,
+                            UiWidgetKind::Button => 32.0,
+                            UiWidgetKind::Slider => 24.0,
+                            UiWidgetKind::Toggle => 24.0,
+                            _ => 24.0,
+                        },
+                        visible: true,
+                        z_order: 0,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        bg_color: [0.0, 0.0, 0.0, 0.5],
+                        font_size: 14.0,
+                        anchor: UiAnchor::TopLeft,
                     });
                 }
                 ui.separator();
@@ -2545,49 +2610,192 @@ fn build_ui(
                 let mut rm: Option<usize> = None;
                 for (i, w) in widget_specs.iter_mut().enumerate() {
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(14, 17, 22))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(33, 39, 49)))
+                        .fill(if w.visible { Color32::from_rgb(14, 17, 22) } else { Color32::from_rgb(8, 10, 14) })
+                        .stroke(egui::Stroke::new(1.0, if w.visible { Color32::from_rgb(33, 39, 49) } else { Color32::from_rgb(20, 22, 28) }))
                         .corner_radius(6.0)
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.monospace(&w.id);
                                 ui.separator();
+                                let vis_resp = ui.selectable_label(w.visible, if w.visible { "V" } else { "-" });
+                                if vis_resp.clicked() { w.visible = !w.visible; }
+                                ui.label(RichText::new(format!("{:?}", w.kind)).small().weak());
+                                if ui.button("x").clicked() { rm = Some(i); }
+                            });
+                            ui.horizontal(|ui| {
                                 ui.add(egui::DragValue::new(&mut w.x).prefix("x ").speed(1.0));
                                 ui.add(egui::DragValue::new(&mut w.y).prefix("y ").speed(1.0));
-                                if ui.button("Remove").clicked() {
-                                    rm = Some(i);
-                                }
+                                ui.add(egui::DragValue::new(&mut w.w).prefix("w ").speed(1.0).range(20.0..=800.0));
+                                ui.add(egui::DragValue::new(&mut w.h).prefix("h ").speed(1.0).range(10.0..=400.0));
                             });
+                            ui.collapsing(RichText::new("Style").small(), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Size:");
+                                    ui.add(egui::DragValue::new(&mut w.font_size).range(8.0..=48.0).suffix("pt"));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Anchor:");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::TopLeft, "TL");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::TopCenter, "TC");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::TopRight, "TR");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::CenterLeft, "CL");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::Center, "C");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::CenterRight, "CR");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::BottomLeft, "BL");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::BottomCenter, "BC");
+                                    ui.selectable_value(&mut w.anchor, UiAnchor::BottomRight, "BR");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Z:");
+                                    ui.add(egui::DragValue::new(&mut w.z_order).range(-10..=10));
+                                });
+                                // Colour editors — show RGB sliders for text and background.
+                                ui.horizontal(|ui| {
+                                    ui.label("Text:");
+                                    ui.add(egui::DragValue::new(&mut w.color[0]).prefix("R ").speed(0.01).range(0.0..=1.0));
+                                    ui.add(egui::DragValue::new(&mut w.color[1]).prefix("G ").speed(0.01).range(0.0..=1.0));
+                                    ui.add(egui::DragValue::new(&mut w.color[2]).prefix("B ").speed(0.01).range(0.0..=1.0));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Bg :");
+                                    ui.add(egui::DragValue::new(&mut w.bg_color[0]).prefix("R ").speed(0.01).range(0.0..=1.0));
+                                    ui.add(egui::DragValue::new(&mut w.bg_color[1]).prefix("G ").speed(0.01).range(0.0..=1.0));
+                                    ui.add(egui::DragValue::new(&mut w.bg_color[2]).prefix("B ").speed(0.01).range(0.0..=1.0));
+                                    ui.add(egui::DragValue::new(&mut w.bg_color[3]).prefix("A ").speed(0.01).range(0.0..=1.0));
+                                });
+                            });
+                            // Drag-and-drop handle — click & drag to reposition.
+                            let resp = ui.interact(ui.max_rect(), egui::Id::new(format!("widget_drag_{}", w.id)), egui::Sense::drag());
+                            if resp.dragged() {
+                                let delta = resp.drag_delta();
+                                w.x += delta.x;
+                                w.y += delta.y;
+                            }
                         });
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                 }
                 if let Some(i) = rm {
                     widget_specs.remove(i);
                 }
                 ui.separator();
-                ui.label("Lua API: set_ui_value(\"player_health\", 0.75), set_ui_text(\"coins\", \"42\")");
+                ui.label(RichText::new("Lua API").small().strong());
+                ui.label("set_ui_value(\"id\", 0.75)  — numeric value");
+                ui.label("set_ui_text(\"id\", \"text\")  — text override");
+                ui.label("set_ui_visible(\"id\", true)  — show/hide");
+                ui.label("get_ui_value(\"id\")  — read back value");
             });
 
         for w in widget_specs.iter() {
+            if !w.visible { continue; }
+            let fg = egui::Color32::from_rgba_premultiplied(
+                (w.color[0] * 255.0) as u8, (w.color[1] * 255.0) as u8,
+                (w.color[2] * 255.0) as u8, (w.color[3] * 255.0) as u8,
+            );
+            let bg = egui::Color32::from_rgba_premultiplied(
+                (w.bg_color[0] * 255.0) as u8, (w.bg_color[1] * 255.0) as u8,
+                (w.bg_color[2] * 255.0) as u8, (w.bg_color[3] * 255.0) as u8,
+            );
+            let text_style = egui::RichText::new("").size(w.font_size).color(fg);
+            // Compute anchored position based on screen size and anchor.
+            let anchor_pos = match w.anchor {
+                UiAnchor::TopLeft      => egui::pos2(w.x, w.y),
+                UiAnchor::TopCenter    => egui::pos2(ctx.screen_rect().width() * 0.5 - w.w * 0.5 + w.x, w.y),
+                UiAnchor::TopRight     => egui::pos2(ctx.screen_rect().width() - w.w - w.x, w.y),
+                UiAnchor::CenterLeft   => egui::pos2(w.x, ctx.screen_rect().height() * 0.5 - w.h * 0.5 + w.y),
+                UiAnchor::Center       => egui::pos2(ctx.screen_rect().width() * 0.5 - w.w * 0.5 + w.x, ctx.screen_rect().height() * 0.5 - w.h * 0.5 + w.y),
+                UiAnchor::CenterRight  => egui::pos2(ctx.screen_rect().width() - w.w - w.x, ctx.screen_rect().height() * 0.5 - w.h * 0.5 + w.y),
+                UiAnchor::BottomLeft   => egui::pos2(w.x, ctx.screen_rect().height() - w.h - w.y),
+                UiAnchor::BottomCenter => egui::pos2(ctx.screen_rect().width() * 0.5 - w.w * 0.5 + w.x, ctx.screen_rect().height() - w.h - w.y),
+                UiAnchor::BottomRight  => egui::pos2(ctx.screen_rect().width() - w.w - w.x, ctx.screen_rect().height() - w.h - w.y),
+            };
             egui::Area::new(format!("hud_widget_{}", w.id).into())
-                .fixed_pos([w.x, w.y])
+                .fixed_pos(anchor_pos)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| match w.kind {
                     UiWidgetKind::HealthBar => {
                         let v = args.scripts.ui_value(&w.id).clamp(0.0, 1.0);
-                        ui.add(egui::ProgressBar::new(v).desired_width(w.w).text(format!("{}: {:.0}%", w.id, v * 100.0)));
+                        let bar = egui::ProgressBar::new(v).desired_width(w.w).text(format!("{}: {:.0}%", w.id, v * 100.0));
+                        ui.add(bar);
                     }
                     UiWidgetKind::Counter => {
-                        let txt = args
-                            .scripts
-                            .ui_text(&w.id)
+                        let txt = args.scripts.ui_text(&w.id)
                             .unwrap_or_else(|| format!("{:.0}", args.scripts.ui_value(&w.id)));
-                        ui.label(RichText::new(format!("{}: {}", w.id, txt)).strong());
+                        ui.label(RichText::new(format!("{}: {}", w.id, txt)).size(w.font_size).color(fg).strong());
                     }
                     UiWidgetKind::Label => {
                         let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
-                        ui.label(txt);
+                        ui.label(RichText::new(txt).size(w.font_size).color(fg));
+                    }
+                    UiWidgetKind::Button => {
+                        let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                        let resp = ui.add(egui::Button::new(RichText::new(txt).size(w.font_size).color(fg)).min_size(egui::vec2(w.w, w.h)));
+                        if resp.clicked() {
+                            // Fire Lua callback: on_ui_click("widget_id")
+                            let _ = args.scripts.lua_create().globals().set("ui_click_event", w.id.clone());
+                        }
+                    }
+UiWidgetKind::Slider => {
+                            let mut val = args.scripts.ui_value(&w.id);
+                            let label = format!("{}: {:.2}", w.id, val);
+                            let resp = ui.add(egui::Slider::new(&mut val, 0.0..=1.0).text(label));
+                            if resp.changed() {
+                                args.scripts.set_ui_value(&w.id, val);
+                            }
+                        }
+                    UiWidgetKind::Toggle => {
+                        let mut val = args.scripts.ui_value(&w.id) > 0.5;
+                        let resp = ui.checkbox(&mut val, format!("{}", w.id));
+                        if resp.changed() {
+                            args.scripts.set_ui_value(&w.id, if val { 1.0 } else { 0.0 });
+                        }
+                    }
+                    UiWidgetKind::Panel => {
+                        egui::Frame::new()
+                            .fill(bg)
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_min_width(w.w - 24.0);
+                                ui.set_min_height(w.h - 24.0);
+                                let title = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                                ui.label(RichText::new(title).size(w.font_size).color(fg).strong());
+                            });
+                    }
+                    UiWidgetKind::ProgressRing => {
+                        let v = args.scripts.ui_value(&w.id).clamp(0.0, 1.0);
+                        let radius = w.h * 0.5;
+                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(w.w, w.h), egui::Sense::hover());
+                        let painter = ui.painter();
+                        let center = rect.center();
+                        // Background ring
+                        painter.circle_stroke(center, radius, egui::Stroke::new(4.0, bg));
+                        // Foreground arc
+                        let start_angle = -std::f32::consts::FRAC_PI_2; // 12 o'clock
+                        let sweep = v * std::f32::consts::TAU;
+                        let rect_ring = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0));
+                        let arc_points: Vec<egui::Pos2> = (0..=64)
+                            .map(|i| {
+                                let a = start_angle + sweep * (i as f32 / 64.0);
+                                egui::pos2(center.x + a.cos() * radius, center.y + a.sin() * radius)
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(arc_points, egui::Stroke::new(4.0, fg)));
+                        painter.text(center, egui::Align2::CENTER_CENTER, format!("{:.0}%", v * 100.0), egui::FontId::proportional(w.font_size), fg);
+                    }
+                    UiWidgetKind::Meter => {
+                        let segments = 10;
+                        let v = args.scripts.ui_value(&w.id).clamp(0.0, 1.0);
+                        let filled = (v * segments as f32).round() as u32;
+                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(w.w, w.h), egui::Sense::hover());
+                        let painter = ui.painter();
+                        let seg_w = (w.w - (segments as f32 - 1.0) * 2.0) / segments as f32;
+                        for s in 0..segments {
+                            let x = rect.left() + s as f32 * (seg_w + 2.0);
+                            let seg_rect = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, w.h));
+                            let fill = if s < filled { fg } else { bg };
+                            painter.rect_filled(seg_rect, 2.0, fill);
+                        }
                     }
                 });
         }
@@ -2978,6 +3186,12 @@ fn build_ui(
                     ui.selectable_value(widget_new_kind, UiWidgetKind::HealthBar, "Health");
                     ui.selectable_value(widget_new_kind, UiWidgetKind::Counter, "Counter");
                     ui.selectable_value(widget_new_kind, UiWidgetKind::Label, "Label");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::Button, "Button");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::Slider, "Slider");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::Toggle, "Toggle");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::Panel, "Panel");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::ProgressRing, "Ring");
+                    ui.selectable_value(widget_new_kind, UiWidgetKind::Meter, "Meter");
                 });
                 if ui.button("Add widget").clicked() && !widget_new_id.trim().is_empty() {
                     widget_specs.push(UiWidgetSpec {
@@ -2986,6 +3200,21 @@ fn build_ui(
                         x: 30.0,
                         y: 90.0 + widget_specs.len() as f32 * 26.0,
                         w: 240.0,
+                        h: match *widget_new_kind {
+                            UiWidgetKind::Panel => 120.0,
+                            UiWidgetKind::Meter => 28.0,
+                            UiWidgetKind::ProgressRing => 64.0,
+                            UiWidgetKind::Button => 32.0,
+                            UiWidgetKind::Slider => 24.0,
+                            UiWidgetKind::Toggle => 24.0,
+                            _ => 24.0,
+                        },
+                        visible: true,
+                        z_order: 0,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        bg_color: [0.0, 0.0, 0.0, 0.5],
+                        font_size: 14.0,
+                        anchor: UiAnchor::TopLeft,
                     });
                 }
                 ui.separator();
@@ -2993,7 +3222,9 @@ fn build_ui(
                 for (i, w) in widget_specs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.monospace(&w.id);
-                        if ui.button("✕").clicked() {
+                        let vis_resp = ui.selectable_label(w.visible, if w.visible { "V" } else { "-" });
+                        if vis_resp.clicked() { w.visible = !w.visible; }
+                        if ui.button("x").clicked() {
                             rm = Some(i);
                         }
                     });
@@ -3003,6 +3234,11 @@ fn build_ui(
                 }
             });
         for w in widget_specs.iter() {
+            if !w.visible { continue; }
+            let fg = egui::Color32::from_rgba_premultiplied(
+                (w.color[0] * 255.0) as u8, (w.color[1] * 255.0) as u8,
+                (w.color[2] * 255.0) as u8, (w.color[3] * 255.0) as u8,
+            );
             egui::Area::new(format!("hud_widget_{}", w.id).into())
                 .fixed_pos([w.x, w.y])
                 .order(egui::Order::Foreground)
@@ -3020,11 +3256,41 @@ fn build_ui(
                             let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| {
                                 format!("{:.0}", args.scripts.ui_value(&w.id))
                             });
-                            ui.label(RichText::new(format!("{}: {}", w.id, txt)).strong());
+                            ui.label(RichText::new(format!("{}: {}", w.id, txt)).size(w.font_size).color(fg).strong());
                         }
                         UiWidgetKind::Label => {
                             let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
-                            ui.label(txt);
+                            ui.label(RichText::new(txt).size(w.font_size).color(fg));
+                        }
+                        UiWidgetKind::Button => {
+                            let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                            ui.add(egui::Button::new(RichText::new(txt).size(w.font_size).color(fg)).min_size(egui::vec2(w.w, w.h)));
+                        }
+                        UiWidgetKind::Slider => {
+                            let mut val = args.scripts.ui_value(&w.id);
+                            let label = format!("{}: {:.2}", w.id, val);
+                            ui.add(egui::Slider::new(&mut val, 0.0..=1.0).text(label));
+                        }
+                        UiWidgetKind::Toggle => {
+                            let mut val = args.scripts.ui_value(&w.id) > 0.5;
+                            ui.checkbox(&mut val, format!("{}", w.id));
+                        }
+                        UiWidgetKind::Panel => {
+                            let bg = egui::Color32::from_rgba_premultiplied(
+                                (w.bg_color[0] * 255.0) as u8, (w.bg_color[1] * 255.0) as u8,
+                                (w.bg_color[2] * 255.0) as u8, (w.bg_color[3] * 255.0) as u8,
+                            );
+                            egui::Frame::new().fill(bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                                let title = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                                ui.label(RichText::new(title).size(w.font_size).color(fg).strong());
+                            });
+                        }
+                        UiWidgetKind::ProgressRing => {
+                            let v = args.scripts.ui_value(&w.id).clamp(0.0, 1.0);
+                            ui.label(RichText::new(format!("{}: {:.0}%", w.id, v * 100.0)).size(w.font_size).color(fg));
+                        }
+                        UiWidgetKind::Meter => {
+                            ui.label(RichText::new(format!("{}: {:.0}%", w.id, args.scripts.ui_value(&w.id) * 100.0)).size(w.font_size).color(fg));
                         }
                     }
                 });
@@ -3146,31 +3412,125 @@ fn build_ui(
             ui.add(egui::Slider::new(&mut args.renderer.features.ssao_strength, 0.0..=1.0).text("SSAO"));
             ui.add(egui::Slider::new(&mut args.renderer.features.fog_density, 0.0..=0.20).text("Fog density"));
             ui.separator();
-            ui.label("Sun Direction (real-time day cycle)");
-            ui.add(egui::Slider::new(&mut args.renderer.features.sun_azimuth_deg, 0.0..=360.0).text("Sun azimuth"));
-            ui.add(egui::Slider::new(&mut args.renderer.features.sun_elevation_deg, -5.0..=89.0).text("Sun elevation"));
-            ui.add(egui::Slider::new(&mut args.renderer.features.sun_intensity, 0.1..=2.0).text("Sun intensity"));
+            // ── Tone Mapping + Colour Grading ──────────────────────────────
             ui.horizontal(|ui| {
-                if ui.button("Morning").clicked() {
-                    args.renderer.features.sun_azimuth_deg = 55.0;
-                    args.renderer.features.sun_elevation_deg = 22.0;
-                    args.renderer.features.sun_intensity = 0.85;
+                ui.label("Tone Mapping");
+                ui.checkbox(&mut args.renderer.features.tonemap_enabled, "");
+            });
+            if args.renderer.features.tonemap_enabled {
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_exposure, -2.0..=2.0).text("Exposure"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_temperature, -1.0..=1.0).text("Temperature"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_saturation, -1.0..=1.0).text("Saturation"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_contrast, -1.0..=1.0).text("Contrast"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_vibrance, -1.0..=1.0).text("Vibrance"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_grain, 0.0..=0.1).text("Film Grain"));
+            }
+            ui.separator();
+            // ── Wind ───────────────────────────────────────────────────────
+            ui.label("Wind");
+            ui.add(egui::Slider::new(&mut args.renderer.features.wind_strength, 0.0..=1.0).text("Strength"));
+            ui.horizontal(|ui| {
+                ui.label("Dir X:");
+                ui.add(egui::Slider::new(&mut args.renderer.features.wind_dir[0], -1.0..=1.0).step_by(0.01));
+                ui.label("Dir Z:");
+                ui.add(egui::Slider::new(&mut args.renderer.features.wind_dir[2], -1.0..=1.0).step_by(0.01));
+            });
+            ui.separator();
+            // ── Screen-Space Reflections ────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label("Screen-Space Reflections");
+                ui.checkbox(&mut args.renderer.features.ssr_enabled, "");
+            });
+            if args.renderer.features.ssr_enabled {
+                ui.add(egui::Slider::new(&mut args.renderer.features.ssr_max_steps, 16..=128).text("Max Steps"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.ssr_max_distance, 5.0..=100.0).text("Max Distance"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.ssr_thickness, 0.01..=0.2).text("Thickness"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.ssr_intensity, 0.0..=2.0).text("Intensity"));
+            }
+            ui.separator();
+            // ── Water Rendering ─────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label("Water Surfaces");
+                ui.checkbox(&mut args.renderer.features.water_enabled, "");
+            });
+            ui.separator();
+            // ── Lava Rendering ──────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label("Lava Surfaces");
+                ui.checkbox(&mut args.renderer.features.lava_enabled, "");
+            });
+            ui.separator();
+            ui.label("Sun Direction (real-time day cycle)");
+            ui.horizontal(|ui| {
+                ui.label("Hour:");
+                ui.add(egui::Slider::new(&mut args.time_of_day.hour, 0.0..=24.0).step_by(0.1));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Speed:");
+                let speed_label = if args.time_of_day.paused {
+                    "PAUSED"
+                } else {
+                    "running"
+                };
+                if ui.button(speed_label).clicked() {
+                    args.time_of_day.paused = !args.time_of_day.paused;
                 }
-                if ui.button("Noon").clicked() {
-                    args.renderer.features.sun_azimuth_deg = 130.0;
-                    args.renderer.features.sun_elevation_deg = 72.0;
-                    args.renderer.features.sun_intensity = 1.2;
-                }
-                if ui.button("Evening").clicked() {
-                    args.renderer.features.sun_azimuth_deg = 300.0;
-                    args.renderer.features.sun_elevation_deg = 15.0;
-                    args.renderer.features.sun_intensity = 0.8;
-                }
-                if ui.button("Night").clicked() {
-                    args.renderer.features.sun_elevation_deg = -4.0;
-                    args.renderer.features.sun_intensity = 0.2;
+                ui.add(egui::Slider::new(&mut args.time_of_day.speed, 0.0..=2.0)
+                    .text("game-hrs/sec"));
+            });
+            let daylight = args.time_of_day.daylight_factor();
+            ui.label(format!("Daylight: {:.0}%", daylight * 100.0));
+            ui.separator();
+            ui.label("Weather");
+            let conditions = [
+                ("Clear", crate::environment::weather::WeatherCondition::Clear),
+                ("Cloudy", crate::environment::weather::WeatherCondition::Cloudy),
+                ("Overcast", crate::environment::weather::WeatherCondition::Overcast),
+                ("Light Rain", crate::environment::weather::WeatherCondition::LightRain),
+                ("Heavy Rain", crate::environment::weather::WeatherCondition::HeavyRain),
+                ("Snow", crate::environment::weather::WeatherCondition::Snow),
+                ("Fog", crate::environment::weather::WeatherCondition::Fog),
+                ("Storm", crate::environment::weather::WeatherCondition::Storm),
+            ];
+            ui.horizontal(|ui| {
+                for (label, condition) in &conditions {
+                    if ui.selectable_label(args.weather.condition == *condition, *label).clicked() {
+                        args.weather.condition = *condition;
+                        args.weather.intensity = 0.8;
+                    }
                 }
             });
+            ui.add(egui::Slider::new(&mut args.weather.intensity, 0.0..=1.0).text("Intensity"));
+            ui.add(egui::Slider::new(&mut args.weather.cloud_coverage, 0.0..=1.0).text("Clouds"));
+            ui.add(egui::Slider::new(&mut args.weather.wind_strength, 0.0..=20.0).text("Wind"));
+            ui.separator();
+            // ── Audio Controls ──────────────────────────────────────────────
+            ui.label("Audio");
+            if let Some(audio) = args.audio.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Master");
+                    ui.add(egui::Slider::new(&mut audio.volume.master, 0.0..=1.0).text(""));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Music  ");
+                    ui.add(egui::Slider::new(&mut audio.volume.music, 0.0..=1.0).text(""));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("SFX    ");
+                    ui.add(egui::Slider::new(&mut audio.volume.sfx, 0.0..=1.0).text(""));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Ambient");
+                    ui.add(egui::Slider::new(&mut audio.volume.ambient, 0.0..=1.0).text(""));
+                });
+                ui.label(format!("Active sounds: {}", audio.active_count()));
+                ui.label(format!("Music playing: {}", audio.is_music_playing()));
+                if ui.button("Stop All").clicked() {
+                    audio.stop_all();
+                }
+            } else {
+                ui.label("(Audio device not available)");
+            }
             ui.separator();
             ui.label("Movable Point Light");
             if let Some(entity) = args.selected_renderable.as_ref().copied() {
@@ -3180,14 +3540,20 @@ fn build_ui(
                     ui.add(egui::Slider::new(&mut p.color[2], 0.0..=2.0).text("B"));
                     ui.add(egui::Slider::new(&mut p.intensity, 0.0..=4.0).text("Intensity"));
                     ui.add(egui::Slider::new(&mut p.range, 0.5..=60.0).text("Range"));
+                    ui.horizontal(|ui| {
+                        ui.label("Type:");
+                        ui.selectable_value(&mut p.light_type, 0.0, "Sun");
+                        ui.selectable_value(&mut p.light_type, 1.0, "Point");
+                        ui.selectable_value(&mut p.light_type, 2.0, "Spot");
+                    });
+                    if p.light_type == 2.0 {
+                        ui.add(egui::Slider::new(&mut p.spot_angle, 5.0..=170.0).text("Cone Angle"));
+                    }
+                    ui.checkbox(&mut p.shadow_casting, "Shadow Casting");
                 } else if ui.button("Add Point Light To Selected").clicked() {
                     let _ = args.world.insert(
                         entity,
-                        (components::PointLight {
-                            color: [1.0, 0.95, 0.85],
-                            intensity: 1.5,
-                            range: 12.0,
-                        },),
+                        (components::PointLight::default(),),
                     );
                 }
             }
@@ -3198,6 +3564,7 @@ fn build_ui(
                         color: [1.0, 0.92, 0.82],
                         intensity: 1.8,
                         range: 14.0,
+                        ..Default::default()
                     },
                 ));
                 *args.selected_renderable = Some(e);
@@ -3215,6 +3582,29 @@ fn build_ui(
                     components::Position { x: 0.0, y: 0.5, z: 0.0 },
                     components::PlayerStart,
                 ));
+            }
+        });
+        ui.collapsing("Water Effects", |ui| {
+            if let Some(entity) = args.selected_renderable.as_ref().copied() {
+                if let Ok(mut wt) = args.world.get::<&mut components::WaterTrigger>(entity) {
+                    ui.label("WaterTrigger");
+                    ui.add(egui::Slider::new(&mut wt.splash_intensity, 0.0..=2.0).text("Splash Intensity"));
+                    ui.checkbox(&mut wt.active, "Active");
+                } else if ui.button("Add WaterTrigger").clicked() {
+                    let _ = args.world.insert(entity, (components::WaterTrigger::default(),));
+                }
+                ui.separator();
+                if let Ok(mut se) = args.world.get::<&mut components::SplashEffect>(entity) {
+                    ui.label("SplashEffect");
+                    ui.add(egui::Slider::new(&mut se.max_splashes, 1..=32).text("Max Splashes"));
+                    ui.add(egui::Slider::new(&mut se.splash_duration, 0.1..=5.0).text("Duration (s)"));
+                    ui.add(egui::Slider::new(&mut se.ripple_scale, 0.1..=5.0).text("Ripple Scale"));
+                    ui.checkbox(&mut se.active, "Active");
+                } else if ui.button("Add SplashEffect").clicked() {
+                    let _ = args.world.insert(entity, (components::SplashEffect::default(),));
+                }
+            } else {
+                ui.label("Select an entity to configure water effects.");
             }
         });
         ui.collapsing("Terrain Auto Material", |ui| {
@@ -3708,9 +4098,15 @@ fn build_ui(
                 ui.text_edit_singleline(widget_new_id);
             });
             ui.horizontal(|ui| {
-                ui.selectable_value(widget_new_kind, UiWidgetKind::HealthBar, "Health Bar");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::HealthBar, "Health");
                 ui.selectable_value(widget_new_kind, UiWidgetKind::Counter, "Counter");
                 ui.selectable_value(widget_new_kind, UiWidgetKind::Label, "Label");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::Button, "Button");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::Slider, "Slider");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::Toggle, "Toggle");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::Panel, "Panel");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::ProgressRing, "Ring");
+                ui.selectable_value(widget_new_kind, UiWidgetKind::Meter, "Meter");
             });
             if ui.button("Add Widget").clicked() {
                 if !widget_new_id.trim().is_empty() {
@@ -3720,6 +4116,19 @@ fn build_ui(
                         x: 30.0,
                         y: 90.0 + widget_specs.len() as f32 * 26.0,
                         w: 240.0,
+                        h: match *widget_new_kind {
+                            UiWidgetKind::Panel => 120.0,
+                            UiWidgetKind::Meter => 28.0,
+                            UiWidgetKind::ProgressRing => 64.0,
+                            UiWidgetKind::Button => 32.0,
+                            _ => 24.0,
+                        },
+                        visible: true,
+                        z_order: 0,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        bg_color: [0.0, 0.0, 0.0, 0.5],
+                        font_size: 14.0,
+                        anchor: UiAnchor::TopLeft,
                     });
                 }
             }
@@ -3739,10 +4148,15 @@ fn build_ui(
                 widget_specs.remove(i);
             }
             ui.separator();
-            ui.label("Lua API: set_ui_value(\"player_health\", 0.75), set_ui_text(\"coins\", \"42\")");
+            ui.label("Lua API: set_ui_value, set_ui_text, set_ui_visible, get_ui_value");
         });
 
     for w in widget_specs.iter() {
+        if !w.visible { continue; }
+        let fg = egui::Color32::from_rgba_premultiplied(
+            (w.color[0] * 255.0) as u8, (w.color[1] * 255.0) as u8,
+            (w.color[2] * 255.0) as u8, (w.color[3] * 255.0) as u8,
+        );
         egui::Area::new(format!("hud_widget_{}", w.id).into())
             .fixed_pos([w.x, w.y])
             .order(egui::Order::Foreground)
@@ -3753,14 +4167,42 @@ fn build_ui(
                         ui.add(egui::ProgressBar::new(v).desired_width(w.w).text(format!("{}: {:.0}%", w.id, v * 100.0)));
                     }
                     UiWidgetKind::Counter => {
-                        let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| {
-                            format!("{:.0}", args.scripts.ui_value(&w.id))
-                        });
-                        ui.label(RichText::new(format!("{}: {}", w.id, txt)).strong());
+                        let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| format!("{:.0}", args.scripts.ui_value(&w.id)));
+                        ui.label(RichText::new(format!("{}: {}", w.id, txt)).size(w.font_size).color(fg).strong());
                     }
                     UiWidgetKind::Label => {
                         let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
-                        ui.label(txt);
+                        ui.label(RichText::new(txt).size(w.font_size).color(fg));
+                    }
+                    UiWidgetKind::Button => {
+                        let txt = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                        ui.add(egui::Button::new(RichText::new(txt).size(w.font_size).color(fg)).min_size(egui::vec2(w.w, w.h)));
+                    }
+                    UiWidgetKind::Slider => {
+                        let mut val = args.scripts.ui_value(&w.id);
+                        let label = format!("{}: {:.2}", w.id, val);
+                        ui.add(egui::Slider::new(&mut val, 0.0..=1.0).text(label));
+                    }
+                    UiWidgetKind::Toggle => {
+                        let mut val = args.scripts.ui_value(&w.id) > 0.5;
+                        ui.checkbox(&mut val, format!("{}", w.id));
+                    }
+                    UiWidgetKind::Panel => {
+                        let bg = egui::Color32::from_rgba_premultiplied(
+                            (w.bg_color[0] * 255.0) as u8, (w.bg_color[1] * 255.0) as u8,
+                            (w.bg_color[2] * 255.0) as u8, (w.bg_color[3] * 255.0) as u8,
+                        );
+                        egui::Frame::new().fill(bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                            let title = args.scripts.ui_text(&w.id).unwrap_or_else(|| w.id.clone());
+                            ui.label(RichText::new(title).size(w.font_size).color(fg).strong());
+                        });
+                    }
+                    UiWidgetKind::ProgressRing => {
+                        let v = args.scripts.ui_value(&w.id).clamp(0.0, 1.0);
+                        ui.label(RichText::new(format!("{}: {:.0}%", w.id, v * 100.0)).size(w.font_size).color(fg));
+                    }
+                    UiWidgetKind::Meter => {
+                        ui.label(RichText::new(format!("{}: {:.0}%", w.id, args.scripts.ui_value(&w.id) * 100.0)).size(w.font_size).color(fg));
                     }
                 }
             });

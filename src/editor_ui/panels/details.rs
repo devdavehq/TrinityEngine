@@ -120,12 +120,12 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         if ui.small_button("Expand All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "lava_surf", "weather", "wind", "point_light", "water_trig", "splash", "script"] {
                 set_section_open(ui, k, true);
             }
         }
         if ui.small_button("Collapse All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "lava_surf", "weather", "wind", "point_light", "water_trig", "splash", "script"] {
                 set_section_open(ui, k, false);
             }
         }
@@ -516,8 +516,8 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.label(RichText::new("Quick instances").small().strong());
             ui.horizontal_wrapped(|ui| {
                 for name in args.materials.instance_names() {
-                    if ui.button(name).clicked() {
-                        if let Err(e) = args.materials.apply_instance(name, &mut rend) {
+                    if ui.button(&name).clicked() {
+                        if let Err(e) = args.materials.apply_instance(&name, &mut rend) {
                             args.error_log.push(format!("[Material] {}", e));
                         }
                     }
@@ -619,5 +619,422 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             egui::Slider::new(&mut args.terrain.material.height_rock_start, 0.0..=6.0)
                 .text("Rock from height"),
         );
+    });
+
+    // ── Rotation ─────────────────────────────────────────────────────
+    section_shell(ui, "rot", "Rotation", "rotation", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_rot = false;
+        if let Ok(mut rot) = args.world.get::<&mut components::Rotation>(entity) {
+            let mut deg_pitch = rot.pitch.to_degrees();
+            let mut deg_yaw = rot.yaw.to_degrees();
+            let mut deg_roll = rot.roll.to_degrees();
+            ui.add(egui::DragValue::new(&mut deg_pitch).prefix("Pitch ").suffix("°").speed(0.5).range(-360.0..=360.0));
+            ui.add(egui::DragValue::new(&mut deg_yaw).prefix("Yaw ").suffix("°").speed(0.5).range(-360.0..=360.0));
+            ui.add(egui::DragValue::new(&mut deg_roll).prefix("Roll ").suffix("°").speed(0.5).range(-360.0..=360.0));
+            rot.pitch = deg_pitch.to_radians();
+            rot.yaw = deg_yaw.to_radians();
+            rot.roll = deg_roll.to_radians();
+            if ui.button("Reset rotation").clicked() {
+                rot.pitch = 0.0;
+                rot.yaw = 0.0;
+                rot.roll = 0.0;
+            }
+            if ui.button("Remove rotation").clicked() {
+                remove_rot = true;
+            }
+        } else if ui.button("Add rotation").clicked() {
+            let _ = args.world.insert(entity, (components::Rotation::default(),));
+        }
+        if remove_rot {
+            let _ = args.world.remove_one::<components::Rotation>(entity);
+        }
+    });
+
+    // ── Sphere Collider ─────────────────────────────────────────────
+    section_shell(ui, "sph", "Sphere Collider", "sphere_col", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_col = false;
+        if let Ok(mut col) = args.world.get::<&mut components::SphereCollider>(entity) {
+            ui.add(egui::DragValue::new(&mut col.radius).prefix("Radius ").speed(0.02).range(0.01..=256.0));
+            ui.add(egui::DragValue::new(&mut col.layer).prefix("Layer ").speed(1.0).range(1..=u32::MAX));
+            ui.add(egui::DragValue::new(&mut col.mask).prefix("Mask ").speed(1.0).range(1..=u32::MAX));
+            ui.checkbox(&mut col.is_trigger, "Is trigger");
+            if ui.button("Remove sphere collider").clicked() {
+                remove_col = true;
+            }
+        } else if ui.button("Add sphere collider").clicked() {
+            let _ = args.world.insert(entity, (components::SphereCollider::default(),));
+        }
+        if remove_col {
+            let _ = args.world.remove_one::<components::SphereCollider>(entity);
+        }
+    });
+
+    // ── Capsule Collider ────────────────────────────────────────────
+    section_shell(ui, "cap", "Capsule Collider", "capsule_col", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_col = false;
+        if let Ok(mut col) = args.world.get::<&mut components::CapsuleCollider>(entity) {
+            ui.add(egui::DragValue::new(&mut col.radius).prefix("Radius ").speed(0.02).range(0.01..=256.0));
+            ui.add(egui::DragValue::new(&mut col.half_height).prefix("Half height ").speed(0.02).range(0.0..=256.0));
+            ui.add(egui::DragValue::new(&mut col.layer).prefix("Layer ").speed(1.0).range(1..=u32::MAX));
+            ui.add(egui::DragValue::new(&mut col.mask).prefix("Mask ").speed(1.0).range(1..=u32::MAX));
+            ui.checkbox(&mut col.is_trigger, "Is trigger");
+            if ui.button("Remove capsule collider").clicked() {
+                remove_col = true;
+            }
+        } else if ui.button("Add capsule collider").clicked() {
+            let _ = args.world.insert(entity, (components::CapsuleCollider::default(),));
+        }
+        if remove_col {
+            let _ = args.world.remove_one::<components::CapsuleCollider>(entity);
+        }
+    });
+
+    // ── Character Controller ────────────────────────────────────────
+    section_shell(ui, "cc", "Character Controller", "char_ctrl", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_cc = false;
+        if let Ok(mut cc) = args.world.get::<&mut components::CharacterController>(entity) {
+            ui.add(egui::Slider::new(&mut cc.speed, 0.0..=30.0).text("Speed"));
+            ui.add(egui::Slider::new(&mut cc.jump_force, 0.0..=30.0).text("Jump force"));
+            ui.add(egui::Slider::new(&mut cc.ground_detect_dist, 0.01..=2.0).text("Ground detect dist"));
+            ui.add(egui::Slider::new(&mut cc.max_slope_angle, 0.0..=1.5708).text("Max slope angle (rad)"));
+            ui.add(egui::Slider::new(&mut cc.step_height, 0.0..=1.0).text("Step height"));
+            ui.add(egui::Slider::new(&mut cc.skin_width, 0.001..=0.1).text("Skin width"));
+            ui.add(egui::Slider::new(&mut cc.gravity_scale, 0.0..=3.0).text("Gravity scale"));
+            ui.checkbox(&mut cc.on_ground, "On ground (debug)");
+            ui.checkbox(&mut cc.jump_pressed, "Jump pressed (debug)");
+            if ui.button("Remove character controller").clicked() {
+                remove_cc = true;
+            }
+        } else if ui.button("Add character controller").clicked() {
+            let _ = args.world.insert(entity, (components::CharacterController::default(),));
+        }
+        if remove_cc {
+            let _ = args.world.remove_one::<components::CharacterController>(entity);
+        }
+    });
+
+    // ── Health ──────────────────────────────────────────────────────
+    section_shell(ui, "hp", "Health", "health", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_hp = false;
+        if let Ok(mut hp) = args.world.get::<&mut components::Health>(entity) {
+            ui.add(egui::DragValue::new(&mut hp.current).prefix("Current ").speed(1).range(0..=i32::MAX));
+            ui.add(egui::DragValue::new(&mut hp.max).prefix("Max ").speed(1).range(1..=i32::MAX));
+            if hp.current > hp.max {
+                hp.current = hp.max;
+            }
+            if ui.button("Reset to max").clicked() {
+                hp.current = hp.max;
+            }
+            if ui.button("Remove health").clicked() {
+                remove_hp = true;
+            }
+        } else if ui.button("Add health").clicked() {
+            let _ = args.world.insert(entity, (components::Health::default(),));
+        }
+        if remove_hp {
+            let _ = args.world.remove_one::<components::Health>(entity);
+        }
+    });
+
+    // ── Fire Surface ────────────────────────────────────────────────
+    section_shell(ui, "fss", "Fire Surface", "fire_surf", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_fs = false;
+        if let Ok(mut fs) = args.world.get::<&mut components::FireSurface>(entity) {
+            ui.color_edit_button_rgb(&mut fs.base_color);
+            ui.label("Base color");
+            ui.color_edit_button_rgb(&mut fs.tip_color);
+            ui.label("Tip color");
+            ui.add(egui::Slider::new(&mut fs.intensity, 0.0..=20.0).text("Intensity"));
+            ui.add(egui::Slider::new(&mut fs.flame_speed, 0.0..=2.0).text("Flame speed"));
+            ui.add(egui::Slider::new(&mut fs.noise_scale, 0.1..=10.0).text("Noise scale"));
+            ui.add(egui::Slider::new(&mut fs.flicker_strength, 0.0..=1.0).text("Flicker strength"));
+            ui.add(egui::Slider::new(&mut fs.flame_height, 0.1..=10.0).text("Flame height"));
+            ui.add(egui::Slider::new(&mut fs.opacity, 0.0..=1.0).text("Opacity"));
+            if ui.button("Remove fire surface").clicked() {
+                remove_fs = true;
+            }
+        } else if ui.button("Add fire surface").clicked() {
+            let _ = args.world.insert(entity, (components::FireSurface::default(),));
+        }
+        if remove_fs {
+            let _ = args.world.remove_one::<components::FireSurface>(entity);
+        }
+    });
+
+    // ── Fire Source ─────────────────────────────────────────────────
+    section_shell(ui, "fsp", "Fire Source", "fire_src", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_fs = false;
+        if let Ok(mut fs) = args.world.get::<&mut components::FireSource>(entity) {
+            ui.add(egui::Slider::new(&mut fs.intensity, 0.0..=5.0).text("Intensity"));
+            ui.add(egui::Slider::new(&mut fs.radius, 0.1..=20.0).text("Radius"));
+            ui.add(egui::Slider::new(&mut fs.flame_height, 0.1..=10.0).text("Flame height"));
+            ui.add(egui::Slider::new(&mut fs.smoke_amount, 0.0..=1.0).text("Smoke amount"));
+            ui.add(egui::Slider::new(&mut fs.ember_amount, 0.0..=1.0).text("Ember amount"));
+            ui.add(egui::Slider::new(&mut fs.wind_susceptibility, 0.0..=1.0).text("Wind susceptibility"));
+            ui.checkbox(&mut fs.damaging, "Damaging");
+            ui.add(egui::Slider::new(&mut fs.damage_per_second, 0.0..=100.0).text("Damage/sec"));
+            if ui.button("Remove fire source").clicked() {
+                remove_fs = true;
+            }
+        } else if ui.button("Add fire source").clicked() {
+            let _ = args.world.insert(entity, (components::FireSource::default(),));
+        }
+        if remove_fs {
+            let _ = args.world.remove_one::<components::FireSource>(entity);
+        }
+    });
+
+    // ── Water Surface ───────────────────────────────────────────────
+    section_shell(ui, "wfs", "Water Surface", "water_surf", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_ws = false;
+        if let Ok(mut ws) = args.world.get::<&mut components::WaterSurface>(entity) {
+            ui.add(egui::Slider::new(&mut ws.wave_height, 0.0..=5.0).text("Wave height"));
+            ui.add(egui::Slider::new(&mut ws.wave_speed, 0.0..=3.0).text("Wave speed"));
+            ui.color_edit_button_rgb(&mut ws.deep_color);
+            ui.label("Deep color");
+            ui.color_edit_button_rgb(&mut ws.shallow_color);
+            ui.label("Shallow color");
+            ui.add(egui::Slider::new(&mut ws.opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(egui::Slider::new(&mut ws.foam_intensity, 0.0..=1.0).text("Foam intensity"));
+            ui.add(egui::Slider::new(&mut ws.specular_power, 1.0..=1024.0).text("Specular power"));
+            if ui.button("Remove water surface").clicked() {
+                remove_ws = true;
+            }
+        } else if ui.button("Add water surface").clicked() {
+            let _ = args.world.insert(entity, (components::WaterSurface::default(),));
+        }
+        if remove_ws {
+            let _ = args.world.remove_one::<components::WaterSurface>(entity);
+        }
+    });
+
+    // ── Lava Surface ────────────────────────────────────────────────
+    section_shell(ui, "lvs", "Lava Surface", "lava_surf", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_ls = false;
+        if let Ok(mut ls) = args.world.get::<&mut components::LavaSurface>(entity) {
+            ui.color_edit_button_rgb(&mut ls.rock_color);
+            ui.label("Rock color");
+            ui.color_edit_button_rgb(&mut ls.emissive_color);
+            ui.label("Emissive color");
+            ui.add(egui::Slider::new(&mut ls.emissive_intensity, 0.0..=20.0).text("Emissive intensity"));
+            ui.add(egui::Slider::new(&mut ls.flow_speed, 0.0..=1.0).text("Flow speed"));
+            ui.add(egui::Slider::new(&mut ls.crack_scale, 0.1..=10.0).text("Crack scale"));
+            ui.add(egui::Slider::new(&mut ls.crack_threshold, 0.0..=1.0).text("Crack threshold"));
+            ui.add(egui::Slider::new(&mut ls.displacement_amp, 0.0..=0.5).text("Displacement amp"));
+            ui.add(egui::Slider::new(&mut ls.opacity, 0.0..=1.0).text("Opacity"));
+            if ui.button("Remove lava surface").clicked() {
+                remove_ls = true;
+            }
+        } else if ui.button("Add lava surface").clicked() {
+            let _ = args.world.insert(entity, (components::LavaSurface::default(),));
+        }
+        if remove_ls {
+            let _ = args.world.remove_one::<components::LavaSurface>(entity);
+        }
+    });
+
+    // ── Weather Zone ────────────────────────────────────────────────
+    section_shell(ui, "wz", "Weather Zone", "weather", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_wz = false;
+        if let Ok(mut wz) = args.world.get::<&mut components::WeatherZone>(entity) {
+            egui::ComboBox::from_id_salt("weather_condition_combo")
+                .selected_text(format!("{:?}", wz.condition))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Clear, "Clear");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Cloudy, "Cloudy");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Overcast, "Overcast");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::LightRain, "Light Rain");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::HeavyRain, "Heavy Rain");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Snow, "Snow");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Fog, "Fog");
+                    ui.selectable_value(&mut wz.condition, crate::environment::weather::WeatherCondition::Storm, "Storm");
+                });
+            ui.add(egui::Slider::new(&mut wz.intensity, 0.0..=1.0).text("Intensity"));
+            ui.add(egui::Slider::new(&mut wz.radius, 1.0..=500.0).text("Radius"));
+            ui.add(egui::Slider::new(&mut wz.falloff, 0.0..=100.0).text("Falloff"));
+            ui.checkbox(&mut wz.active, "Active");
+            if ui.button("Remove weather zone").clicked() {
+                remove_wz = true;
+            }
+        } else if ui.button("Add weather zone").clicked() {
+            let _ = args.world.insert(entity, (components::WeatherZone::default(),));
+        }
+        if remove_wz {
+            let _ = args.world.remove_one::<components::WeatherZone>(entity);
+        }
+    });
+
+    // ── Wind Zone ───────────────────────────────────────────────────
+    section_shell(ui, "wnd", "Wind Zone", "wind", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_wz = false;
+        if let Ok(mut wz) = args.world.get::<&mut components::WindZone>(entity) {
+            ui.label(RichText::new("Direction").small().strong());
+            ui.add(egui::DragValue::new(&mut wz.direction[0]).prefix("X ").speed(0.05));
+            ui.add(egui::DragValue::new(&mut wz.direction[1]).prefix("Y ").speed(0.05));
+            ui.add(egui::DragValue::new(&mut wz.direction[2]).prefix("Z ").speed(0.05));
+            ui.add(egui::Slider::new(&mut wz.strength, 0.0..=5.0).text("Strength"));
+            ui.add(egui::Slider::new(&mut wz.radius, 1.0..=500.0).text("Radius"));
+            ui.add(egui::Slider::new(&mut wz.falloff, 0.0..=100.0).text("Falloff"));
+            ui.checkbox(&mut wz.active, "Active");
+            if ui.button("Remove wind zone").clicked() {
+                remove_wz = true;
+            }
+        } else if ui.button("Add wind zone").clicked() {
+            let _ = args.world.insert(entity, (components::WindZone::default(),));
+        }
+        if remove_wz {
+            let _ = args.world.remove_one::<components::WindZone>(entity);
+        }
+    });
+
+    // ── Point Light ─────────────────────────────────────────────────
+    section_shell(ui, "lit", "Point Light", "point_light", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_pl = false;
+        if let Ok(mut pl) = args.world.get::<&mut components::PointLight>(entity) {
+            ui.color_edit_button_rgb(&mut pl.color);
+            ui.label("Color");
+            ui.add(egui::Slider::new(&mut pl.intensity, 0.0..=50.0).text("Intensity"));
+            ui.add(egui::Slider::new(&mut pl.range, 0.0..=200.0).text("Range"));
+            egui::ComboBox::from_id_salt("light_type_combo")
+                .selected_text(match pl.light_type as u32 {
+                    0 => "Directional",
+                    1 => "Point",
+                    2 => "Spot",
+                    _ => "Unknown",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pl.light_type, 0.0, "Directional");
+                    ui.selectable_value(&mut pl.light_type, 1.0, "Point");
+                    ui.selectable_value(&mut pl.light_type, 2.0, "Spot");
+                });
+            ui.add(egui::Slider::new(&mut pl.spot_angle, 5.0..=170.0).text("Spot angle (°)"));
+            ui.checkbox(&mut pl.shadow_casting, "Shadow casting");
+            if ui.button("Remove point light").clicked() {
+                remove_pl = true;
+            }
+        } else if ui.button("Add point light").clicked() {
+            let _ = args.world.insert(entity, (components::PointLight::default(),));
+        }
+        if remove_pl {
+            let _ = args.world.remove_one::<components::PointLight>(entity);
+        }
+    });
+
+    // ── Water Trigger ───────────────────────────────────────────────
+    section_shell(ui, "wtr", "Water Trigger", "water_trig", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_wt = false;
+        if let Ok(mut wt) = args.world.get::<&mut components::WaterTrigger>(entity) {
+            ui.add(egui::Slider::new(&mut wt.splash_intensity, 0.0..=2.0).text("Splash intensity"));
+            ui.checkbox(&mut wt.active, "Active");
+            if ui.button("Remove water trigger").clicked() {
+                remove_wt = true;
+            }
+        } else if ui.button("Add water trigger").clicked() {
+            let _ = args.world.insert(entity, (components::WaterTrigger::default(),));
+        }
+        if remove_wt {
+            let _ = args.world.remove_one::<components::WaterTrigger>(entity);
+        }
+    });
+
+    // ── Splash Effect ───────────────────────────────────────────────
+    section_shell(ui, "spl", "Splash Effect", "splash", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_se = false;
+        if let Ok(mut se) = args.world.get::<&mut components::SplashEffect>(entity) {
+            ui.add(egui::DragValue::new(&mut se.max_splashes).prefix("Max splashes ").speed(1).range(1..=u32::MAX));
+            ui.add(egui::Slider::new(&mut se.splash_duration, 0.1..=5.0).text("Splash duration"));
+            ui.add(egui::Slider::new(&mut se.ripple_scale, 0.1..=5.0).text("Ripple scale"));
+            ui.checkbox(&mut se.active, "Active");
+            if ui.button("Remove splash effect").clicked() {
+                remove_se = true;
+            }
+        } else if ui.button("Add splash effect").clicked() {
+            let _ = args.world.insert(entity, (components::SplashEffect::default(),));
+        }
+        if remove_se {
+            let _ = args.world.remove_one::<components::SplashEffect>(entity);
+        }
+    });
+
+    // ── Script ──────────────────────────────────────────────────────
+    section_shell(ui, "scr", "Script", "script", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_scr = false;
+        if let Ok(mut scr) = args.world.get::<&mut components::Script>(entity) {
+            ui.label(RichText::new("Lua script path").small().strong());
+            ui.monospace(&scr.path);
+            let mut new_path = scr.path.clone();
+            ui.add(egui::TextEdit::singleline(&mut new_path).hint_text("scripts/my_script.lua"));
+            if ui.button("Apply path").clicked() {
+                scr.path = new_path;
+            }
+            if ui.button("Remove script").clicked() {
+                remove_scr = true;
+            }
+        } else if ui.button("Add script").clicked() {
+            let _ = args.world.insert(entity, (components::Script::default(),));
+        }
+        if remove_scr {
+            let _ = args.world.remove_one::<components::Script>(entity);
+        }
     });
 }

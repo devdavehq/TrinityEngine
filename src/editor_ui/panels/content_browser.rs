@@ -96,33 +96,42 @@ pub fn render_content_browser_panel(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if let Some(icon) = icon_texture_cache.get("folder_open").or_else(|| icon_texture_cache.get("folder")) {
-                    let _ = ui.add(egui::Image::new((icon.id(), egui::vec2(16.0, 16.0))));
-                }
-                ui.label("Folder");
-                ui.text_edit_singleline(content_new_folder);
-                if ui.button("Create").clicked() {
-                    let p = format!("Content/{}", content_new_folder.trim());
-                    let _ = fs::create_dir_all(p);
-                }
-                if ui.button("Delete").clicked() {
-                    let p = format!("Content/{}", content_new_folder.trim());
-                    let _ = fs::remove_dir_all(&p);
-                    error_log.push(format!("[Content] Deleted folder: {}", p));
-                }
+                ui.label(egui::RichText::new("Scene").small().strong().color(egui::Color32::from_rgb(168, 176, 188)));
                 ui.separator();
-                ui.label("File");
-                ui.text_edit_singleline(content_new_file);
-                if ui.button("Create").clicked() {
-                    let p = format!("Content/{}", content_new_file.trim());
-                    let _ = fs::write(p, "");
+                if ui.button(egui::RichText::new("New Scene").small().color(egui::Color32::from_rgb(147, 158, 172))).clicked() {
+                    // Signal: clear the world. Main loop will handle it.
+                    ui.data_mut(|d| d.insert_temp("scene_action_new".into(), true));
                 }
-                if ui.button("Delete").clicked() {
-                    let p = format!("Content/{}", content_new_file.trim());
-                    let _ = fs::remove_file(&p);
-                    error_log.push(format!("[Content] Deleted file: {}", p));
+                if ui.button(egui::RichText::new("Load Scene").small().color(egui::Color32::from_rgb(147, 158, 172))).clicked() {
+                    // List .scene files and show a popup.
+                    ui.data_mut(|d| d.insert_temp("scene_action_load".into(), true));
                 }
             });
+
+            // Show recent scenes if any.
+            let show_recent = ui
+                .data_mut(|d| d.get_temp::<bool>("scene_action_load".into()))
+                .unwrap_or(false);
+
+            if show_recent {
+                ui.separator();
+                ui.label(egui::RichText::new("Recent Scenes:").small().color(egui::Color32::from_rgb(147, 158, 172)));
+                // Scan Content/ for .scene files.
+                let scenes = crate::scene::SceneManager::list_scene_files("Content");
+                for scene_path in &scenes {
+                    let name = std::path::Path::new(scene_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(scene_path);
+                    if ui.button(name).clicked() {
+                        ui.data_mut(|d| d.insert_temp("scene_load_path".into(), scene_path.clone()));
+                        ui.data_mut(|d| d.insert_temp("scene_action_load".into(), false));
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    ui.data_mut(|d| d.insert_temp("scene_action_load".into(), false));
+                }
+            }
         });
     ui.add_space(8.0);
 

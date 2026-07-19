@@ -3,17 +3,25 @@ name = "Triengine"
 version = "0.1.0"
 edition = "2024"   # Always use 2025, it's the modern Rust edition
 
+[features]
+default = ["audio", "scripting", "editor"]
+audio = ["dep:rodio"]
+scripting = ["dep:mlua"]
+editor = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit", "dep:egui_dock"]
+
 [dependencies]
 # We'll add libraries here as we need them, one phase at a time
 winit = "0.30.13"     # Creates and manages the OS window
 wgpu = "29.0.1"      # Cross-platform GPU rendering
 notify = "8.2.0"
-mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
+mlua = { version = "0.11.6", features = ["lua54", "vendored"], optional = true }
 glam = { version = "0.32.1", features = ["bytemuck"] }
 pollster = "0.4.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 env_logger = "0.11"
 log      = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hecs     = "0.11.0"
 # image   = "0.25"   # loads PNG, JPG textures
 # For HDR loading we use image's hdr feature:
@@ -22,12 +30,13 @@ gilrs = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 rayon = "1"
-egui = "0.34.1"
-egui-wgpu = "0.34.1"
-egui-winit = "0.34.1"
-egui_dock = { version = "0.19.1", features = ["serde"] }
+egui = { version = "0.34.1", optional = true }
+egui-wgpu = { version = "0.34.1", optional = true }
+egui-winit = { version = "0.34.1", optional = true }
+egui_dock = { version = "0.19.1", features = ["serde"], optional = true }
 serde_json = "1"
 gltf = "1.4.1"
+rodio = { version = "0.19", optional = true }
 
 
 [lib]
