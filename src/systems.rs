@@ -8,6 +8,39 @@ use crate::scripting::ScriptEngine;
 use crate::audio::AudioSystem;
 use crate::ai::AiRegistry;
 use crate::navigation::NavGrid;
+use crate::core::systems::SystemScheduler;
+
+/// EngineSystems wraps the SystemScheduler and provides a central registration
+/// point for engine systems that are currently called inline in main.rs.
+///
+/// This is a FOUNDATION for migrating the monolithic GameApp::frame() loop
+/// into a data-driven, composable pipeline. Systems are registered here but
+/// NOT yet removed from main.rs — the migration is incremental.
+pub struct EngineSystems {
+    pub scheduler: SystemScheduler,
+}
+
+impl EngineSystems {
+    pub fn new() -> Self {
+        let mut scheduler = SystemScheduler::new();
+        // Register the systems that are currently called inline in main.rs.
+        // DO NOT remove them from main.rs yet — just register them for future use.
+        //
+        // TODO: Implement SystemMut for each system and register them here:
+        //   scheduler.register(Box::new(AnimationSystem));
+        //   scheduler.register(Box::new(AnimationBlendingSystem));
+        //   scheduler.register(Box::new(FloodSystem));
+        //   scheduler.register(Box::new(AiSystem));
+        //   scheduler.resolve().expect("System dependency cycle detected");
+        Self { scheduler }
+    }
+}
+
+impl Default for EngineSystems {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // scripting_system() runs the Lua update() for every entity with a Script.
 //

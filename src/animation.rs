@@ -3,6 +3,8 @@ use crate::jobs::JobSystem;
 use hecs::World;
 
 pub mod skeletal;
+pub mod blending;
+pub mod anim_graph;
 
 #[derive(Clone, Copy, Debug)]
 pub enum AnimState {

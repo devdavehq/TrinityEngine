@@ -120,12 +120,12 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         if ui.small_button("Expand All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "lava_surf", "weather", "wind", "point_light", "water_trig", "splash", "script"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script"] {
                 set_section_open(ui, k, true);
             }
         }
         if ui.small_button("Collapse All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "lava_surf", "weather", "wind", "point_light", "water_trig", "splash", "script"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script"] {
                 set_section_open(ui, k, false);
             }
         }
@@ -557,8 +557,8 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
 
     section_shell(ui, "fol", "Foliage Tools", "foliage", false, |ui| {
         ui.label("Spawn/remove foliage near the terrain cursor (same actions as Content Browser quick row).");
-        let wx = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
-        let wz = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
+        let wx = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
+        let wz = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
         ui.label(format!("Cursor world XZ: ({wx:.1}, {wz:.1})"));
         let mut ring_radius = ui
             .data_mut(|d| d.get_temp::<f32>("foliage_ring_radius".into()))
@@ -609,16 +609,122 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         }
     });
 
+    // ── Smart Foliage Asset Settings ────────────────────────────────
+    section_shell(ui, "sfa", "Smart Foliage Asset", "smart_foliage", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_sfa = false;
+        if let Ok(mut sfa) = args.world.get::<&mut components::SmartFoliageAsset>(entity) {
+            ui.checkbox(&mut sfa.visible, "Visible");
+            ui.checkbox(&mut sfa.locked, "Locked");
+            ui.add(egui::Slider::new(&mut sfa.density_multiplier, 0.0..=5.0).text("Density multiplier"));
+            ui.add(egui::Slider::new(&mut sfa.min_scale, 0.1..=3.0).text("Min scale"));
+            ui.add(egui::Slider::new(&mut sfa.max_scale, 0.1..=3.0).text("Max scale"));
+            ui.checkbox(&mut sfa.random_rotation, "Random rotation");
+            ui.add(egui::Slider::new(&mut sfa.min_slope_deg, 0.0..=90.0).text("Min slope (deg)"));
+            ui.add(egui::Slider::new(&mut sfa.max_slope_deg, 0.0..=90.0).text("Max slope (deg)"));
+            ui.add(egui::Slider::new(&mut sfa.min_height, -10.0..=500.0).text("Min height"));
+            ui.add(egui::Slider::new(&mut sfa.max_height, -10.0..=500.0).text("Max height"));
+            egui::ComboBox::from_id_salt("foliage_paint_mode")
+                .selected_text(format!("{:?}", sfa.paint_mode))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut sfa.paint_mode, components::FoliagePaintMode::Paint, "Paint");
+                    ui.selectable_value(&mut sfa.paint_mode, components::FoliagePaintMode::Erase, "Erase");
+                    ui.selectable_value(&mut sfa.paint_mode, components::FoliagePaintMode::Fill, "Fill");
+                    ui.selectable_value(&mut sfa.paint_mode, components::FoliagePaintMode::Procedural, "Procedural");
+                });
+            if ui.button("Remove smart foliage asset").clicked() {
+                remove_sfa = true;
+            }
+        } else if ui.button("Add smart foliage asset").clicked() {
+            let _ = args.world.insert(entity, (components::SmartFoliageAsset::default(),));
+        }
+        if remove_sfa {
+            let _ = args.world.remove_one::<components::SmartFoliageAsset>(entity);
+        }
+    });
+
     section_shell(ui, "ter", "Terrain Auto-Material", "terrain", false, |ui| {
         ui.label("Grass / dirt / rock blend by slope and height.");
         ui.add(
-            egui::Slider::new(&mut args.terrain.material.slope_rock_start, 0.1..=1.6)
+            egui::Slider::new(&mut args.terrain_world.material.slope_rock_start, 0.1..=1.6)
                 .text("Rock from slope"),
         );
         ui.add(
-            egui::Slider::new(&mut args.terrain.material.height_rock_start, 0.0..=6.0)
+            egui::Slider::new(&mut args.terrain_world.material.height_rock_start, 0.0..=6.0)
                 .text("Rock from height"),
         );
+    });
+
+    // ── Terrain Editor Brush ─────────────────────────────────────────
+    section_shell(ui, "tbr", "Terrain Editor", "terrain_brush", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Select an entity to enable terrain editing.");
+            return;
+        };
+        // Add TerrainEditor component if missing.
+        if args.world.get::<&components::TerrainEditor>(entity).is_err() {
+            if ui.button("Enable Terrain Editor").clicked() {
+                args.world.insert_one(entity, components::TerrainEditor::default()).ok();
+            }
+            ui.label("Attach a TerrainEditor to this entity for brush editing.");
+            return;
+        }
+        // Edit TerrainEditor properties.
+        if let Ok(mut te) = args.world.get::<&mut components::TerrainEditor>(entity) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Active").small());
+                ui.checkbox(&mut te.active, "");
+                if te.active {
+                    ui.colored_label(Color32::from_rgb(80, 200, 120), " Brush active");
+                } else {
+                    ui.colored_label(Color32::from_rgb(140, 100, 80), " Press T in viewport");
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Brush Mode").small().strong());
+            let modes = [
+                (components::TerrainBrushMode::Raise, "Raise [1]"),
+                (components::TerrainBrushMode::Lower, "Lower [2]"),
+                (components::TerrainBrushMode::Smooth, "Smooth [3]"),
+                (components::TerrainBrushMode::Flatten, "Flatten [4]"),
+                (components::TerrainBrushMode::Paint, "Paint [5]"),
+                (components::TerrainBrushMode::Foliage, "Foliage [6]"),
+            ];
+            for (mode, label) in modes {
+                let selected = te.brush_mode == mode;
+                let btn = ui.selectable_label(selected, RichText::new(label).small());
+                if btn.clicked() {
+                    te.brush_mode = mode;
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Slider::new(&mut te.brush_radius, 0.5..=50.0)
+                    .text("Radius")
+                    .prefix("R: "),
+            );
+            ui.add(
+                egui::Slider::new(&mut te.brush_strength, 0.01..=2.0)
+                    .text("Strength")
+                    .prefix("S: "),
+            );
+            if te.brush_mode == components::TerrainBrushMode::Flatten {
+                ui.add(
+                    egui::Slider::new(&mut te.flatten_target, -50.0..=100.0)
+                        .text("Target Height"),
+                );
+            }
+            ui.checkbox(&mut te.show_cursor, "Show brush cursor");
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("T = toggle mode · 1-6 = brush · [ / ] = radius")
+                    .small()
+                    .weak(),
+            );
+        }
     });
 
     // ── Rotation ─────────────────────────────────────────────────────
@@ -774,6 +880,13 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.add(egui::Slider::new(&mut fs.flicker_strength, 0.0..=1.0).text("Flicker strength"));
             ui.add(egui::Slider::new(&mut fs.flame_height, 0.1..=10.0).text("Flame height"));
             ui.add(egui::Slider::new(&mut fs.opacity, 0.0..=1.0).text("Opacity"));
+            // ── Emissive light emission controls ─────────────────────────
+            ui.separator();
+            ui.label(RichText::new("Dynamic Light Emission").strong());
+            ui.add(egui::Slider::new(&mut fs.emissive_light_strength, 0.0..=20.0).text("Light strength"));
+            ui.add(egui::Slider::new(&mut fs.emissive_light_radius, 0.1..=50.0).text("Light radius"));
+            ui.color_edit_button_rgb(&mut fs.emissive_light_color);
+            ui.label("Light color");
             if ui.button("Remove fire surface").clicked() {
                 remove_fs = true;
             }
@@ -840,6 +953,47 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         }
     });
 
+    // ── Smart Water Body ───────────────────────────────────────────
+    section_shell(ui, "wbd", "Water Body", "water_body", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_wb = false;
+        if let Ok(mut wb) = args.world.get::<&mut components::WaterBody>(entity) {
+            egui::ComboBox::from_id_salt("wb_type")
+                .selected_text(wb.body_type.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Ocean, "Ocean");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Lake, "Lake");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::River, "River");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Pond, "Pond");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Stream, "Stream");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Waterfall, "Waterfall");
+                    ui.selectable_value(&mut wb.body_type, components::WaterBodyType::Swamp, "Swamp");
+                });
+            ui.add(egui::Slider::new(&mut wb.size_x, 5.0..=500.0).text("Size X"));
+            ui.add(egui::Slider::new(&mut wb.size_z, 5.0..=500.0).text("Size Z"));
+            ui.add(egui::Slider::new(&mut wb.depth, 0.5..=100.0).text("Depth"));
+            ui.add(egui::Slider::new(&mut wb.flow_speed, 0.0..=10.0).text("Flow speed"));
+            ui.add(egui::Slider::new(&mut wb.turbulence, 0.0..=2.0).text("Turbulence"));
+            ui.checkbox(&mut wb.auto_surface, "Auto surface");
+            ui.checkbox(&mut wb.auto_physics, "Auto physics");
+            ui.checkbox(&mut wb.auto_collision, "Auto collision");
+            ui.checkbox(&mut wb.auto_reflections, "Auto reflections");
+            ui.checkbox(&mut wb.auto_underwater, "Auto underwater");
+            ui.add(egui::Slider::new(&mut wb.lod_distance, 50.0..=1000.0).text("LOD distance"));
+            if ui.button("Remove water body").clicked() {
+                remove_wb = true;
+            }
+        } else if ui.button("Add water body").clicked() {
+            let _ = args.world.insert(entity, (components::WaterBody::default(),));
+        }
+        if remove_wb {
+            let _ = args.world.remove_one::<components::WaterBody>(entity);
+        }
+    });
+
     // ── Lava Surface ────────────────────────────────────────────────
     section_shell(ui, "lvs", "Lava Surface", "lava_surf", false, |ui| {
         let Some(entity) = args.selected_renderable.as_ref().copied() else {
@@ -858,6 +1012,13 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.add(egui::Slider::new(&mut ls.crack_threshold, 0.0..=1.0).text("Crack threshold"));
             ui.add(egui::Slider::new(&mut ls.displacement_amp, 0.0..=0.5).text("Displacement amp"));
             ui.add(egui::Slider::new(&mut ls.opacity, 0.0..=1.0).text("Opacity"));
+            // ── Emissive light emission controls ─────────────────────────
+            ui.separator();
+            ui.label(RichText::new("Dynamic Light Emission").strong());
+            ui.add(egui::Slider::new(&mut ls.emissive_light_strength, 0.0..=20.0).text("Light strength"));
+            ui.add(egui::Slider::new(&mut ls.emissive_light_radius, 0.1..=50.0).text("Light radius"));
+            ui.color_edit_button_rgb(&mut ls.emissive_light_color);
+            ui.label("Light color");
             if ui.button("Remove lava surface").clicked() {
                 remove_ls = true;
             }
@@ -965,6 +1126,40 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         }
         if remove_pl {
             let _ = args.world.remove_one::<components::PointLight>(entity);
+        }
+    });
+
+    // ── Material Extras ─────────────────────────────────────────────
+    section_shell(ui, "mtx", "Material Extras", "material_extras", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_mx = false;
+        if let Ok(mut mx) = args.world.get::<&mut components::MaterialExtras>(entity) {
+            ui.add(egui::Slider::new(&mut mx.subsurface, 0.0..=1.0).text("Subsurface"));
+            ui.add(egui::Slider::new(&mut mx.clearcoat, 0.0..=1.0).text("Clearcoat"));
+            ui.add(egui::Slider::new(&mut mx.clearcoat_roughness, 0.0..=1.0).text("Clearcoat roughness"));
+            ui.add(egui::Slider::new(&mut mx.emissive_strength, 0.0..=10.0).text("Emissive strength"));
+            ui.label(
+                RichText::new("Values are uploaded to the GPU as material_extras (binding 6).")
+                    .small()
+                    .color(Color32::from_rgb(141, 151, 165)),
+            );
+            if ui.button("Reset defaults").clicked() {
+                mx.subsurface = 0.0;
+                mx.clearcoat = 0.0;
+                mx.clearcoat_roughness = 0.0;
+                mx.emissive_strength = 0.0;
+            }
+            if ui.button("Remove material extras").clicked() {
+                remove_mx = true;
+            }
+        } else if ui.button("Add material extras").clicked() {
+            let _ = args.world.insert(entity, (components::MaterialExtras::default(),));
+        }
+        if remove_mx {
+            let _ = args.world.remove_one::<components::MaterialExtras>(entity);
         }
     });
 

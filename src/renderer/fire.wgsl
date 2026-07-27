@@ -106,52 +106,80 @@ fn fs_fire(in: FireVertOut) -> @location(0) vec4<f32> {
     let speed = fire.params.x;
     let h = in.height;
 
-    // ── Two scrolling noise layers for flickering flame shape ────────────
-    // Layer A scrolls upward (flame rising).
+    // ── Multiple scrolling noise layers for volumetric depth ─────────────
+    // Layer A: primary flame rising motion.
     let uv_a = in.flame_uv + vec2<f32>(t * speed * 0.3, -t * speed);
-    // Layer B scrolls upward at different speed for internal detail.
+    // Layer B: secondary detail at different scale/speed.
     let uv_b = in.flame_uv * 1.5 + vec2<f32>(-t * speed * 0.2, -t * speed * 0.7);
+    // Layer C: fine internal turbulence (small scale, fast scroll).
+    let uv_c = in.flame_uv * 3.0 + vec2<f32>(t * speed * 0.15, -t * speed * 1.3);
+    // Layer D: slow large-scale undulation for overall flame sway.
+    let uv_d = in.flame_uv * 0.5 + vec2<f32>(-t * speed * 0.1, -t * speed * 0.4);
 
     let n1 = fbm(uv_a);
     let n2 = fbm(uv_b);
+    let n3 = fbm(uv_c);
+    let n4 = fbm(uv_d);
 
-    // Combine layers: average creates organic flame texture.
-    let flame_mask = (n1 + n2) * 0.5;
+    // Combine: primary + secondary + fine turbulence + sway.
+    let flame_mask = (n1 * 0.4 + n2 * 0.3 + n3 * 0.15 + n4 * 0.15);
+
+    // ── Volumetric depth effect ──────────────────────────────────────────
+    // Simulate internal glow by creating a bright core surrounded by
+    // dimmer outer flames — gives the illusion of 3D volume.
+    let core_mask = smoothstep(0.3, 0.6, flame_mask);
+    let outer_mask = smoothstep(0.0, 0.4, flame_mask);
+    let volume = core_mask * 0.6 + outer_mask * 0.4;
 
     // ── Height-based flame shape ─────────────────────────────────────────
-    // Flames are wider at the base and taper to a point at the top.
-    // This simulates the natural shape of a candle / campfire flame.
-    let taper = smoothstep(0.8, 0.1, h);
-    let flame = flame_mask * taper;
+    // Wider at base, tapers to point. Multiple taper stages for realism.
+    let taper_base = smoothstep(0.9, 0.0, h);         // Main taper
+    let taper_inner = smoothstep(0.6, 0.05, h) * 0.3; // Inner bright core taper
+    let taper = taper_base + taper_inner;
 
-    // ── Colour gradient ──────────────────────────────────────────────────
-    // Base (h=0): white-hot bright colour
-    // Mid (h=0.3): orange
-    // Top (h=0.8): dark red / smoke
+    let flame = volume * taper;
+
+    // ── Colour gradient (4-stop for realism) ─────────────────────────────
+    // Base (h=0.0): white-hot bright core
+    // Lower (h=0.15): yellow-orange
+    // Mid (h=0.4): deep orange
+    // Tip (h=0.8): dark red → smoke
     let base = fire.base_color.rgb;
     let tip  = fire.tip_color.rgb;
+    let white_hot = vec3<f32>(1.0, 0.95, 0.85);
+    let yellow = mix(base, vec3<f32>(1.0, 0.8, 0.1), 0.3);
 
-    // Three-stop gradient: base → mid → tip.
-    let mid = mix(base, tip, 0.5);
     var color: vec3<f32>;
-    if h < 0.3 {
-        color = mix(base, mid, h / 0.3);
+    if h < 0.15 {
+        color = mix(white_hot, yellow, h / 0.15);
+    } else if h < 0.4 {
+        color = mix(yellow, base, (h - 0.15) / 0.25);
+    } else if h < 0.7 {
+        color = mix(base, tip, (h - 0.4) / 0.3);
     } else {
-        color = mix(mid, tip, (h - 0.3) / 0.7);
+        // Fade to dark smoke at the very tips.
+        let smoke = tip * 0.3;
+        color = mix(tip, smoke, (h - 0.7) / 0.3);
     }
 
-    // ── Brightness variation ─────────────────────────────────────────────
-    // Brighter at the core (low noise value = dense flame = bright).
-    let brightness = mix(1.5, 0.8, flame_mask);
-    color *= brightness;
+    // ── Core brightness boost ────────────────────────────────────────────
+    // The inner core of the flame is much brighter than the outer shell.
+    let core_boost = mix(0.8, 2.0, core_mask);
+    color *= core_boost;
+
+    // ── Brightness variation from flame density ──────────────────────────
+    let density_var = mix(1.2, 0.7, flame_mask);
+    color *= density_var;
 
     // ── Emissive output ──────────────────────────────────────────────────
     let intensity = fire.base_color.a;
     color *= intensity;
 
     // ── Alpha ────────────────────────────────────────────────────────────
-    // Flame alpha: high at base, fades at tips.
-    let alpha = flame * smoothstep(0.0, 0.15, 1.0 - h) * 0.9;
+    // High at base core, soft fade at tips and edges.
+    let alpha_core = flame * smoothstep(0.0, 0.1, 1.0 - h) * 0.95;
+    let alpha_edge = outer_mask * 0.3;
+    let alpha = max(alpha_core, alpha_edge * taper);
     let final_alpha = clamp(alpha, 0.0, 0.95);
 
     return vec4<f32>(color, final_alpha);

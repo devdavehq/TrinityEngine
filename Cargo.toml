@@ -8,6 +8,7 @@ default = ["audio", "scripting", "editor"]
 audio = ["dep:rodio"]
 scripting = ["dep:mlua"]
 editor = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit", "dep:egui_dock"]
+jolt = ["dep:rolt"]
 
 [dependencies]
 # We'll add libraries here as we need them, one phase at a time
@@ -37,6 +38,8 @@ egui_dock = { version = "0.19.1", features = ["serde"], optional = true }
 serde_json = "1"
 gltf = "1.4.1"
 rodio = { version = "0.19", optional = true }
+rolt = { version = "0.3", optional = true }
+rfd = "0.15"
 
 
 [lib]

@@ -65,6 +65,36 @@ use crate::ai::{
     Sequence, Selector, Parallel, Inverter, Repeater, Cooldown,
     MoveTo, Patrol, Wait, Log,
 };
+
+// ── SandboxConfig ────────────────────────────────────────────────────────
+// Restricts what Lua scripts are allowed to do. Applied per-ScriptEngine
+// instance. Scripts are restricted by default — enable capabilities only
+// when a script legitimately needs them.
+#[derive(Clone, Debug)]
+pub struct SandboxConfig {
+    /// Allow Lua to read/write files on disk (io.open, fs.*).
+    pub file_system_access: bool,
+    /// Allow Lua to open network sockets (socket.*, http.*).
+    pub network_access: bool,
+    /// Allow Lua to spawn OS processes (os.execute, os.popen).
+    pub os_command_access: bool,
+    /// Hard memory ceiling for the Lua heap in bytes (0 = unlimited).
+    pub max_memory_bytes: usize,
+    /// Maximum wall-clock execution time per frame in ms (0 = unlimited).
+    pub max_execution_time_ms: u64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            file_system_access: false,
+            network_access: false,
+            os_command_access: false,
+            max_memory_bytes: 0,
+            max_execution_time_ms: 0,
+        }
+    }
+}
 use crate::navigation::NavGrid;
 
 // ── BTBuilder: deferred behavior tree construction ─────────────────────────
@@ -279,6 +309,10 @@ pub struct ScriptEngine {
     nav_grid_ptr: usize,
     // Raw pointer to AiRegistry for bt.assign() tree registration.
     ai_registry_ptr: usize,
+    // Raw pointer to TerrainWorld for terrain_height / terrain_raise / etc.
+    terrain_world_ptr: usize,
+    /// Sandbox configuration — controls what scripts are allowed to do.
+    pub sandbox: SandboxConfig,
 }
 
 // SAFETY: ScriptEngine is only ever used on the main thread.
@@ -300,6 +334,8 @@ impl ScriptEngine {
             bt_trees: HashMap::new(),
             nav_grid_ptr: 0,
             ai_registry_ptr: 0,
+            terrain_world_ptr: 0,
+            sandbox: SandboxConfig::default(),
         }
     }
 
@@ -346,9 +382,15 @@ impl ScriptEngine {
 
     /// Store raw pointers to external engine systems so Lua closures can
     /// access them.  Must be called before run_update() each frame.
-    pub fn set_external_refs(&mut self, nav: &NavGrid, ai_reg: &mut AiRegistry) {
+    pub fn set_external_refs(
+        &mut self,
+        nav: &NavGrid,
+        ai_reg: &mut AiRegistry,
+        terrain: &mut crate::terrain::TerrainWorld,
+    ) {
         self.nav_grid_ptr = nav as *const NavGrid as usize;
         self.ai_registry_ptr = ai_reg as *mut AiRegistry as usize;
+        self.terrain_world_ptr = terrain as *mut crate::terrain::TerrainWorld as usize;
     }
 
     /// Expose the Lua instance so external code can set globals (e.g., ui_click_event).
@@ -472,6 +514,26 @@ impl ScriptEngine {
         })?;
         globals.set("vec_lerp", vec_lerp_fn)?;
 
+        // ── Sandbox enforcement ─────────────────────────────────────────
+        // Remove dangerous Lua standard libraries based on SandboxConfig.
+        // By default everything is restricted; enable only what is allowed.
+        if !self.sandbox.os_command_access {
+            globals.set("os", self.lua.create_table()?)?;
+        }
+        if !self.sandbox.file_system_access {
+            globals.set("io", self.lua.create_table()?)?;
+            globals.set("loadfile", self.lua.create_function(|_, ()| -> LuaResult<()> {
+                Err(LuaError::RuntimeError(
+                    "loadfile is disabled by sandbox".to_string()
+                ))
+            })?)?;
+            globals.set("dofile", self.lua.create_function(|_, ()| -> LuaResult<()> {
+                Err(LuaError::RuntimeError(
+                    "dofile is disabled by sandbox".to_string()
+                ))
+            })?)?;
+        }
+
         Ok(())
     }
 
@@ -535,10 +597,17 @@ impl ScriptEngine {
 
         std::thread::spawn(move || {
             let (ntx, nrx) = mpsc::channel::<notify::Result<Event>>();
-            let mut watcher = recommended_watcher(move |res| { let _ = ntx.send(res); })
-                .expect("Could not create file watcher");
-            watcher.watch(Path::new(&watch_dir), RecursiveMode::Recursive)
-                .expect("Could not watch directory");
+            let mut watcher = match recommended_watcher(move |res| { let _ = ntx.send(res); }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("[Scripting] Could not create file watcher: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = watcher.watch(Path::new(&watch_dir), RecursiveMode::Recursive) {
+                tracing::error!("[Scripting] Could not watch directory {}: {}", watch_dir, e);
+                return;
+            }
 
             loop {
                 match nrx.recv() {
@@ -639,6 +708,9 @@ impl ScriptEngine {
         script_path: &str,
         dt: f32,
         audio: Option<&mut crate::audio::AudioSystem>,
+        screen_w: f32,
+        screen_h: f32,
+        fov_degrees: f32,
     ) -> LuaResult<()> {
         let globals   = self.lua.globals();
         let script_ptr = self as *mut ScriptEngine as usize;
@@ -679,7 +751,10 @@ impl ScriptEngine {
         // get_position(entity) → x, y, z
         let gp = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_position", eid);
+                return Ok((0.0f32, 0.0f32, 0.0f32));
+            };
             match world.get::<&Position>(entity) {
                 Ok(p)  => Ok((p.x, p.y, p.z)),
                 Err(_) => Ok((0.0f32, 0.0f32, 0.0f32)),
@@ -690,7 +765,10 @@ impl ScriptEngine {
         // set_position(entity, x, y, z)
         let sp = self.lua.create_function(move |_, (eid, x, y, z): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_position", eid);
+                return Ok(());
+            };
             if let Ok(mut p) = world.get::<&mut Position>(entity) {
                 p.x = x; p.y = y; p.z = z;
             }
@@ -702,7 +780,10 @@ impl ScriptEngine {
             .lua
             .create_function(move |_, (eid, dx, dy, dz): (u64, f32, f32, f32)| {
                 let world = unsafe { &mut *(world_ptr as *mut World) };
-                let entity = Entity::from_bits(eid).unwrap();
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in move_entity", eid);
+                    return Ok(());
+                };
                 if let Ok(mut p) = world.get::<&mut Position>(entity) {
                     p.x += dx;
                     p.y += dy;
@@ -716,7 +797,10 @@ impl ScriptEngine {
         // get_velocity(entity) → vx, vy, vz
         let gv = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_velocity", eid);
+                return Ok((0.0f32, 0.0f32, 0.0f32));
+            };
             match world.get::<&RigidBody>(entity) {
                 Ok(b)  => Ok((b.velocity_x, b.velocity_y, b._velocity_z)),
                 Err(_) => Ok((0.0f32, 0.0f32, 0.0f32)),
@@ -727,7 +811,10 @@ impl ScriptEngine {
         // set_velocity(entity, vx, vy, vz) — replaces current velocity
         let sv = self.lua.create_function(move |_, (eid, vx, vy, vz): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_velocity", eid);
+                return Ok(());
+            };
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.velocity_x = vx;
                 b.velocity_y = vy;
@@ -739,7 +826,10 @@ impl ScriptEngine {
 
         let gav = self.lua.create_function(move |_, eid: u64| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_angular_velocity", eid);
+                return Ok(0.0);
+            };
             let v = world
                 .get::<&RigidBody>(entity)
                 .map(|b| b.angular_velocity)
@@ -750,7 +840,10 @@ impl ScriptEngine {
 
         let sav = self.lua.create_function(move |_, (eid, w): (u64, f32)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_angular_velocity", eid);
+                return Ok(());
+            };
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.angular_velocity = w;
                 b.sleeping = false;
@@ -762,7 +855,10 @@ impl ScriptEngine {
 
         let at = self.lua.create_function(move |_, (eid, torque): (u64, f32)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in apply_torque", eid);
+                return Ok(());
+            };
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.torque += torque;
                 b.sleeping = false;
@@ -774,7 +870,10 @@ impl ScriptEngine {
 
         let chj = self.lua.create_function(move |_, (eid, other, rest_length, stiffness): (u64, u64, f32, f32)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in create_hinge_joint", eid);
+                return Ok(());
+            };
             let Some(other) = Entity::from_bits(other) else { return Ok(()); };
             let _ = world.insert(
                 entity,
@@ -793,7 +892,10 @@ impl ScriptEngine {
         let cfj = self.lua.create_function(
             move |_, (eid, other, offset_x, offset_y, stiffness): (u64, u64, f32, f32, f32)| {
                 let world = unsafe { &mut *(world_ptr as *mut World) };
-                let entity = Entity::from_bits(eid).unwrap();
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in create_fixed_joint", eid);
+                    return Ok(());
+                };
                 let Some(other) = Entity::from_bits(other) else { return Ok(()); };
                 let _ = world.insert(
                     entity,
@@ -814,7 +916,10 @@ impl ScriptEngine {
         let csj = self.lua.create_function(
             move |_, (eid, other, rest_length, stiffness, damping): (u64, u64, f32, f32, f32)| {
                 let world = unsafe { &mut *(world_ptr as *mut World) };
-                let entity = Entity::from_bits(eid).unwrap();
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in create_spring_joint", eid);
+                    return Ok(());
+                };
                 let Some(other) = Entity::from_bits(other) else { return Ok(()); };
                 let _ = world.insert(
                     entity,
@@ -834,7 +939,10 @@ impl ScriptEngine {
 
         let crc = self.lua.create_function(move |_, (eid, other, max_length, stiffness): (u64, u64, f32, f32)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in create_rope_constraint", eid);
+                return Ok(());
+            };
             let Some(other) = Entity::from_bits(other) else { return Ok(()); };
             let _ = world.insert(
                 entity,
@@ -853,7 +961,10 @@ impl ScriptEngine {
         // apply_force(entity, fx, fy, fz) — adds to current velocity
         let af = self.lua.create_function(move |_, (eid, fx, fy, fz): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in apply_force", eid);
+                return Ok(());
+            };
             if let Ok(mut b) = world.get::<&mut RigidBody>(entity) {
                 b.velocity_x += fx;
                 b.velocity_y += fy;
@@ -866,7 +977,10 @@ impl ScriptEngine {
         // is_on_ground(entity) → bool
         let og = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in is_on_ground", eid);
+                return Ok(false);
+            };
             let g = world.get::<&RigidBody>(entity)
                 .map(|b| b.on_ground)
                 .unwrap_or(false);
@@ -881,7 +995,10 @@ impl ScriptEngine {
         // get_health(entity) → current, max
         let gh = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_health", eid);
+                return Ok((0i32, 0i32));
+            };
             match world.get::<&Health>(entity) {
                 Ok(h)  => Ok((h.current, h.max)),
                 Err(_) => Ok((0i32, 0i32)),
@@ -892,7 +1009,10 @@ impl ScriptEngine {
         // set_health(entity, current, max)
         let sh = self.lua.create_function(move |_, (eid, cur, max): (u64, i32, i32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_health", eid);
+                return Ok(());
+            };
             if let Ok(mut h) = world.get::<&mut Health>(entity) {
                 h.max     = max;
                 h.current = cur.clamp(0, max);
@@ -904,7 +1024,10 @@ impl ScriptEngine {
         // damage(entity, amount) — convenience: subtract from health
         let dmg = self.lua.create_function(move |_, (eid, amount): (u64, i32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in damage", eid);
+                return Ok(());
+            };
             if let Ok(mut h) = world.get::<&mut Health>(entity) {
                 h.current = (h.current - amount).max(0);
             }
@@ -915,7 +1038,10 @@ impl ScriptEngine {
         // is_dead(entity) → bool
         let id = self.lua.create_function(move |_, eid: u64| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in is_dead", eid);
+                return Ok(false);
+            };
             let dead = world.get::<&Health>(entity)
                 .map(|h| h.current <= 0)
                 .unwrap_or(false);
@@ -927,7 +1053,10 @@ impl ScriptEngine {
         // set_color(entity, r, g, b) — tint the entity this frame
         let sc = self.lua.create_function(move |_, (eid, r, g, b): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_color", eid);
+                return Ok(());
+            };
             if let Ok(mut rend) = world.get::<&mut Renderable>(entity) {
                 rend.color = [r, g, b];
             }
@@ -938,7 +1067,10 @@ impl ScriptEngine {
         // set_scale(entity, sx, sy, sz)
         let ss = self.lua.create_function(move |_, (eid, sx, sy, sz): (u64, f32, f32, f32)| {
             let world  = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_scale", eid);
+                return Ok(());
+            };
             if let Ok(mut rend) = world.get::<&mut Renderable>(entity) {
                 rend.scale = [sx, sy, sz];
             }
@@ -949,7 +1081,10 @@ impl ScriptEngine {
         // get_rotation(entity) -> pitch, yaw, roll
         let gr = self.lua.create_function(move |_, eid: u64| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_rotation", eid);
+                return Ok((0.0f32, 0.0f32, 0.0f32));
+            };
             match world.get::<&Rotation>(entity) {
                 Ok(r) => Ok((r.pitch, r.yaw, r.roll)),
                 Err(_) => Ok((0.0f32, 0.0f32, 0.0f32)),
@@ -960,7 +1095,10 @@ impl ScriptEngine {
         // set_rotation(entity, pitch, yaw, roll)
         let sr = self.lua.create_function(move |_, (eid, p, y, r): (u64, f32, f32, f32)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_rotation", eid);
+                return Ok(());
+            };
             if let Ok(mut rot) = world.get::<&mut Rotation>(entity) {
                 rot.pitch = p;
                 rot.yaw = y;
@@ -977,7 +1115,10 @@ impl ScriptEngine {
             .lua
             .create_function(move |_, (eid, metallic, roughness, ao): (u64, f32, f32, f32)| {
                 let world = unsafe { &mut *(world_ptr as *mut World) };
-                let entity = Entity::from_bits(eid).unwrap();
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_material", eid);
+                    return Ok(());
+                };
                 if let Ok(mut rend) = world.get::<&mut Renderable>(entity) {
                     rend.metallic = metallic.clamp(0.0, 1.0);
                     rend.roughness = roughness.clamp(0.02, 1.0);
@@ -990,7 +1131,10 @@ impl ScriptEngine {
         // get_texture_path(entity) / set_texture_path(entity, path)
         let gtp = self.lua.create_function(move |_, eid: u64| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_texture_path", eid);
+                return Ok(String::new());
+            };
             let path = world
                 .get::<&MaterialTexture>(entity)
                 .map(|t| t.path.clone())
@@ -1000,7 +1144,10 @@ impl ScriptEngine {
         globals.set("get_texture_path", gtp)?;
         let stp = self.lua.create_function(move |_, (eid, path): (u64, String)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_texture_path", eid);
+                return Ok(());
+            };
             if let Ok(mut t) = world.get::<&mut MaterialTexture>(entity) {
                 t.path = path;
             } else {
@@ -1052,7 +1199,10 @@ impl ScriptEngine {
         // has_component(entity, name) — lightweight reflection helper.
         let hc = self.lua.create_function(move |_, (eid, name): (u64, String)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in has_component", eid);
+                return Ok(false);
+            };
             let has = match name.as_str() {
                 "Position" => world.get::<&Position>(entity).is_ok(),
                 "RigidBody" => world.get::<&RigidBody>(entity).is_ok(),
@@ -1074,7 +1224,10 @@ impl ScriptEngine {
 
         let gc = self.lua.create_function(move |lua, (eid, name): (u64, String)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in get_component", eid);
+                return Ok(None);
+            };
             let table = lua.create_table()?;
             let found = match name.as_str() {
                 "Position" => {
@@ -1191,7 +1344,10 @@ impl ScriptEngine {
 
         let sc = self.lua.create_function(move |_, (eid, name, data): (u64, String, LuaTable)| {
             let world = unsafe { &mut *(world_ptr as *mut World) };
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_component", eid);
+                return Ok(false);
+            };
             let ok = match name.as_str() {
                 "Position" => {
                     if let Ok(mut c) = world.get::<&mut Position>(entity) {
@@ -1310,7 +1466,10 @@ impl ScriptEngine {
         // destroy(entity) — deferred removal, processed after scripting_system.
         let destroys_ptr = self.pending_destroys.get() as usize;
         let df = self.lua.create_function(move |_, eid: u64| {
-            let entity = Entity::from_bits(eid).unwrap();
+            let Some(entity) = Entity::from_bits(eid) else {
+                tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in destroy", eid);
+                return Ok(());
+            };
             let destroys = unsafe { &mut *(destroys_ptr as *mut Vec<Entity>) };
             destroys.push(entity);
             Ok(())
@@ -1386,6 +1545,42 @@ impl ScriptEngine {
             Ok(())
         })?;
         globals.set("look_at", lka)?;
+        // get_camera_direction() -> dx, dy, dz (normalised).
+        let cam_dir_copy = camera_target_copy;
+        let cam_pos_dir = camera_pos_copy;
+        let gcd = self.lua.create_function(move |_, ()| {
+            let dir = glam::Vec3::from_array(cam_dir_copy) - glam::Vec3::from_array(cam_pos_dir);
+            let dir = dir.normalize_or_zero();
+            Ok((dir.x, dir.y, dir.z))
+        })?;
+        globals.set("get_camera_direction", gcd)?;
+        // screen_to_ray(screen_x, screen_y) -> ox, oy, oz, dx, dy, dz
+        // Converts 2D screen pixel coords to a world-space ray.
+        let cam_pos_ray = camera_pos_copy;
+        let cam_tgt_ray = camera_target_copy;
+        let sw = screen_w;
+        let sh = screen_h;
+        let fov_r = fov_degrees;
+        let str_fn = self.lua.create_function(move |_, (sx, sy): (f32, f32)| {
+            let aspect = sw / sh.max(1.0);
+            let view = glam::Mat4::look_at_rh(
+                glam::Vec3::from_array(cam_pos_ray),
+                glam::Vec3::from_array(cam_tgt_ray),
+                glam::Vec3::Y,
+            );
+            let proj = glam::Mat4::perspective_rh(fov_r.to_radians(), aspect, 0.1, 1000.0);
+            let vp = proj * view;
+            let inv_vp = vp.inverse();
+            let ndc_x = (2.0 * sx / sw) - 1.0;
+            let ndc_y = 1.0 - (2.0 * sy / sh);
+            let near4 = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+            let far4  = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+            let near3 = near4.xyz() / near4.w;
+            let far3  = far4.xyz() / far4.w;
+            let dir = (far3 - near3).normalize_or_zero();
+            Ok((near3.x, near3.y, near3.z, dir.x, dir.y, dir.z))
+        })?;
+        globals.set("screen_to_ray", str_fn)?;
         // skip_next_frames(n) asks runtime to skip simulation for N frames.
         let skip_ptr = self.pending_frame_skip.get() as usize;
         let sk = self.lua.create_function(move |_, n: u32| {
@@ -1677,7 +1872,10 @@ impl ScriptEngine {
                     }
 
                     // Insert an AiAgent component on the entity.
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.assign", eid);
+                        return Ok(());
+                    };
                     let _ = world.insert(entity, (AiAgent::new(&tree_name),));
 
                     // Inject patrol waypoints into the entity's blackboard.
@@ -1703,7 +1901,10 @@ impl ScriptEngine {
             let bt_set_bb = self.lua.create_function(
                 move |_, (eid, key, value): (u64, String, bool)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.set_blackboard", eid);
+                        return Ok(());
+                    };
                     if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
                         agent.blackboard.set(&key, BlackboardValue::Bool(value));
                     }
@@ -1718,7 +1919,10 @@ impl ScriptEngine {
             let bt_get_bb = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.get_blackboard", eid);
+                        return Ok(false);
+                    };
                     let result = world
                         .get::<&AiAgent>(entity)
                         .ok()
@@ -1735,7 +1939,10 @@ impl ScriptEngine {
             let bt_set_bb_vec3 = self.lua.create_function(
                 move |_, (eid, key, x, y, z): (u64, String, f32, f32, f32)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.set_blackboard_vec3", eid);
+                        return Ok(());
+                    };
                     if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
                         agent
                             .blackboard
@@ -1752,7 +1959,10 @@ impl ScriptEngine {
             let bt_get_bb_vec3 = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.get_blackboard_vec3", eid);
+                        return Ok((0.0f32, 0.0f32, 0.0f32));
+                    };
                     let v = world
                         .get::<&AiAgent>(entity)
                         .ok()
@@ -1769,7 +1979,10 @@ impl ScriptEngine {
             let bt_set_bb_float = self.lua.create_function(
                 move |_, (eid, key, value): (u64, String, f32)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.set_blackboard_float", eid);
+                        return Ok(());
+                    };
                     if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
                         agent
                             .blackboard
@@ -1786,7 +1999,10 @@ impl ScriptEngine {
             let bt_get_bb_float = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
                     let world = unsafe { &mut *(wp as *mut World) };
-                    let entity = Entity::from_bits(eid).unwrap();
+                    let Some(entity) = Entity::from_bits(eid) else {
+                        tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.get_blackboard_float", eid);
+                        return Ok(0.0);
+                    };
                     let result = world
                         .get::<&AiAgent>(entity)
                         .ok()
@@ -1796,6 +2012,28 @@ impl ScriptEngine {
                 },
             )?;
             bt_table.set("get_blackboard_float", bt_get_bb_float)?;
+
+            // bt.set_state(entity, state_name)
+            // Convenience: writes "ai_state" = state_name to the entity's blackboard.
+            // This triggers the animation blending system to crossfade to the new clip.
+            // Example: bt.set_state(player, "walk")
+            {
+                let wp = world_ptr;
+                let bt_set_state = self.lua.create_function(
+                    move |_, (eid, state_name): (u64, String)| {
+                        let world = unsafe { &mut *(wp as *mut World) };
+                        let Some(entity) = Entity::from_bits(eid) else {
+                            tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in bt.set_state", eid);
+                            return Ok(());
+                        };
+                        if let Ok(mut agent) = world.get::<&mut AiAgent>(entity) {
+                            agent.blackboard.set("ai_state", BlackboardValue::String(state_name));
+                        }
+                        Ok(())
+                    },
+                )?;
+                bt_table.set("set_state", bt_set_state)?;
+            }
 
             globals.set("bt", bt_table)?;
         }

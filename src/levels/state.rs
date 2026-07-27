@@ -21,7 +21,7 @@ use std::collections::HashMap;
 ///
 /// Stored in WorldStateManager and consulted when re-loading a level
 /// to determine if an entity should be modified from its default state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityState {
     /// The entity's name (matches SceneMeta.name from the .scene file).
     pub entity_name: String,
@@ -41,6 +41,7 @@ pub struct EntityState {
 ///
 /// Keyed by level name, then by entity name within that level.
 /// Call save_entity() before unloading, get_entity() when reloading.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorldStateManager {
     /// level_name → list of entity states for that level.
     states: HashMap<String, Vec<EntityState>>,
@@ -113,6 +114,18 @@ impl WorldStateManager {
         self.get_entity(level_name, entity_name)?
             .custom_flags.get(key)
             .map(|s| s.as_str())
+    }
+
+    /// Save the entire state manager to a JSON file.
+    pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Load a state manager from a JSON file.
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 }
 

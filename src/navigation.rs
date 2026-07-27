@@ -1,4 +1,5 @@
 use crate::terrain::TerrainGrid;
+use crate::terrain::TerrainWorld;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -36,6 +37,25 @@ impl NavGrid {
                 let wz = z as f32 * terrain.cell_size - (self.depth as f32 * 0.5);
                 let slope = terrain.sample_slope_world(wx, wz);
                 self.walkable[z * self.width + x] = slope <= self.max_slope;
+            }
+        }
+        self.contour_edges = self.extract_contours();
+        self.region_count = self.count_regions();
+    }
+
+    pub fn rebuild_from_heights(&mut self, tw: &TerrainWorld) {
+        let width = tw.grid.total_width;
+        let depth = tw.grid.total_depth;
+        self.width = width;
+        self.depth = depth;
+        self.walkable.resize(width * depth, true);
+        for z in 0..depth {
+            for x in 0..width {
+                let wx = x as f32 * tw.cell_size - (width as f32 * tw.cell_size * 0.5);
+                let wz = z as f32 * tw.cell_size - (depth as f32 * tw.cell_size * 0.5);
+                let h = tw.height_at(wx, wz);
+                let slope = tw.slope_at(wx, wz);
+                self.walkable[z * width + x] = h < 2.0 && slope < self.max_slope;
             }
         }
         self.contour_edges = self.extract_contours();

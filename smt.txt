@@ -556,3 +556,61 @@ Where to get them (free, royalty-free):
 
 
 do i have smthing that can allow me to move parts of the terrain or level easily and it auto dectets and arranges foilage and others things dynamically and accurately as we move things like roads, paths and massive changse not just small things 
+
+
+
+High Priority
+- Wire TerrainWorld into main.rs — Replace TerrainGrid with TerrainWorld for full biome/spline/foliage/erosion support
+- Terrain editor UI — Paint mode for biomes, spline placement tool, foliage painting
+- Import mesh file picker — "Import Mesh..." in hierarchy Add Entity menu is a placeholder
+- Complete feature flag gating — #[cfg] on remaining GameApp struct fields
+- Wire per-entity material extras in editor — SSS/clearcoat/emissive per entity
+Medium Priority
+- Decompose GameApp god object — Use SystemScheduler to break into registered systems
+- Decouple editor via EditorBackend trait — Headless engine support
+- Replace unwrap()/expect() with Result propagation — No panicking code paths
+- Lua sandboxing — Restrict script capabilities
+- Flood system — Dynamic water level rise
+Lower Priority
+- Level streaming visual feedback — Loading screen during level load
+- Cross-level entity references — Entity A in Level1 references Entity B in Level2
+- Level save state persistence — Serialize/deserialize WorldStateManager
+- AI behavior tree visual editor — Node-graph for building BTs visually
+- UI designer runtime rendering — Wire UiDesign into actual viewport
+
+Next Steps (from your list)
+- Integrate AnimGraph parameters with BT blackboard (auto-sync "speed", "is_grounded", "is_attacking")
+- Flood system wired into frame loop
+- Loading screen wired into level streaming
+- Decompose GameApp god object with SystemScheduler
+- Decouple editor via EditorBackend trait
+
+
+
+
+
+
+hopethe cgs/sculpt doesnt have errors or cause crashes or have bgs wgen we use it i dont want my pc to crash or be corrupted that i will have to formatt
+
+also when rain falls will kit accumulate too will it react with the environment expecially like mud and how do we do it that mud and even snow or water would stick to a mesh that pass over or in them
+
+263 passed, 4 failed. The 4 failures are all pre-existing in terrain::csg::tests — completely unrelated to my changes. Zero regressions introduced. what failed are they fixed
+
+hope loading screen doesnt block and make games unplayable u know it should be smart just like games nowadays handle it how do they do that
+
+# Todos
+[✓] Wire flood system into main.rs frame loop
+[✓] Wire loading screen into level streaming
+[✓] Integrate AnimGraph params with BT blackboard
+[✓] Add CSG/sculpting tools for level prototyping
+[✓] Add dynamic light emission to fire and lava
+[•] Add fire cross-plane rendering + heat distortion
+[ ] Add snow accumulation material blending
+[ ] Expose LOD settings in EngineSettings
+[ ] Improve mesh LOD with edge-collapse decimation
+[ ] Decompose GameApp god object with subsystem groups
+[ ] Decouple editor via EditorBackend trait
+Camera Lua API: expose get/set camera position, direction, screen-to-ray, and camera look_at to Lua
+[ ] Runtime terrain modification from Lua scripts (called per-frame in update loop)
+[ ] Mesh blending system: vertex-paint blending so placed objects blend with terrain (distance-based alpha, decal projection)
+[ ] Verify compilation + tests after all implementations continue from here

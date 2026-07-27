@@ -16,6 +16,7 @@
 
 pub mod biome;
 pub mod chunk;
+pub mod csg;
 pub mod erosion;
 pub mod foliage;
 pub mod spline;
@@ -325,10 +326,13 @@ pub struct TerrainWorld {
     /// Erosion state for incremental simulation.
     pub erosion: TerrainErosionState,
 
+    /// Auto-surface material blend settings.
+    pub material: TerrainMaterialProfile,
+
     /// Grid dimensions for erosion state allocation.
     width: usize,
     depth: usize,
-    cell_size: f32,
+    pub cell_size: f32,
 }
 
 impl TerrainWorld {
@@ -356,6 +360,7 @@ impl TerrainWorld {
                 max_attempts: 30,
                 random_seed: 0,
             },
+            material: TerrainMaterialProfile::default(),
             layers: Self::default_layers(),
             erosion,
             width,
@@ -413,6 +418,13 @@ impl TerrainWorld {
     /// Sample slope at a world position.
     pub fn slope_at(&self, world_x: f32, world_z: f32) -> f32 {
         sample_slope(&self.grid, world_x, world_z)
+    }
+
+    /// Compute auto-surface color using height/slope material blending.
+    pub fn auto_surface_color_world(&self, world_x: f32, world_z: f32) -> [f32; 3] {
+        let h = self.height_at(world_x, world_z);
+        let slope = self.slope_at(world_x, world_z);
+        self.material.blend_color(h, slope)
     }
 
     /// Evaluate biome at a world position — returns splatting weights for up to 4 layers.

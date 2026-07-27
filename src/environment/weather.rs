@@ -116,6 +116,21 @@ pub struct WeatherState {
     pub cloud_coverage: f32,
     /// Transition speed (0 = instant, 1 = 10-second blend).
     pub transition_speed: f32,
+    /// Snow accumulation on surfaces (0 = no snow, 1 = fully covered).
+    /// Builds over time during snowfall, melts when temperature rises above 0C.
+    pub snow_coverage: f32,
+    /// Snow accumulation rate (how fast snow builds up per second).
+    pub snow_accumulation_rate: f32,
+    /// Snow melt rate (how fast snow melts when temperature > 0C).
+    pub snow_melt_rate: f32,
+    /// Snow depth in centimetres (visual height of accumulated snow on surfaces).
+    pub snow_depth: f32,
+    /// Snow surface roughness (0 = smooth, 1 = wind-sculpted drifts).
+    pub snow_roughness: f32,
+    /// Wind-driven snow drift factor (0 = flat accumulation, 1 = heavy drifts).
+    pub snow_drift_factor: f32,
+    /// Snow sparkle intensity (specular highlights on ice crystals).
+    pub snow_sparkle: f32,
 }
 
 impl Default for WeatherState {
@@ -128,6 +143,13 @@ impl Default for WeatherState {
             temperature: 20.0,
             cloud_coverage: 0.2,
             transition_speed: 0.3,
+            snow_coverage: 0.0,
+            snow_accumulation_rate: 0.05,
+            snow_melt_rate: 0.03,
+            snow_depth: 0.0,
+            snow_roughness: 0.4,
+            snow_drift_factor: 0.3,
+            snow_sparkle: 0.5,
         }
     }
 }
@@ -147,9 +169,22 @@ impl WeatherState {
         self.temperature = lerp(self.temperature, target.temperature, t);
         self.cloud_coverage = lerp(self.cloud_coverage, target.cloud_coverage, t);
         self.wind_direction = self.wind_direction.lerp(target.wind_direction, t);
+        self.snow_roughness = lerp(self.snow_roughness, target.snow_roughness, t);
+        self.snow_drift_factor = lerp(self.snow_drift_factor, target.snow_drift_factor, t);
+        self.snow_sparkle = lerp(self.snow_sparkle, target.snow_sparkle, t);
         // Condition snaps when intensity is close to target.
         if (self.intensity - target.intensity).abs() < 0.05 {
             self.condition = target.condition;
+        }
+        // Snow accumulation: builds during snowfall, melts when above 0C.
+        if self.condition.is_snow() && self.intensity > 0.1 {
+            let accumulation = self.snow_accumulation_rate * self.intensity * dt;
+            self.snow_coverage = (self.snow_coverage + accumulation).min(1.0);
+            self.snow_depth = self.snow_depth + accumulation * 30.0; // 30cm per full coverage
+        } else if self.temperature > 0.0 {
+            let melt_factor = self.snow_melt_rate * (self.temperature / 20.0).min(1.0) * dt;
+            self.snow_coverage = (self.snow_coverage - melt_factor).max(0.0);
+            self.snow_depth = (self.snow_depth - melt_factor * 30.0).max(0.0);
         }
     }
 
@@ -233,6 +268,13 @@ impl WeatherState {
             cloud_coverage: 0.85,
             wind_strength: 3.0,
             temperature: -5.0,
+            snow_coverage: 0.0,
+            snow_accumulation_rate: 0.08,
+            snow_melt_rate: 0.02,
+            snow_depth: 0.0,
+            snow_roughness: 0.5,
+            snow_drift_factor: 0.4,
+            snow_sparkle: 0.6,
             ..Default::default()
         }
     }
@@ -303,7 +345,29 @@ mod tests {
     #[test]
     fn uniform_data_size() {
         let w = WeatherState::default();
-        let data = w.to_uniform_data();
+        let _data = w.to_uniform_data();
         assert_eq!(std::mem::size_of::<WeatherUniformData>(), 32);
+    }
+
+    #[test]
+    fn snow_coverage_derived_from_condition_and_intensity() {
+        let w = WeatherState::snowy();
+        let snow_coverage = if w.condition.is_snow() { w.intensity } else { 0.0 };
+        assert!((snow_coverage - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn snow_coverage_zero_for_non_snow() {
+        let w = WeatherState::rainy();
+        let snow_coverage = if w.condition.is_snow() { w.intensity } else { 0.0 };
+        assert_eq!(snow_coverage, 0.0);
+    }
+
+    #[test]
+    fn snow_coverage_scales_with_intensity() {
+        let mut w = WeatherState::snowy();
+        w.intensity = 0.3;
+        let snow_coverage = if w.condition.is_snow() { w.intensity } else { 0.0 };
+        assert!((snow_coverage - 0.3).abs() < 0.01);
     }
 }

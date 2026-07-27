@@ -166,7 +166,7 @@ impl ShaderManager {
         let dir = dir.as_ref().to_path_buf();
         let (tx, rx) = mpsc::channel::<PathBuf>();
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 for path in event.paths {
                     if path.extension().and_then(|e| e.to_str()) == Some("wgsl") {
@@ -174,8 +174,13 @@ impl ShaderManager {
                     }
                 }
             }
-        })
-        .expect("Failed to create shader watcher");
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("[ShaderManager] Failed to create shader watcher: {}", e);
+                return;
+            }
+        };
 
         watcher
             .watch(&dir, RecursiveMode::Recursive)

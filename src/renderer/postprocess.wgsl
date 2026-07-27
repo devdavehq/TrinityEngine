@@ -190,6 +190,48 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Heat Distortion (fire / lava shimmer)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Screen-space UV distortion driven by a distortion texture rendered during
+// the transparent pass.  Fire and lava entities write their screen-space UV
+// and intensity into this texture; this pass warps the scene behind them.
+//
+// Bindings:
+// Group(0): t_src = scene colour, s_src = sampler.
+// Group(1): heat distortion data.
+@group(1) @binding(0) var t_distortion: texture_2d<f32>;
+@group(1) @binding(1) var s_distortion: sampler;
+
+struct HeatDistortionUniforms {
+    strength:   f32,   // overall distortion magnitude (0.002–0.01 typical)
+    time:       f32,   // elapsed time for animated noise
+    noise_scale: f32,  // frequency of the distortion noise
+    _pad:       f32,
+};
+@group(1) @binding(2) var<uniform> heat: HeatDistortionUniforms;
+
+fn heat_hash(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, vec3<f32>(p3.y + 33.33, p3.z + 33.33, p3.x + 33.33));
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+@fragment
+fn fs_heat_distortion(in: VsOut) -> @location(0) vec4<f32> {
+    let distortion = textureSample(t_distortion, s_distortion, in.uv).rg;
+    let intensity = distortion.r;
+    if (intensity < 0.001) {
+        return textureSample(t_src, s_src, in.uv);
+    }
+    let t = heat.time;
+    let ns = heat.noise_scale;
+    let noise_x = (heat_hash(in.uv * ns + vec2<f32>(t * 0.7, t * 0.3)) - 0.5) * 2.0;
+    let noise_y = (heat_hash(in.uv * ns + vec2<f32>(-t * 0.5, t * 0.9)) - 0.5) * 2.0;
+    let offset = vec2<f32>(noise_x, noise_y) * heat.strength * intensity;
+    return textureSample(t_src, s_src, in.uv + offset);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Screen-Space Reflections (SSR)
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hierarchical-Z ray marching in screen space.
@@ -684,4 +726,121 @@ fn fs_god_rays(in: VsOut) -> @location(0) vec4<f32> {
     // Add god rays to the original scene.
     let result = scene + ray_color * godray.intensity;
     return vec4<f32>(result, 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Underwater Post-Processing
+// ═══════════════════════════════════════════════════════════════════════════════
+// Applied when the camera is below the waterline.
+// Effects:
+//   - Depth-based fog tint (darker blue-green with distance)
+//   - Caustic light patterns (animated projected noise)
+//   - God rays from surface
+//   - Chromatic aberration / distortion
+//   - Vignette darkening at edges
+//
+// Bindings:
+// Group(0): t_src = scene colour, s_src = sampler.
+// Group(1): underwater uniforms + depth.
+
+struct UnderwaterUniforms {
+    tint:             vec4<f32>,  // rgb = water tint, a = fog density
+    caustics:         vec4<f32>,  // x = intensity, y = scale, z = speed, w = god_rays
+    distortion:       vec4<f32>,  // x = distortion strength, y = time, z = vignette, w = bloom
+    camera_params:    vec4<f32>,  // x = water_surface_y, y = camera_depth_below, z = near, w = far
+}
+@group(1) @binding(0) var t_uw_depth: texture_depth_2d;
+@group(1) @binding(1) var s_uw:       sampler;
+@group(1) @binding(2) var<uniform> uw: UnderwaterUniforms;
+
+// Procedural caustic pattern — Voronoi-based for realistic light caustics.
+fn caustic_voronoi(uv: vec2<f32>, time: f32) -> f32 {
+    let cell = floor(uv);
+    let frac = fract(uv);
+    var min_dist = 1.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let neighbor = vec2<f32>(f32(x), f32(y));
+            let cell_id = cell + neighbor;
+            // Animated random point inside each cell.
+            let rnd = fract(sin(dot(cell_id, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+            let rnd2 = fract(sin(dot(cell_id, vec2<f32>(93.989, 67.345))) * 24634.6345);
+            let point = neighbor + 0.5 + 0.5 * vec2<f32>(
+                sin(time * 0.8 + rnd * 6.283),
+                cos(time * 0.6 + rnd2 * 6.283)
+            ) - frac;
+            let dist = length(point);
+            min_dist = min(min_dist, dist);
+        }
+    }
+    return min_dist;
+}
+
+@fragment
+fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
+    var color = textureSample(t_src, s_src, in.uv).rgb;
+    let depth = textureSampleDepth(t_uw_depth, s_uw, in.uv);
+
+    // ── Depth-based fog tint ──────────────────────────────────────────────
+    // Exponential fog: objects farther from camera fade into the tint color.
+    let linear_depth = depth * uw.camera_params.w;
+    let fog_factor = 1.0 - exp(-linear_depth * uw.tint.a);
+    color = mix(color, uw.tint.rgb, clamp(fog_factor, 0.0, 0.85));
+
+    // ── Caustic light patterns ────────────────────────────────────────────
+    // Two layers of Voronoi caustics at different scales/speeds projected
+    // onto the scene from above, giving realistic underwater light ripples.
+    if (uw.caustics.x > 0.001) {
+        let t = uw.distortion.y;
+        let sc = uw.caustics.y;
+        let uv_world = in.uv * sc;
+        let caustic_1 = caustic_voronoi(uv_world + vec2<f32>(t * 0.1, t * 0.07), t * uw.caustics.z);
+        let caustic_2 = caustic_voronoi(uv_world * 1.4 + vec2<f32>(-t * 0.08, t * 0.12), t * uw.caustics.z * 0.7);
+        let caustic_combined = (caustic_1 + caustic_2) * 0.5;
+        // Sharp caustic lines — darken valleys, brighten peaks.
+        let caustic_mask = pow(1.0 - caustic_combined, 3.0) * uw.caustics.x;
+        // Caustics fade with depth (less light at depth).
+        let caustic_fade = exp(-linear_depth * 0.05);
+        let caustic_color = vec3<f32>(0.3, 0.7, 0.9) * caustic_mask * caustic_fade;
+        color += caustic_color;
+    }
+
+    // ── God rays from water surface ───────────────────────────────────────
+    // Simple vertical gradient: brighter toward the surface.
+    if (uw.caustics.w > 0.001) {
+        let surface_fade = 1.0 - clamp(in.uv.y * 2.0, 0.0, 1.0);
+        let ray_contribution = surface_fade * uw.caustics.w * 0.3;
+        color += vec3<f32>(0.2, 0.4, 0.5) * ray_contribution;
+    }
+
+    // ── Chromatic aberration / distortion ─────────────────────────────────
+    if (uw.distortion.x > 0.001) {
+        let t = uw.distortion.y;
+        let strength = uw.distortion.x;
+        let wave = vec2<f32>(
+            sin(in.uv.y * 12.0 + t * 2.0) * strength,
+            cos(in.uv.x * 10.0 + t * 1.5) * strength * 0.7
+        );
+        let r = textureSample(t_src, s_src, in.uv + wave * 1.0).r;
+        let g = textureSample(t_src, s_src, in.uv).g;
+        let b = textureSample(t_src, s_src, in.uv - wave * 1.0).b;
+        color = vec3<f32>(r, g, b);
+        // Re-apply depth fog to the aberrated sample.
+        color = mix(color, uw.tint.rgb, clamp(fog_factor, 0.0, 0.85));
+    }
+
+    // ── Vignette ──────────────────────────────────────────────────────────
+    if (uw.distortion.z > 0.001) {
+        let vig_uv = in.uv * 2.0 - 1.0;
+        let vig = 1.0 - dot(vig_uv, vig_uv) * uw.distortion.z * 0.5;
+        color *= clamp(vig, 0.0, 1.0);
+    }
+
+    // ── Bloom boost ───────────────────────────────────────────────────────
+    if (uw.distortion.w > 0.001) {
+        let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        color += color * luma * uw.distortion.w * 0.3;
+    }
+
+    return vec4<f32>(color, 1.0);
 }

@@ -12,10 +12,12 @@ pub mod loader;
 pub mod prefab;
 pub mod subscene;
 pub mod transition;
+pub mod diff;
 pub use loader::parse_scene;
 pub use prefab::{Prefab, PrefabRegistry};
 pub use subscene::SubSceneManager;
 pub use transition::SceneTransition;
+pub use diff::{SceneDiff, diff_entities, diff_materials, AssetFingerprint};
 
 use crate::assets::{AssetStore, Handle, Mesh};
 use crate::components::{Position, Renderable, Rotation, Script, SceneMeta, RigidBody, PointLight};

@@ -1,6 +1,6 @@
-// src/levels/mod.rs
+// src/levels.rs
 // ──────────────────────────────────────────────────────────────────────────────
-// Level system module for TrinityEngine.
+// Level system for TrinEngine.
 //
 // A "level" (or sub-level) is a collection of entities loaded from a .scene
 // file that coexist in the game world alongside other levels. Multiple levels
@@ -18,8 +18,12 @@ pub mod level;
 pub mod streaming;
 pub mod portal;
 pub mod state;
+pub mod cross_ref;
+pub mod loading_screen;
 
 pub use level::*;
 pub use streaming::*;
 pub use portal::*;
 pub use state::*;
+pub use cross_ref::*;
+pub use loading_screen::*;

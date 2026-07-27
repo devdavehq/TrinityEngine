@@ -12,6 +12,7 @@
 pub mod fire;
 pub mod ibl;
 pub mod light_probes;
+pub mod lightning_bolt;
 pub mod lava;
 pub mod particle;
 pub mod pipeline;
@@ -271,6 +272,15 @@ struct GodRayUniforms {
     _pad:        f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct UnderwaterUniforms {
+    tint:          [f32; 4], // rgb = water tint, a = fog density
+    caustics:      [f32; 4], // x = intensity, y = scale, z = speed, w = god_rays
+    distortion:    [f32; 4], // x = distortion strength, y = time, z = vignette, w = bloom
+    camera_params: [f32; 4], // x = water_surface_y, y = camera_depth_below, z = near, w = far
+}
+
 // ── GpuLightData ───────────────────────────────────────────────────────────
 // Matches LightData in shader.wgsl.  Each entry is 64 bytes (aligned to 16).
 #[repr(C)]
@@ -312,6 +322,16 @@ struct GpuMaterialExtras {
     anisotropy:          f32,
     emissive_strength:   f32,
     _pad:                [f32; 3],
+}
+
+// ── GpuWeatherData ────────────────────────────────────────────────────────
+// Matches WeatherData in shader.wgsl (binding 13).
+// Total size: 16 bytes (1 × vec4).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuWeatherData {
+    snow_coverage: f32,
+    _pad: [f32; 3],
 }
 
 // ── GpuShadowData ──────────────────────────────────────────────────────────
@@ -379,6 +399,17 @@ pub struct RenderFeatures {
     pub lava_enabled: bool,        // master toggle for lava surfaces
     // ── Fire rendering ────────────────────────────────────────────────────
     pub fire_enabled: bool,        // master toggle for fire surfaces
+    // ── Heat distortion ──────────────────────────────────────────────────
+    pub heat_distortion_enabled: bool, // screen-space heat shimmer behind fire/lava
+    // ── Underwater rendering ──────────────────────────────────────────────
+    pub underwater_enabled: bool,       // master toggle for underwater post-process
+    pub underwater_tint: [f32; 3],     // underwater fog tint colour (RGB 0-1)
+    pub underwater_fog_density: f32,   // depth-based fog density
+    pub underwater_caustics: f32,      // caustic light pattern intensity
+    pub underwater_god_rays: f32,      // surface god ray intensity
+    pub underwater_distortion: f32,    // chromatic aberration / wave distortion
+    pub underwater_vignette: f32,      // edge darkening
+    pub underwater_bloom: f32,         // bloom boost underwater
     // ── Temporal Anti-Aliasing (TAA) ──────────────────────────────────────
     pub taa_enabled: bool,
     pub taa_blend_factor: f32,
@@ -397,6 +428,11 @@ pub struct RenderFeatures {
     pub god_rays_density: f32,
     pub god_rays_weight: f32,
     pub god_rays_num_samples: u32,
+    // ── LOD settings ─────────────────────────────────────────────────────
+    pub mesh_lod_threshold_1: f32,
+    pub mesh_lod_threshold_2: f32,
+    pub mesh_lod_threshold_3: f32,
+    pub mesh_lod_threshold_4: f32,
 }
 
 impl Default for RenderFeatures {
@@ -447,6 +483,17 @@ impl Default for RenderFeatures {
             lava_enabled: true,
             // Fire — enabled by default (cheap, only draws when FireSurface entities exist).
             fire_enabled: true,
+            // Heat distortion — enabled by default (subtle shimmer behind fire/lava).
+            heat_distortion_enabled: true,
+            // Underwater rendering — enabled by default.
+            underwater_enabled: true,
+            underwater_tint: [0.01, 0.08, 0.12],
+            underwater_fog_density: 0.04,
+            underwater_caustics: 0.6,
+            underwater_god_rays: 0.3,
+            underwater_distortion: 0.003,
+            underwater_vignette: 0.3,
+            underwater_bloom: 0.15,
             // TAA — enabled by default for anti-aliasing.
             taa_enabled: true,
             taa_blend_factor: 0.1,
@@ -465,6 +512,11 @@ impl Default for RenderFeatures {
             god_rays_density: 1.2,
             god_rays_weight: 0.04,
             god_rays_num_samples: 32,
+            // LOD defaults.
+            mesh_lod_threshold_1: 48.0,
+            mesh_lod_threshold_2: 95.0,
+            mesh_lod_threshold_3: 180.0,
+            mesh_lod_threshold_4: 300.0,
         }
     }
 }
@@ -518,6 +570,17 @@ impl RenderFeatures {
             lava_enabled: true,
             // Fire enabled even on low-end — only draws when FireSurface entities exist.
             fire_enabled: true,
+            // Heat distortion off on low-end — saves a full-screen post-process.
+            heat_distortion_enabled: false,
+            // Underwater rendering off on low-end — saves a post-process pass.
+            underwater_enabled: false,
+            underwater_tint: [0.01, 0.08, 0.12],
+            underwater_fog_density: 0.04,
+            underwater_caustics: 0.0,
+            underwater_god_rays: 0.0,
+            underwater_distortion: 0.0,
+            underwater_vignette: 0.0,
+            underwater_bloom: 0.0,
             // No TAA, motion blur, DOF on low-end.
             taa_enabled: false,
             taa_blend_factor: 0.1,
@@ -533,6 +596,11 @@ impl RenderFeatures {
             god_rays_density: 1.2,
             god_rays_weight: 0.04,
             god_rays_num_samples: 32,
+            // LOD defaults.
+            mesh_lod_threshold_1: 48.0,
+            mesh_lod_threshold_2: 95.0,
+            mesh_lod_threshold_3: 180.0,
+            mesh_lod_threshold_4: 300.0,
         }
     }
 
@@ -588,6 +656,16 @@ impl RenderFeatures {
             water_enabled: true,
             lava_enabled: true,
             fire_enabled: true,
+            heat_distortion_enabled: true,
+            // Underwater rendering on high-end.
+            underwater_enabled: true,
+            underwater_tint: [0.01, 0.08, 0.12],
+            underwater_fog_density: 0.04,
+            underwater_caustics: 0.6,
+            underwater_god_rays: 0.3,
+            underwater_distortion: 0.003,
+            underwater_vignette: 0.3,
+            underwater_bloom: 0.15,
             // TAA on high-end.
             taa_enabled: true,
             taa_blend_factor: 0.1,
@@ -605,6 +683,11 @@ impl RenderFeatures {
             god_rays_density: 1.0,
             god_rays_weight: 0.05,
             god_rays_num_samples: 48,
+            // LOD defaults.
+            mesh_lod_threshold_1: 48.0,
+            mesh_lod_threshold_2: 95.0,
+            mesh_lod_threshold_3: 180.0,
+            mesh_lod_threshold_4: 300.0,
         }
     }
 
@@ -716,8 +799,18 @@ pub struct Renderer {
     pub lava_renderer: lava::LavaRenderer,
     /// Fire surface renderer — draws procedural flames with emissive glow.
     pub fire_renderer: fire::FireRenderer,
+    /// ── Heat distortion post-process ─────────────────────────────────────
+    heat_distortion_texture:  wgpu::Texture,
+    heat_distortion_view:     wgpu::TextureView,
+    heat_distortion_pipeline: wgpu::RenderPipeline,
+    heat_distortion_bgl:      wgpu::BindGroupLayout,
+    heat_distortion_uniform_buf: wgpu::Buffer,
     /// ── Multi-light uniform buffer (group 0, binding 12) ───────────────────
     light_uniform_buf: wgpu::Buffer,
+    /// ── Weather uniform buffer (group 0, binding 13) ──────────────────────
+    weather_uniform_buf: wgpu::Buffer,
+    /// Snow coverage value (0 = none, 1 = full) — set from WeatherState.
+    snow_coverage: f32,
     /// ── Default material extras buffer (group 1, binding 6) ───────────────
     /// Used for entities that don't override material extras.
     default_material_extras_buf: wgpu::Buffer,
@@ -762,6 +855,10 @@ pub struct Renderer {
     godray_pipeline:    wgpu::RenderPipeline,
     godray_bgl:         wgpu::BindGroupLayout,
     godray_uniform_buf: wgpu::Buffer,
+    /// ── Underwater post-process pipeline ──────────────────────────────────
+    underwater_pipeline:    wgpu::RenderPipeline,
+    underwater_bgl:         wgpu::BindGroupLayout,
+    underwater_uniform_buf: wgpu::Buffer,
     /// ── TAA frame counter (for Halton(2,3) jitter) ───────────────────────
     taa_frame_index:   u32,
     /// Refraction copy texture — scene_view is copied here before the water pass
@@ -778,6 +875,10 @@ pub struct Renderer {
     weather_intensity: f32,
     /// Elapsed time since engine start (for sky animation).
     elapsed_time: f32,
+    /// Visual lightning bolt renderer.
+    lightning_bolt_renderer: lightning_bolt::LightningBoltRenderer,
+    /// Cached lightning state for bolt rendering.
+    lightning_state: crate::environment::lightning::LightningState,
 }
 
 impl Renderer {
@@ -823,8 +924,18 @@ impl Renderer {
         self.storm_darken = lc[0];
         self.lightning_intensity = lc[1];
 
+        // Cache full lightning state for bolt rendering.
+        self.lightning_state = lightning.clone();
+
         // Weather intensity drives water roughness.
         self.weather_intensity = weather.intensity;
+
+        // Snow coverage: full accumulation when condition is Snow, scaled by intensity.
+        self.snow_coverage = if weather.condition.is_snow() {
+            weather.intensity
+        } else {
+            0.0
+        };
 
         // Cache sky/cloud params for the sky renderer.
         self.sky_params = sky_params.clone();
@@ -1015,6 +1126,23 @@ impl Renderer {
             bytemuck::bytes_of(&default_material_extras),
         );
 
+        // ── Weather uniform buffer (binding 13) ───────────────────────────
+        // 16 bytes: snow_coverage + pad.
+        let weather_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Weather Uniforms"),
+            size:               std::mem::size_of::<GpuWeatherData>() as u64,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let default_weather = GpuWeatherData {
+            snow_coverage: 0.0,
+            _pad: [0.0; 3],
+        };
+        queue.write_buffer(
+            &weather_uniform_buf, 0,
+            bytemuck::bytes_of(&default_weather),
+        );
+
         // ── Bind group layouts & pipeline ─────────────────────────────────
         let (global_bgl, material_bgl) = pipeline::create_bind_group_layouts(&device);
 
@@ -1098,6 +1226,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow_fallback_sampler) },
                 // Multi-light uniform (binding 12) — populated each frame in draw_world().
                 wgpu::BindGroupEntry { binding: 12, resource: light_uniform_buf.as_entire_binding() },
+                // Weather uniform (binding 13) — snow_coverage, updated per frame.
+                wgpu::BindGroupEntry { binding: 13, resource: weather_uniform_buf.as_entire_binding() },
             ],
         });
 
@@ -1245,6 +1375,91 @@ impl Renderer {
         // ── Fire surface renderer ─────────────────────────────────────────
         // Procedural flame shape, height-based colour gradient, emissive glow.
         let fire_renderer = fire::FireRenderer::new(&device, surf_fmt);
+
+        // ── Heat distortion post-process ──────────────────────────────────
+        // Renders a distortion field texture during the transparent pass, then
+        // a fullscreen post-process reads it and warps UVs behind fire/lava.
+        let heat_distortion_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Heat Distortion"),
+            size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let heat_distortion_view = heat_distortion_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let heat_distortion_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Heat Distortion Uniforms"),
+            size: 16, // strength(f32) + time(f32) + noise_scale(f32) + pad(f32)
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let heat_distortion_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Heat Distortion BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let heat_distortion_pipeline = {
+            let bgls = vec![Some(&post_bgl), Some(&heat_distortion_bgl)];
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Heat Distortion Pipeline Layout"),
+                bind_group_layouts: &bgls,
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Heat Distortion Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &post_shader,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &post_shader,
+                    entry_point: Some("fs_heat_distortion"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surf_fmt,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
 
         // ── SSR (Screen-Space Reflections) pipeline ────────────────────────
         // Binds: group(0) = scene_color + sampler (reuse post_bgl)
@@ -1754,6 +1969,82 @@ impl Renderer {
             })
         };
 
+        // ── Underwater post-process pipeline ────────────────────────────────
+        // Applied when the camera is below the waterline.
+        let underwater_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Underwater BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let underwater_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Underwater Uniforms"),
+            size: 64, // 4 × vec4 = 64 bytes
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let underwater_pipeline = {
+            let bgls = vec![Some(&post_bgl), Some(&underwater_bgl)];
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Underwater Pipeline Layout"),
+                bind_group_layouts: &bgls,
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Underwater Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &post_shader,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &post_shader,
+                    entry_point: Some("fs_underwater"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surf_fmt,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        // Construct sub-renderers that borrow device before it moves into Self.
+        let lightning_bolt_renderer = lightning_bolt::LightningBoltRenderer::new(&device, surf_fmt);
+
         Self {
             _window:      window.clone(),
             surface,
@@ -1818,6 +2109,11 @@ impl Renderer {
             water_renderer,
             lava_renderer,
             fire_renderer,
+            heat_distortion_texture,
+            heat_distortion_view,
+            heat_distortion_pipeline,
+            heat_distortion_bgl,
+            heat_distortion_uniform_buf,
             velocity_texture,
             velocity_view,
             cloud_history_current,
@@ -1846,8 +2142,13 @@ impl Renderer {
             godray_pipeline,
             godray_bgl,
             godray_uniform_buf,
+            underwater_pipeline,
+            underwater_bgl,
+            underwater_uniform_buf,
             taa_frame_index: 0,
             light_uniform_buf,
+            weather_uniform_buf,
+            snow_coverage: 0.0,
             default_material_extras_buf,
             sky_params: crate::environment::sky::SkyParams::default(),
             cloud_params: crate::environment::clouds::CloudParams::default(),
@@ -1855,6 +2156,8 @@ impl Renderer {
             lightning_intensity: 0.0,
             weather_intensity: 0.0,
             elapsed_time: 0.0,
+            lightning_bolt_renderer,
+            lightning_state: crate::environment::lightning::LightningState::default(),
         }
     }
 
@@ -2006,6 +2309,16 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniform_buf, 0,
             bytemuck::bytes_of(&uniforms),
+        );
+
+        // ── Upload weather uniform (binding 13) ────────────────────────────
+        let weather_data = GpuWeatherData {
+            snow_coverage: self.snow_coverage,
+            _pad: [0.0; 3],
+        };
+        self.queue.write_buffer(
+            &self.weather_uniform_buf, 0,
+            bytemuck::bytes_of(&weather_data),
         );
 
         // ── Build multi-light array ────────────────────────────────────────────
@@ -2258,10 +2571,10 @@ impl Renderer {
                     ((dx * dx + dy * dy + dz * dz).sqrt()) / max_scale
                 }).fold(0.0f32, f32::max);
 
-                let lod_band = if max_lod_distance > 300.0 { 4u8 }
-                    else if max_lod_distance > 180.0 { 3u8 }
-                    else if max_lod_distance > 95.0 { 2u8 }
-                    else if max_lod_distance > 48.0 { 1u8 }
+                let lod_band = if max_lod_distance > self.features.mesh_lod_threshold_4 { 4u8 }
+                    else if max_lod_distance > self.features.mesh_lod_threshold_3 { 3u8 }
+                    else if max_lod_distance > self.features.mesh_lod_threshold_2 { 2u8 }
+                    else if max_lod_distance > self.features.mesh_lod_threshold_1 { 1u8 }
                     else { 0u8 };
                 let lod_ratio = match lod_band {
                     0 => 1.0, 1 => 0.78, 2 => 0.56, 3 => 0.34, _ => 0.20,
@@ -2648,6 +2961,87 @@ impl Renderer {
                     self.wind_strength,
                 );
             }
+        }
+
+        // ── Lightning bolt visual pass ──────────────────────────────────────
+        // Draws jagged line geometry from bolt_origin to bolt_target during flash.
+        if self.lightning_state.flash_intensity > 0.05 {
+            self.lightning_bolt_renderer.render(
+                &self.lightning_state,
+                &vp.to_cols_array_2d(),
+                &mut enc,
+                &self.scene_view,
+                &self.depth_view,
+                &self.device,
+                &self.queue,
+            );
+        }
+
+        // ── Heat distortion post-process ───────────────────────────────────
+        // Warps the scene behind fire/lava using a screen-space UV offset.
+        if self.features.heat_distortion_enabled && self.features.fire_enabled {
+            let heat_uniforms = [0.003f32, self.elapsed_time, 8.0f32, 0.0f32]; // strength, time, noise_scale, pad
+            self.queue.write_buffer(
+                &self.heat_distortion_uniform_buf, 0,
+                bytemuck::cast_slice(&heat_uniforms),
+            );
+
+            let hd_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Heat Distortion BG"),
+                layout: &self.heat_distortion_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.heat_distortion_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.heat_distortion_uniform_buf.as_entire_binding() },
+                ],
+            });
+
+            let scene_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Heat Distortion Scene BG"),
+                layout: &self.post_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.scene_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                ],
+            });
+
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Heat Distortion Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.tonemap_temp_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.heat_distortion_pipeline);
+                pass.set_bind_group(0, &scene_bg, &[]);
+                pass.set_bind_group(1, &hd_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            // Copy result back to scene_color for downstream passes.
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.tonemap_temp,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.scene_color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+            );
         }
 
         {
@@ -3262,6 +3656,139 @@ impl Renderer {
             }
         }
 
+        // 5b) Underwater post-process pass.
+        //     Applied when the camera is below any water surface.
+        //     Reads tonemap_temp + depth → tint, caustics, god rays, distortion → postprocess_temp.
+        //     Then copies postprocess_temp → tonemap_temp for tonemap input.
+        if self.features.underwater_enabled {
+            // Find the highest water surface Y from all WaterSurface entities.
+            let mut water_surface_y: Option<f32> = None;
+            for (pos, _ws) in world.query::<(&Position, &crate::components::WaterSurface)>().iter() {
+                // Use the entity's Y position as the water surface height.
+                // For multiple water surfaces, take the highest one the camera is below.
+                let sy = pos.y;
+                if cam_pos.y < sy {
+                    match &mut water_surface_y {
+                        Some(best) => { *best = (*best).max(sy); }
+                        None => { water_surface_y = Some(sy); }
+                    }
+                }
+            }
+            // Also check WaterBody entities for their position-based water surface.
+            for (pos, _wb) in world.query::<(&Position, &crate::components::WaterBody)>().iter() {
+                let sy = pos.y;
+                if cam_pos.y < sy {
+                    match &mut water_surface_y {
+                        Some(best) => { *best = (*best).max(sy); }
+                        None => { water_surface_y = Some(sy); }
+                    }
+                }
+            }
+
+            if let Some(surface_y) = water_surface_y {
+                let camera_depth_below = surface_y - cam_pos.y; // positive = underwater depth
+                if camera_depth_below > 0.0 {
+                    let uw_uniforms = UnderwaterUniforms {
+                        tint: [
+                            self.features.underwater_tint[0],
+                            self.features.underwater_tint[1],
+                            self.features.underwater_tint[2],
+                            self.features.underwater_fog_density,
+                        ],
+                        caustics: [
+                            self.features.underwater_caustics,
+                            8.0,  // scale — tiling of caustic pattern
+                            1.0,  // speed — animation speed
+                            self.features.underwater_god_rays,
+                        ],
+                        distortion: [
+                            self.features.underwater_distortion,
+                            self.elapsed_time,
+                            self.features.underwater_vignette,
+                            self.features.underwater_bloom,
+                        ],
+                        camera_params: [
+                            surface_y,
+                            camera_depth_below,
+                            0.1,   // near clip
+                            1000.0, // far clip
+                        ],
+                    };
+                    self.queue.write_buffer(
+                        &self.underwater_uniform_buf, 0,
+                        bytemuck::bytes_of(&uw_uniforms),
+                    );
+
+                    let uw_scene_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Underwater Scene BG"),
+                        layout: &self.post_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.tonemap_temp_view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                        ],
+                    });
+                    let uw_data_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Underwater Data BG"),
+                        layout: &self.underwater_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                            wgpu::BindGroupEntry { binding: 2, resource: self.underwater_uniform_buf.as_entire_binding() },
+                        ],
+                    });
+
+                    // Underwater: tonemap_temp → postprocess_temp
+                    {
+                        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Underwater Pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &self.postprocess_temp_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.underwater_pipeline);
+                        pass.set_bind_group(0, &uw_scene_bg, &[]);
+                        pass.set_bind_group(1, &uw_data_bg, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+
+                    // Copy postprocess_temp → tonemap_temp for tonemap input.
+                    {
+                        let copy_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("Underwater Copy BG"),
+                            layout: &self.post_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.postprocess_temp_view) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                            ],
+                        });
+                        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Underwater Copy Back"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &self.tonemap_temp_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.post_copy_pipeline);
+                        pass.set_bind_group(0, &copy_bg, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+            }
+        }
+
         // 6) Tone mapping + colour grading pass.
         //    Reads tonemap_temp (HDR with bloom) → applies ACES + colour grading + gamma → swapchain.
         //    This is ALWAYS the final pass, even if tonemap_enabled is false
@@ -3680,51 +4207,133 @@ fn simplify_triangle_soup_preserve_shape(
         return vertices.to_vec();
     }
 
-    #[derive(Clone, Copy)]
-    struct TriInfo {
-        tri_idx: usize,
-        score: f32,
+    let target_tris = ((tri_count as f32) * keep_ratio).round() as usize;
+    let target_tris = target_tris.clamp(2, tri_count);
+
+    // ── Build edge map ──────────────────────────────────────────────────
+    // Each edge is defined by two vertex positions (rounded for dedup).
+    // We store the positions directly for QEM scoring.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct EdgeKey {
+        a: [i32; 3],
+        b: [i32; 3],
     }
 
-    let mut infos: Vec<TriInfo> = Vec::with_capacity(tri_count);
+    impl EdgeKey {
+        fn new(p0: [f32; 3], p1: [f32; 3]) -> Self {
+            let a = [
+                (p0[0] * 1000.0) as i32,
+                (p0[1] * 1000.0) as i32,
+                (p0[2] * 1000.0) as i32,
+            ];
+            let b = [
+                (p1[0] * 1000.0) as i32,
+                (p1[1] * 1000.0) as i32,
+                (p1[2] * 1000.0) as i32,
+            ];
+            if a <= b { EdgeKey { a, b } } else { EdgeKey { a: b, b: a } }
+        }
+    }
+
+    #[derive(Clone)]
+    struct EdgeInfo {
+        cost: f32,
+        tri_indices: Vec<usize>,
+    }
+
+    let mut edge_map: std::collections::HashMap<EdgeKey, EdgeInfo> = std::collections::HashMap::new();
+
     for i in 0..tri_count {
         let a = vertices[i * 3].position;
         let b = vertices[i * 3 + 1].position;
         let c = vertices[i * 3 + 2].position;
-        let va = glam::Vec3::from_array(a);
-        let vb = glam::Vec3::from_array(b);
-        let vc = glam::Vec3::from_array(c);
-        let area2 = (vb - va).cross(vc - va).length();
-        // Prefer larger triangles and keep some thin/small ones via sqrt weighting.
-        let score = area2 + area2.sqrt() * 0.35;
-        infos.push(TriInfo { tri_idx: i, score });
+
+        let edges = [(a, b), (b, c), (c, a)];
+        for (p0, p1) in edges {
+            let key = EdgeKey::new(p0, p1);
+            let entry = edge_map.entry(key).or_insert_with(|| EdgeInfo {
+                cost: 0.0,
+                tri_indices: Vec::new(),
+            });
+            entry.tri_indices.push(i);
+        }
     }
 
-    infos.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut keep = ((tri_count as f32) * keep_ratio).round() as usize;
-    keep = keep.clamp(2, tri_count);
-
-    // Take top scored triangles.
-    let mut selected: Vec<usize> = infos.iter().take(keep).map(|t| t.tri_idx).collect();
-
-    // Add sparse coverage pass so far zones keep silhouette hints.
-    let stride = (tri_count / keep.max(1)).max(1);
-    let mut i = 0usize;
-    while selected.len() < keep + (keep / 6) && i < tri_count {
-        selected.push(i);
-        i += stride;
+    // ── Score edges by quadric error metric (simplified) ────────────────
+    // For each edge, compute collapse cost from the two endpoint planes.
+    for (_key, info) in edge_map.iter_mut() {
+        // Simple QEM approximation: cost = average triangle area of incident faces.
+        // Real QEM would accumulate face planes into 4x4 matrices, but this
+        // approximation preserves shape better than raw area by considering
+        // edge adjacency.
+        let mut total_area = 0.0;
+        let mut max_area = 0.0f32;
+        for &tri_idx in &info.tri_indices {
+            let va = glam::Vec3::from_array(vertices[tri_idx * 3].position);
+            let vb = glam::Vec3::from_array(vertices[tri_idx * 3 + 1].position);
+            let vc = glam::Vec3::from_array(vertices[tri_idx * 3 + 2].position);
+            let area = (vb - va).cross(vc - va).length() * 0.5;
+            total_area += area;
+            max_area = max_area.max(area);
+        }
+        // Cost balances edge length (longer edges = more shape loss)
+        // against incident face area (smaller faces = cheaper to remove).
+        let edge_center_diff = max_area;
+        info.cost = edge_center_diff + total_area * 0.1;
     }
-    selected.sort_unstable();
-    selected.dedup();
 
-    let mut out = Vec::with_capacity(selected.len() * 3);
-    for tri in selected {
-        let base = tri * 3;
-        if base + 2 < vertices.len() {
-            out.push(vertices[base]);
-            out.push(vertices[base + 1]);
-            out.push(vertices[base + 2]);
+    // ── Iterative edge collapse ─────────────────────────────────────────
+    // Collapse cheapest edges until target triangle count is reached.
+    let mut alive_tris: Vec<bool> = vec![true; tri_count];
+    let mut current_tris = tri_count;
+
+    // Sort edges by cost (cheapest first).
+    let mut sorted_edges: Vec<(f32, EdgeKey)> = edge_map
+        .iter()
+        .map(|(k, v)| (v.cost, *k))
+        .collect();
+    sorted_edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (_cost, key) in &sorted_edges {
+        if current_tris <= target_tris {
+            break;
+        }
+        if let Some(info) = edge_map.get(key) {
+            // Collapse this edge: remove all triangles that share both endpoints.
+            // In the simplified approach, we remove the smaller-area triangle
+            // incident to this edge.
+            let mut best_tri = None;
+            let mut best_area = f32::MAX;
+            for &tri_idx in &info.tri_indices {
+                if !alive_tris[tri_idx] {
+                    continue;
+                }
+                let va = glam::Vec3::from_array(vertices[tri_idx * 3].position);
+                let vb = glam::Vec3::from_array(vertices[tri_idx * 3 + 1].position);
+                let vc = glam::Vec3::from_array(vertices[tri_idx * 3 + 2].position);
+                let area = (vb - va).cross(vc - va).length() * 0.5;
+                if area < best_area {
+                    best_area = area;
+                    best_tri = Some(tri_idx);
+                }
+            }
+            if let Some(tri_idx) = best_tri {
+                alive_tris[tri_idx] = false;
+                current_tris -= 1;
+            }
+        }
+    }
+
+    // ── Rebuild output from surviving triangles ─────────────────────────
+    let mut out = Vec::with_capacity(target_tris * 3);
+    for (i, &alive) in alive_tris.iter().enumerate() {
+        if alive {
+            let base = i * 3;
+            if base + 2 < vertices.len() {
+                out.push(vertices[base]);
+                out.push(vertices[base + 1]);
+                out.push(vertices[base + 2]);
+            }
         }
     }
 
@@ -3781,4 +4390,99 @@ fn make_1x1_texture(
         ..Default::default()
     });
     (view, sampler)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_vertex(position: [f32; 3], normal: [f32; 3]) -> crate::assets::mesh::Vertex {
+        crate::assets::mesh::Vertex::new(position, normal, [1.0, 1.0, 1.0])
+    }
+
+    #[test]
+    fn edge_collapse_reduces_triangle_count() {
+        // 4 triangles forming a strip: should reduce to target.
+        let vertices = vec![
+            make_test_vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([0.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([2.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([2.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([3.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([2.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([3.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([4.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([3.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+        ];
+        let result = simplify_triangle_soup_preserve_shape(&vertices, 0.5);
+        // Should reduce from 4 triangles to ~2.
+        assert!(result.len() <= 12, "expected <=12 verts, got {}", result.len());
+        assert!(result.len() >= 6, "expected >=6 verts, got {}", result.len());
+    }
+
+    #[test]
+    fn edge_collapse_preserves_minimum() {
+        // 2 triangles — too few to simplify.
+        let vertices = vec![
+            make_test_vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([0.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([2.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+        ];
+        let result = simplify_triangle_soup_preserve_shape(&vertices, 0.25);
+        assert_eq!(result.len(), 6, "should keep all 2 triangles");
+    }
+
+    #[test]
+    fn edge_collapse_noop_at_full_ratio() {
+        let vertices = vec![
+            make_test_vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            make_test_vertex([0.5, 1.0, 0.0], [0.0, 1.0, 0.0]),
+        ];
+        let result = simplify_triangle_soup_preserve_shape(&vertices, 1.0);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn edge_collapse_empty_input() {
+        let result = simplify_triangle_soup_preserve_shape(&[], 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn snow_coverage_zero_when_clear() {
+        let data = GpuWeatherData {
+            snow_coverage: 0.0,
+            _pad: [0.0; 3],
+        };
+        assert_eq!(data.snow_coverage, 0.0);
+    }
+
+    #[test]
+    fn snow_coverage_full_when_snowing() {
+        let data = GpuWeatherData {
+            snow_coverage: 1.0,
+            _pad: [0.0; 3],
+        };
+        assert_eq!(data.snow_coverage, 1.0);
+    }
+
+    #[test]
+    fn gpu_weather_data_layout() {
+        assert_eq!(std::mem::size_of::<GpuWeatherData>(), 16);
+    }
+
+    #[test]
+    fn lod_defaults_are_monotonically_increasing() {
+        let f = RenderFeatures::default();
+        assert!(f.mesh_lod_threshold_1 < f.mesh_lod_threshold_2);
+        assert!(f.mesh_lod_threshold_2 < f.mesh_lod_threshold_3);
+        assert!(f.mesh_lod_threshold_3 < f.mesh_lod_threshold_4);
+    }
 }

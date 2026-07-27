@@ -183,23 +183,31 @@ impl MemoryVfs {
 
     /// Insert a file from a string.
     pub fn insert_str(&self, path: &str, data: &str) {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), data.as_bytes().to_vec());
+        let Ok(mut files) = self.files.lock() else {
+            tracing::error!("[VFS] Mutex poisoned on insert_str for '{}'", path);
+            return;
+        };
+        files.insert(path.to_string(), data.as_bytes().to_vec());
     }
 
     /// Insert raw bytes.
     pub fn insert(&self, path: &str, data: Vec<u8>) {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), data);
+        let Ok(mut files) = self.files.lock() else {
+            tracing::error!("[VFS] Mutex poisoned on insert for '{}'", path);
+            return;
+        };
+        files.insert(path.to_string(), data);
     }
 
     /// Remove a file.
     pub fn remove(&self, path: &str) -> bool {
-        self.files.lock().unwrap().remove(path).is_some()
+        match self.files.lock() {
+            Ok(mut files) => files.remove(path).is_some(),
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on remove for '{}'", path);
+                false
+            }
+        }
     }
 }
 
@@ -215,9 +223,14 @@ impl Vfs for MemoryVfs {
     }
 
     fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-        self.files
-            .lock()
-            .unwrap()
+        let files = match self.files.lock() {
+            Ok(f) => f,
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on read for '{}'", path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "VFS mutex poisoned"));
+            }
+        };
+        files
             .get(path)
             .cloned()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path))
@@ -230,10 +243,13 @@ impl Vfs for MemoryVfs {
     }
 
     fn write(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), data.to_vec());
+        match self.files.lock() {
+            Ok(mut files) => { files.insert(path.to_string(), data.to_vec()); }
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on write for '{}'", path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "VFS mutex poisoned"));
+            }
+        }
         Ok(())
     }
 
@@ -242,11 +258,23 @@ impl Vfs for MemoryVfs {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.files.lock().unwrap().contains_key(path)
+        match self.files.lock() {
+            Ok(files) => files.contains_key(path),
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on exists for '{}'", path);
+                false
+            }
+        }
     }
 
     fn read_dir(&self, path: &str) -> std::io::Result<Vec<DirEntry>> {
-        let files = self.files.lock().unwrap();
+        let files = match self.files.lock() {
+            Ok(f) => f,
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on read_dir for '{}'", path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "VFS mutex poisoned"));
+            }
+        };
         let prefix = if path.is_empty() || path == "." || path == "/" {
             String::new()
         } else {
@@ -284,7 +312,13 @@ impl Vfs for MemoryVfs {
     }
 
     fn walk_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
-        let files = self.files.lock().unwrap();
+        let files = match self.files.lock() {
+            Ok(f) => f,
+            Err(_) => {
+                tracing::error!("[VFS] Mutex poisoned on walk_dir for '{}'", path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "VFS mutex poisoned"));
+            }
+        };
         let prefix = if path.is_empty() || path == "." || path == "/" {
             String::new()
         } else {

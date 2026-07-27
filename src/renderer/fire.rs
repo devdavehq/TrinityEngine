@@ -128,7 +128,7 @@ impl FireRenderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // cross-plane: both sides visible from any angle
                 ..Default::default()
             },
             // No depth write — fire is transparent and doesn't occlude anything.
@@ -165,7 +165,8 @@ impl FireRenderer {
         }
     }
 
-    /// Create a vertical quad mesh for the fire effect.
+    /// Create a cross-plane mesh for the fire effect (two intersecting quads at 90°).
+    /// This ensures fire looks 3D from any viewing angle.
     /// The vertex shader displaces vertices upward based on noise,
     /// creating the flame shape procedurally.
     fn create_fire_quad(
@@ -173,12 +174,15 @@ impl FireRenderer {
     ) -> (wgpu::Buffer, wgpu::Buffer, u32) {
         let half_w = 1.0;
         let height = 2.0;
-        let segments_h = 8; // vertical subdivisions for smooth flame shape
-        let segments_w = 4; // horizontal subdivisions for flicker detail
+        let segments_h = 8;
+        let segments_w = 4;
 
-        let mut vertices = Vec::with_capacity((segments_h + 1) * (segments_w + 1));
-        let mut indices = Vec::with_capacity(segments_h * segments_w * 6);
+        let verts_per_quad = (segments_h + 1) * (segments_w + 1);
+        let tris_per_quad = segments_h * segments_w * 2;
+        let mut vertices = Vec::with_capacity(verts_per_quad * 2);
+        let mut indices = Vec::with_capacity(tris_per_quad * 3 * 2);
 
+        // Quad A: faces the camera (XY plane, normal along +Z).
         for y in 0..=segments_h {
             for x in 0..=segments_w {
                 let fx = x as f32 / segments_w as f32;
@@ -188,24 +192,44 @@ impl FireRenderer {
                 vertices.push(FireVertex {
                     position: [px, py, 0.0],
                     _pad: 0.0,
-                    normal: [0.0, 0.0, 1.0], // faces camera
+                    normal: [0.0, 0.0, 1.0],
                     _pad2: 0.0,
                 });
             }
         }
 
-        for y in 0..segments_h {
-            for x in 0..segments_w {
-                let tl = y * (segments_w + 1) + x;
-                let tr = tl + 1;
-                let bl = (y + 1) * (segments_w + 1) + x;
-                let br = bl + 1;
-                indices.push(tl);
-                indices.push(bl);
-                indices.push(tr);
-                indices.push(tr);
-                indices.push(bl);
-                indices.push(br);
+        // Quad B: rotated 90° around Y axis (ZY plane, normal along +X).
+        for y in 0..=segments_h {
+            for x in 0..=segments_w {
+                let fx = x as f32 / segments_w as f32;
+                let fy = y as f32 / segments_h as f32;
+                let pz = (fx - 0.5) * 2.0 * half_w;
+                let py = fy * height;
+                vertices.push(FireVertex {
+                    position: [0.0, py, pz],
+                    _pad: 0.0,
+                    normal: [1.0, 0.0, 0.0],
+                    _pad2: 0.0,
+                });
+            }
+        }
+
+        // Generate indices for both quads.
+        for quad in 0..2u32 {
+            let base = quad * verts_per_quad as u32;
+            for y in 0..segments_h {
+                for x in 0..segments_w {
+                    let tl = base + y as u32 * (segments_w as u32 + 1) + x as u32;
+                    let tr = tl + 1;
+                    let bl = base + (y as u32 + 1) * (segments_w as u32 + 1) + x as u32;
+                    let br = bl + 1;
+                    indices.push(tl);
+                    indices.push(bl);
+                    indices.push(tr);
+                    indices.push(tr);
+                    indices.push(bl);
+                    indices.push(br);
+                }
             }
         }
 
@@ -249,7 +273,7 @@ impl FireRenderer {
         }
 
         // Render each fire entity individually (they have different positions/colours).
-        for (pos, fire_surf) in fire_entities {
+        for (_pos, fire_surf) in fire_entities {
             let uniforms = GpuFireUniforms {
                 base_color: [
                     fire_surf.base_color[0],

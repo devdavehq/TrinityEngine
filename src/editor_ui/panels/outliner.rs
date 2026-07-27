@@ -3,6 +3,7 @@
 // Tree view with parent-child hierarchy, groups, search, and drag-drop reparent.
 
 use crate::components;
+use crate::animation::anim_graph::AnimGraphComponent;
 use crate::core::hierarchy::{build_hierarchy, set_parent};
 use crate::editor_ui::UiFrameArgs;
 use egui::{Color32, RichText};
@@ -18,6 +19,32 @@ fn header_panel(ui: &mut egui::Ui, title: &str, subtitle: &str) {
             ui.label(RichText::new(title).strong().color(Color32::from_rgb(229, 232, 238)));
             ui.label(RichText::new(subtitle).small().color(Color32::from_rgb(142, 152, 168)));
         });
+}
+
+/// Spawn a shape entity with the given name and scale.
+fn spawn_shape(world: &mut hecs::World, name: &str, scale: [f32; 3]) {
+    let e = world.spawn((
+        components::Position { x: 0.0, y: scale[1] * 0.5, z: 0.0 },
+        components::Renderable {
+            mesh: crate::assets::Handle::new(0),
+            color: match name {
+                "Cube" => [0.7, 0.7, 0.7],
+                "Sphere" => [0.6, 0.8, 1.0],
+                "Cylinder" => [0.8, 0.7, 0.6],
+                "Plane" => [0.4, 0.7, 0.4],
+                "Quad" => [0.9, 0.9, 0.9],
+                _ => [0.8, 0.8, 0.8],
+            },
+            metallic: 0.0,
+            roughness: 0.5,
+            ao: 1.0,
+            scale,
+        },
+        components::Rotation::default(),
+        components::GroupNode::new(name),
+    ));
+    tracing::info!("[Outliner] Spawned {} entity", name);
+    let _ = e;
 }
 
 /// Render a single entity row in the tree, with drag-drop support for reparenting.
@@ -265,7 +292,8 @@ pub fn render_outliner_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
     ui.data_mut(|d| d.insert_temp("outliner_search".into(), search.clone()));
     ui.add_space(8.0);
 
-    // Group node creation buttons.
+    // Add Entity menu — dropdown with shapes, lights, cameras, imports.
+    let add_menu_id = egui::Id::new("add_entity_menu");
     egui::Frame::new()
         .fill(Color32::from_rgb(14, 17, 22))
         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(33, 39, 49)))
@@ -273,35 +301,160 @@ pub fn render_outliner_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .button(RichText::new("+ Group").small().color(Color32::from_rgb(147, 158, 172)))
-                    .clicked()
-                {
-                    // Spawn a new group node.
-                    let group = args.world.spawn((
-                        components::GroupNode::new("New Group"),
-                        components::Children::new(),
-                    ));
-                    *args.selected_renderable = Some(group);
+                // ── Add Entity dropdown ──────────────────────────────────
+                let add_btn = ui.button(
+                    RichText::new("➕ Add").small().color(Color32::from_rgb(180, 220, 140)),
+                );
+                if add_btn.clicked() {
+                    ui.memory_mut(|m| m.open_popup(add_menu_id));
                 }
-                if ui
-                    .button(RichText::new("+ Empty").small().color(Color32::from_rgb(147, 158, 172)))
-                    .clicked()
-                {
-                    // Spawn a new empty entity.
-                    let entity = args.world.spawn((
-                        components::Position { x: 0.0, y: 0.0, z: 0.0 },
-                        components::Renderable {
-                            mesh: crate::assets::Handle::new(0),
-                            color: [1.0; 3],
-                            metallic: 0.0,
-                            roughness: 0.5,
-                            ao: 1.0,
-                            scale: [1.0; 3],
-                        },
-                    ));
-                    *args.selected_renderable = Some(entity);
-                }
+
+                egui::Area::new(egui::Id::new("add_entity_menu"))
+                    .fixed_pos(add_btn.rect.left_bottom())
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(180.0);
+
+                            // ── Shapes ──────────────────────────────────
+                            ui.label(RichText::new("Shapes").strong().color(Color32::from_rgb(140, 180, 220)));
+                            if ui.button("Cube").clicked() {
+                                spawn_shape(args.world, "Cube", [1.0, 1.0, 1.0]);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Sphere").clicked() {
+                                spawn_shape(args.world, "Sphere", [1.0, 1.0, 1.0]);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Cylinder").clicked() {
+                                spawn_shape(args.world, "Cylinder", [1.0, 1.0, 1.0]);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Plane").clicked() {
+                                spawn_shape(args.world, "Plane", [5.0, 0.1, 5.0]);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Quad").clicked() {
+                                spawn_shape(args.world, "Quad", [2.0, 2.0, 1.0]);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            ui.separator();
+
+                            // ── Lights ──────────────────────────────────
+                            ui.label(RichText::new("Lights").strong().color(Color32::from_rgb(220, 200, 120)));
+                            if ui.button("Point Light").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 3.0, z: 0.0 },
+                                    components::PointLight {
+                                        color: [1.0, 0.9, 0.7],
+                                        intensity: 1.0,
+                                        range: 15.0,
+                                        light_type: 1.0,
+                                        spot_angle: 45.0,
+                                        shadow_casting: true,
+                                    },
+                                    components::GroupNode::new("Point Light"),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Directional Light").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 10.0, z: 0.0 },
+                                    components::PointLight {
+                                        color: [1.0, 0.95, 0.8],
+                                        intensity: 2.0,
+                                        range: 1000.0,
+                                        light_type: 0.0,
+                                        spot_angle: 0.0,
+                                        shadow_casting: true,
+                                    },
+                                    components::GroupNode::new("Directional Light"),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Spot Light").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 4.0, z: 0.0 },
+                                    components::PointLight {
+                                        color: [1.0, 1.0, 1.0],
+                                        intensity: 3.0,
+                                        range: 20.0,
+                                        light_type: 2.0,
+                                        spot_angle: 30.0,
+                                        shadow_casting: true,
+                                    },
+                                    components::GroupNode::new("Spot Light"),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            ui.separator();
+
+                            // ── Objects ──────────────────────────────────
+                            ui.label(RichText::new("Objects").strong().color(Color32::from_rgb(180, 140, 220)));
+                            if ui.button("Camera").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 2.0, z: 5.0 },
+                                    components::Rotation::default(),
+                                    components::GroupNode::new("Camera"),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Empty Entity").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 0.0, z: 0.0 },
+                                    components::GroupNode::new("Empty"),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Group Node").clicked() {
+                                let e = args.world.spawn((
+                                    components::GroupNode::new("New Group"),
+                                    components::Children::new(),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            if ui.button("Animated Character").clicked() {
+                                let e = args.world.spawn((
+                                    components::Position { x: 0.0, y: 0.0, z: 0.0 },
+                                    components::Rotation::default(),
+                                    components::Renderable {
+                                        mesh: crate::assets::Handle::new(0),
+                                        color: [0.6, 0.7, 0.9],
+                                        metallic: 0.0,
+                                        roughness: 0.6,
+                                        ao: 1.0,
+                                        scale: [1.0, 1.0, 1.0],
+                                    },
+                                    components::GroupNode::new("Animated Character"),
+                                    AnimGraphComponent::new(),
+                                ));
+                                *args.selected_renderable = Some(e);
+                                tracing::info!("[Outliner] Spawned Animated Character with AnimGraphComponent");
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                            ui.separator();
+
+                            // ── Import ──────────────────────────────────
+                            ui.label(RichText::new("Import").strong().color(Color32::from_rgb(140, 200, 180)));
+                            if ui.button("Import Mesh...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("3D Models", &["gltf", "glb", "obj"])
+                                    .add_filter("All Files", &["*"])
+                                    .pick_file()
+                                {
+                                    tracing::info!("[Import] Selected mesh: {:?}", path);
+                                    // TODO: Actually load the mesh file
+                                }
+                                ui.memory_mut(|m| m.close_popup(add_menu_id));
+                            }
+                        });
+                    });
             });
         });
     ui.add_space(4.0);

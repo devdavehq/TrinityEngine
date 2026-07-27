@@ -1,5 +1,6 @@
+use crate::components;
 use crate::editor_ui::{
-    draw_transform_gizmo, pick_entity_in_viewport, GizmoDragState, GizmoMode, GizmoSpace,
+    draw_transform_gizmo, pick_entity_in_viewport, GizmoAxis, GizmoDragState, GizmoMode, GizmoSpace,
     UiFrameArgs,
 };
 
@@ -32,6 +33,10 @@ pub fn render_viewport_panel(
     gizmo_mode: &mut GizmoMode,
     gizmo_drag: &mut Option<GizmoDragState>,
     gizmo_space: GizmoSpace,
+    gizmo_axis_lock: Option<GizmoAxis>,
+    terrain_mode: bool,
+    terrain_brush_mode: components::TerrainBrushMode,
+    terrain_brush_radius: f32,
     snap_enabled: bool,
     snap_translate: f32,
     snap_rotate_deg: f32,
@@ -102,27 +107,35 @@ pub fn render_viewport_panel(
 
     let right = rect.right() - 10.0;
     let top = rect.top() + 10.0;
-    let chips = [
-        ("W / E / R", 82.0),
-        (
-            &format!(
-                "Snap {}",
-                if snap_enabled {
-                    format!("T {:.2}", snap_translate)
-                } else {
-                    "Off".to_string()
-                }
-            ),
-            92.0,
-        ),
-        (&format!("Rot {:.1}", snap_rotate_deg), 76.0),
-        (&format!("Scale {:.2}", snap_scale), 84.0),
-        (&format!("Cam x{:.1}", args.camera_nav_speed), 84.0),
-    ];
+    let terrain_label = if terrain_mode {
+        format!("T {} [{}]", terrain_brush_mode.label(), terrain_brush_radius as u32)
+    } else {
+        String::new()
+    };
+    let snap_label = format!(
+        "Snap {}",
+        if snap_enabled {
+            format!("T {:.2}", snap_translate)
+        } else {
+            "Off".to_string()
+        }
+    );
+    let rot_label = format!("Rot {:.1}", snap_rotate_deg);
+    let scale_label = format!("Scale {:.2}", snap_scale);
+    let cam_label = format!("Cam x{:.1}", args.camera_nav_speed);
+    let mut chips: Vec<(&str, f32)> = Vec::new();
+    if !terrain_label.is_empty() {
+        chips.push((&terrain_label, 120.0));
+    }
+    chips.push(("W / E / R", 82.0));
+    chips.push((&snap_label, 92.0));
+    chips.push((&rot_label, 76.0));
+    chips.push((&scale_label, 84.0));
+    chips.push((&cam_label, 84.0));
     let mut cursor = right;
-    for (label, width) in chips {
+    for (label, width) in &chips {
         cursor -= width;
-        overlay_chip(p, egui::pos2(cursor, top), label, width);
+        overlay_chip(p, egui::pos2(cursor, top), label, *width);
         cursor -= 6.0;
     }
 
@@ -171,6 +184,7 @@ pub fn render_viewport_panel(
             gizmo_mode,
             gizmo_drag,
             gizmo_space,
+            gizmo_axis_lock,
             snap_enabled,
             snap_translate,
             snap_rotate_deg,

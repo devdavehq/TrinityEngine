@@ -1,3 +1,7 @@
+pub mod particle_collision;
+#[cfg(feature = "jolt")]
+pub mod jolt_bridge;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
@@ -1204,7 +1208,20 @@ fn collision_events(contacts: &[Contact], settings: &RuntimeSettings) -> Vec<Col
             })
             .collect();
     }
-    let mut guard = collision_state().lock().expect("collision state mutex poisoned");
+    let mut guard = match collision_state().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::error!("[Physics] Collision state mutex poisoned — resetting");
+            collision_state().clear_poison();
+            match collision_state().lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!("[Physics] Mutex still poisoned after recovery");
+                    return Vec::new();
+                }
+            }
+        }
+    };
     let previous = guard.clone();
     let mut current = HashSet::new();
     let mut events = Vec::new();
@@ -1220,9 +1237,17 @@ fn collision_events(contacts: &[Contact], settings: &RuntimeSettings) -> Vec<Col
         });
     }
     for ended in previous.difference(&current) {
+        let Some(entity_a) = Entity::from_bits(ended.0) else {
+            tracing::warn!("[Physics] Invalid entity bits 0x{:x} for ended collision A", ended.0);
+            continue;
+        };
+        let Some(entity_b) = Entity::from_bits(ended.1) else {
+            tracing::warn!("[Physics] Invalid entity bits 0x{:x} for ended collision B", ended.1);
+            continue;
+        };
         events.push(CollisionPair {
-            entity_a: Entity::from_bits(ended.0).expect("valid entity bits"),
-            entity_b: Entity::from_bits(ended.1).expect("valid entity bits"),
+            entity_a,
+            entity_b,
             normal: [0.0, 0.0, 0.0],
             penetration: 0.0,
             phase: CollisionPhase::Ended,

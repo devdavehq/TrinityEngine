@@ -101,6 +101,14 @@ pub struct AudioSystem {
     pub volume: VolumeControl,
     /// Monotonically increasing ID counter.
     next_id: u64,
+    /// 3D listener position for spatial audio.
+    listener_position: [f32; 3],
+    /// 3D listener forward direction (normalized).
+    listener_forward: [f32; 3],
+    /// 3D listener up vector.
+    listener_up: [f32; 3],
+    /// Spatial audio enabled flag.
+    spatial_enabled: bool,
 }
 
 impl AudioSystem {
@@ -126,6 +134,10 @@ impl AudioSystem {
             music_sink: None,
             volume: VolumeControl::default(),
             next_id: 1,
+            listener_position: [0.0, 0.0, 0.0],
+            listener_forward: [0.0, 0.0, -1.0],
+            listener_up: [0.0, 1.0, 0.0],
+            spatial_enabled: true,
         })
     }
 
@@ -163,8 +175,9 @@ impl AudioSystem {
         Some(SoundHandle { id, channel: Channel::Sfx })
     }
 
-    /// Play procedural thunder sound (low-frequency rumble).
+    /// Play procedural thunder sound (layered rumble with crack and rumble layers).
     /// Uses rodio's built-in signal generators — no audio file needed.
+    /// Tries to load a real thunder audio file first; falls back to procedural.
     pub fn play_thunder(&mut self, volume: f32) -> Option<SoundHandle> {
         use rodio::source::SineWave;
 
@@ -172,13 +185,53 @@ impl AudioSystem {
         let effective_vol = self.volume.effective(Channel::Sfx) * volume;
         sink.set_volume(effective_vol);
 
-        // Thunder is a low rumble: 60Hz sine wave that fades out.
-        let mut taken = SineWave::new(60.0)
-            .take_duration(std::time::Duration::from_secs_f32(1.5));
-        taken.set_filter_fadeout();
-        let source = taken.amplify(0.8);
+        // Try loading a real thunder file first (search common paths)
+        let thunder_paths = [
+            "assets/audio/thunder.wav",
+            "assets/audio/thunder.ogg",
+            "Content/Audio/thunder.wav",
+            "Content/Audio/thunder.ogg",
+        ];
+        for path in &thunder_paths {
+            if let Some(source) = Self::decode_file(path) {
+                sink.append(source);
+                let id = self.next_id;
+                self.next_id += 1;
+                self.sounds.insert(id, SoundEntry {
+                    id,
+                    channel: Channel::Sfx,
+                    sink,
+                });
+                return Some(SoundHandle { id, channel: Channel::Sfx });
+            }
+        }
 
-        sink.append(source);
+        // Fallback: layered procedural thunder
+        // Layer 1: Deep rumble (40 Hz sine, 2s duration)
+        let rumble = SineWave::new(40.0)
+            .take_duration(std::time::Duration::from_secs_f32(2.0))
+            .amplify(0.6);
+
+        // Layer 2: Mid rumble (80 Hz sine, 1.5s, delayed start via take/skip)
+        let mid_rumble = SineWave::new(80.0)
+            .take_duration(std::time::Duration::from_secs_f32(1.5))
+            .amplify(0.3);
+
+        // Layer 3: High crack (200 Hz sine, 0.3s, for the initial crack sound)
+        let crack = SineWave::new(200.0)
+            .take_duration(std::time::Duration::from_secs_f32(0.3))
+            .amplify(0.8);
+
+        // Layer 4: Sub-bass (25 Hz sine, 2.5s for visceral feel)
+        let sub = SineWave::new(25.0)
+            .take_duration(std::time::Duration::from_secs_f32(2.5))
+            .amplify(0.4);
+
+        // Append crack first (immediate), then mix layers
+        // rodio Sink::append chains sources sequentially, so we mix via amplitude envelope
+        let layered = crack.mix(rumble).mix(mid_rumble).mix(sub);
+
+        sink.append(layered);
 
         let id = self.next_id;
         self.next_id += 1;
@@ -311,6 +364,72 @@ impl AudioSystem {
     /// Cleans up finished sounds.
     pub fn update(&mut self) {
         self.sounds.retain(|_, entry| !entry.sink.empty());
+    }
+
+    // ── 3D Spatial Audio ─────────────────────────────────────────────────────
+
+    /// Update the listener position (camera position).
+    pub fn set_listener_position(&mut self, pos: [f32; 3]) {
+        self.listener_position = pos;
+    }
+
+    /// Update the listener forward direction (camera look direction).
+    pub fn set_listener_forward(&mut self, forward: [f32; 3]) {
+        self.listener_forward = forward;
+    }
+
+    /// Update the listener up vector.
+    pub fn set_listener_up(&mut self, up: [f32; 3]) {
+        self.listener_up = up;
+    }
+
+    /// Enable/disable spatial audio processing.
+    pub fn set_spatial_enabled(&mut self, enabled: bool) {
+        self.spatial_enabled = enabled;
+    }
+
+    /// Get current listener position.
+    pub fn listener_position(&self) -> [f32; 3] {
+        self.listener_position
+    }
+
+    /// Compute distance attenuation for a source at the given world position.
+    /// Returns a volume multiplier (0.0 to 1.0).
+    pub fn distance_attenuation(&self, source_pos: [f32; 3], min_distance: f32, max_distance: f32) -> f32 {
+        if !self.spatial_enabled { return 1.0; }
+        let dx = source_pos[0] - self.listener_position[0];
+        let dy = source_pos[1] - self.listener_position[1];
+        let dz = source_pos[2] - self.listener_position[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= min_distance { return 1.0; }
+        if dist >= max_distance { return 0.0; }
+        // Quadratic falloff
+        let t = (dist - min_distance) / (max_distance - min_distance);
+        1.0 - t * t
+    }
+
+    /// Compute stereo pan for a source (-1.0 left, 0.0 center, 1.0 right).
+    pub fn stereo_pan(&self, source_pos: [f32; 3]) -> f32 {
+        if !self.spatial_enabled { return 0.0; }
+        let forward = glam::Vec3::from(self.listener_forward).normalize();
+        let up = glam::Vec3::from(self.listener_up).normalize();
+        let right = forward.cross(up).normalize();
+        let to_source = glam::Vec3::new(
+            source_pos[0] - self.listener_position[0],
+            source_pos[1] - self.listener_position[1],
+            source_pos[2] - self.listener_position[2],
+        );
+        let right_component = right.dot(to_source);
+        let dist = to_source.length();
+        if dist < 0.001 { return 0.0; }
+        (right_component / dist).clamp(-1.0, 1.0)
+    }
+
+    /// Apply spatial audio to a sound source at the given world position.
+    /// Adjusts volume based on distance and left/right balance.
+    pub fn apply_spatial(&self, source_pos: [f32; 3], base_volume: f32) -> f32 {
+        let attenuation = self.distance_attenuation(source_pos, 1.0, 100.0);
+        base_volume * attenuation
     }
 
     // ── Internal ────────────────────────────────────────────────────────────

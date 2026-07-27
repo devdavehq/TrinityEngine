@@ -70,6 +70,10 @@ pub struct RenderSettings {
     pub lava_enabled: bool,
     // ── Fire rendering ─────────────────────────────────────────────────────
     pub fire_enabled: bool,
+    // ── Heat distortion ──────────────────────────────────────────────────
+    pub heat_distortion_enabled: bool,
+    // ── Underwater rendering ──────────────────────────────────────────────
+    pub underwater_enabled: bool,
     // ── Temporal Anti-Aliasing (TAA) ──────────────────────────────────────
     pub taa_enabled: bool,
     pub taa_blend_factor: f32,
@@ -88,6 +92,17 @@ pub struct RenderSettings {
     pub god_rays_density: f32,
     pub god_rays_weight: f32,
     pub god_rays_num_samples: u32,
+    // ── LOD settings ───────────────────────────────────────────────────────
+    /// Distance at which mesh LOD switches from band 0 to band 1.
+    pub mesh_lod_threshold_1: f32,
+    /// Distance at which mesh LOD switches from band 1 to band 2.
+    pub mesh_lod_threshold_2: f32,
+    /// Distance at which mesh LOD switches from band 2 to band 3.
+    pub mesh_lod_threshold_3: f32,
+    /// Distance at which mesh LOD switches from band 3 to band 4.
+    pub mesh_lod_threshold_4: f32,
+    /// Terrain LOD distance thresholds.
+    pub terrain_lod_distances: [f32; 3],
 }
 
 impl Default for RenderSettings {
@@ -141,6 +156,10 @@ impl Default for RenderSettings {
             lava_enabled: true,
             // Fire defaults.
             fire_enabled: true,
+            // Heat distortion defaults.
+            heat_distortion_enabled: true,
+            // Underwater rendering defaults.
+            underwater_enabled: true,
             // TAA defaults — enabled by default for anti-aliasing.
             taa_enabled: true,
             taa_blend_factor: 0.1,
@@ -159,6 +178,12 @@ impl Default for RenderSettings {
             god_rays_density: 1.2,
             god_rays_weight: 0.04,
             god_rays_num_samples: 32,
+            // LOD defaults.
+            mesh_lod_threshold_1: 48.0,
+            mesh_lod_threshold_2: 95.0,
+            mesh_lod_threshold_3: 180.0,
+            mesh_lod_threshold_4: 300.0,
+            terrain_lod_distances: [100.0, 200.0, 400.0],
         }
     }
 }
@@ -492,6 +517,10 @@ impl RenderSettings {
             water_enabled: f.water_enabled,
             lava_enabled: f.lava_enabled,
             fire_enabled: f.fire_enabled,
+            // Heat distortion.
+            heat_distortion_enabled: f.heat_distortion_enabled,
+            // Underwater.
+            underwater_enabled: f.underwater_enabled,
             // TAA.
             taa_enabled: f.taa_enabled,
             taa_blend_factor: f.taa_blend_factor,
@@ -510,6 +539,12 @@ impl RenderSettings {
             god_rays_density: f.god_rays_density,
             god_rays_weight: f.god_rays_weight,
             god_rays_num_samples: f.god_rays_num_samples,
+            // LOD.
+            mesh_lod_threshold_1: f.mesh_lod_threshold_1,
+            mesh_lod_threshold_2: f.mesh_lod_threshold_2,
+            mesh_lod_threshold_3: f.mesh_lod_threshold_3,
+            mesh_lod_threshold_4: f.mesh_lod_threshold_4,
+            terrain_lod_distances: [100.0, 200.0, 400.0],
         }
     }
 
@@ -560,6 +595,10 @@ impl RenderSettings {
         f.lava_enabled = self.lava_enabled;
         // Fire.
         f.fire_enabled = self.fire_enabled;
+        // Heat distortion.
+        f.heat_distortion_enabled = self.heat_distortion_enabled;
+        // Underwater.
+        f.underwater_enabled = self.underwater_enabled;
         // TAA.
         f.taa_enabled = self.taa_enabled;
         f.taa_blend_factor = self.taa_blend_factor;
@@ -578,5 +617,10 @@ impl RenderSettings {
         f.god_rays_density = self.god_rays_density;
         f.god_rays_weight = self.god_rays_weight;
         f.god_rays_num_samples = self.god_rays_num_samples;
+        // LOD.
+        f.mesh_lod_threshold_1 = self.mesh_lod_threshold_1;
+        f.mesh_lod_threshold_2 = self.mesh_lod_threshold_2;
+        f.mesh_lod_threshold_3 = self.mesh_lod_threshold_3;
+        f.mesh_lod_threshold_4 = self.mesh_lod_threshold_4;
     }
 }

@@ -261,7 +261,7 @@ impl BehaviorNode for RandomSelector {
             self.current_index = Some(self.pick_random_index());
         }
 
-        let idx = self.current_index.unwrap();
+        let Some(idx) = self.current_index else { return Status::Failure; };
         let status = self.children[idx].tick(ctx);
 
         // If the child completed (not Running), deselect so next tick picks
@@ -913,6 +913,49 @@ impl BehaviorNode for CustomAction {
     }
 }
 
+// ── SetState ─────────────────────────────────────────────────────────────────
+// Writes an animation state name to the blackboard key "ai_state".
+// This is the bridge between BT logic and the skeletal animation system:
+//   1. BT designer adds SetState::new("chase", "run") to their tree.
+//   2. When this node ticks, it writes "ai_state" = "run" to the blackboard.
+//   3. animation_blending_system reads "ai_state" and calls play_state().
+//   4. SkeletalAnimator triggers a crossfade to the Run clip.
+//
+// Usage in a BT:
+//   Sequence::new("ChasePlayer", vec![
+//       Box::new(SetState::new("SetRun", "run")),
+//       Box::new(MoveTo::new("MoveToPlayer", 5.0, "target_pos")),
+//       Box::new(SetState::new("SetAttack", "attack")),
+//   ])
+
+pub struct SetState {
+    state_name: String,
+    name: String,
+}
+
+impl SetState {
+    pub fn new(name: &str, state_name: &str) -> Self {
+        Self {
+            state_name: state_name.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl BehaviorNode for SetState {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        ctx.blackboard.set(
+            "ai_state",
+            crate::ai::blackboard::BlackboardValue::String(self.state_name.clone()),
+        );
+        Status::Success
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // BEHAVIOR TREE WRAPPER
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1249,5 +1292,42 @@ mod tests {
 
         let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
         assert_eq!(tree.tick(&mut ctx), Status::Success);
+    }
+
+    #[test]
+    fn set_state_writes_ai_state_to_blackboard() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+
+        let mut node = SetState::new("SetRun", "run");
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            // Tick SetState.
+            assert_eq!(node.tick(&mut ctx), Status::Success);
+        }
+        // ctx dropped — now we can read bb.
+        assert_eq!(bb.get_string("ai_state"), Some("run"));
+    }
+
+    #[test]
+    fn set_state_overwrites_previous_state() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        bb.set("ai_state", crate::ai::blackboard::BlackboardValue::String("idle".to_string()));
+        let nav = test_nav_grid();
+
+        let mut node = SetState::new("SetWalk", "walk");
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Success);
+        }
+        assert_eq!(bb.get_string("ai_state"), Some("walk"));
     }
 }

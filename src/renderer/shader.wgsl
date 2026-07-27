@@ -18,6 +18,13 @@ struct Uniforms {
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
+// Weather uniform — drives snow accumulation blending.
+struct WeatherData {
+    snow_coverage: f32,  // 0 = no snow, 1 = full accumulation
+    _pad: vec3<f32>,
+}
+@group(0) @binding(13) var<uniform> weather: WeatherData;
+
 // IBL textures. We use equirectangular maps sampled with a direction vector.
 // A full implementation would use cubemaps — equirectangular is simpler to load.
 @group(0) @binding(1) var ibl_irradiance:         texture_2d<f32>;
@@ -574,6 +581,33 @@ fn fs_main(in: VertOut) -> (@location(0) vec4<f32>, @location(1) vec4<f32>) {
         let voxel_bounce = mix(vec3<f32>(0.03, 0.04, 0.05), albedo * 0.25, hash);
         color += voxel_bounce * uniforms.post_params1.w;
     }
+
+    // Snow accumulation: blend snow albedo/roughness on upward-facing surfaces.
+    let snow_up = max(dot(N, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
+    let snow_mask = smoothstep(0.4, 0.8, snow_up) * weather.snow_coverage;
+    let snow_albedo = vec3<f32>(0.92, 0.95, 0.98);
+    let snow_roughness = 0.25;
+    let snow_metallic = 0.0;
+    let final_albedo = mix(albedo, snow_albedo, snow_mask);
+    let final_roughness = mix(roughness, snow_roughness, snow_mask);
+    let final_metallic = mix(metallic, snow_metallic, snow_mask);
+
+    // Recompute ambient with snow-blended material properties for visible accumulation.
+    let F0_snow = mix(vec3<f32>(0.04), final_albedo, final_metallic);
+    let F_ibl_snow = fresnel_schlick_roughness(NdotV, F0_snow, final_roughness);
+    let kD_ibl_snow = (vec3<f32>(1.0) - F_ibl_snow) * (1.0 - final_metallic);
+    let diffuse_ibl_snow = irradiance * final_albedo;
+    let prefiltered_snow = textureSampleLevel(
+        ibl_prefilter, ibl_prefilter_sampler, refl_uv,
+        final_roughness * (mip_count - 1.0),
+    ).rgb;
+    let brdf_snow = textureSample(brdf_lut, brdf_lut_sampler, vec2<f32>(NdotV, final_roughness)).rg;
+    let spec_ibl_snow = prefiltered_snow * (F_ibl_snow * brdf_snow.x + brdf_snow.y);
+    let ambient_snow = (kD_ibl_snow * diffuse_ibl_snow + spec_ibl_snow) * ao;
+
+    // Blend ambient toward snow-lit version where snow covers the surface.
+    let ambient_blended = mix(ambient, ambient_snow, snow_mask);
+    color = ambient_blended + (total_lighting * (1.0 - snow_mask * 0.3)) + emissive;
 
     // Volumetric fog approximation.
     if uniforms.post_params1.x > 0.5 {

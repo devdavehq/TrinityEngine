@@ -32,6 +32,7 @@
 // renderer integration phase.
 
 use glam::{Quat, Vec3};
+use std::collections::HashMap;
 
 // ── Bone ─────────────────────────────────────────────────────────────────────
 
@@ -270,9 +271,103 @@ impl AnimationClip {
     }
 }
 
+// ── Blend Utilities ──────────────────────────────────────────────────────────
+
+/// Blend two sets of per-bone local transforms by a weight factor.
+///
+/// Given two clips evaluated at their respective times, this produces a single
+/// set of `TransformKeyframe`s that linearly interpolates between them:
+///   - position: `a.position.lerp(b.position, weight)`
+///   - rotation: `a.rotation.slerp(b.rotation, weight)`
+///   - scale:    `a.scale.lerp(b.scale, weight)`
+///
+/// `weight` ranges from 0.0 (pure clip A) to 1.0 (pure clip B).
+///
+/// Both input slices must have the same length (one entry per bone).
+/// Bones that exist in one clip but not the other are treated as identity
+/// for the missing side.
+pub fn blend_animated_locals(
+    locals_a: &[TransformKeyframe],
+    locals_b: &[TransformKeyframe],
+    weight: f32,
+) -> Vec<TransformKeyframe> {
+    let len = locals_a.len().max(locals_b.len());
+    let w = weight.clamp(0.0, 1.0);
+
+    (0..len)
+        .map(|i| {
+            let a = locals_a.get(i).cloned().unwrap_or_else(|| TransformKeyframe::identity(0.0));
+            let b = locals_b.get(i).cloned().unwrap_or_else(|| TransformKeyframe::identity(0.0));
+
+            TransformKeyframe::new(
+                0.0, // Time is irrelevant for the blend result.
+                a.position.lerp(b.position, w),
+                a.rotation.slerp(b.rotation, w),
+                a.scale.lerp(b.scale, w),
+            )
+        })
+        .collect()
+}
+
+// ── Animation State Machine ─────────────────────────────────────────────────
+
+/// Maps human-readable state names to clip indices.
+///
+/// Example:
+///   "idle"  → 0
+///   "walk"  → 1
+///   "run"   → 2
+///   "attack" → 3
+///
+/// Built once per skeleton. The BT writes "ai_state" to the blackboard;
+/// the animation system reads it and calls `play_state()` on the animator.
+#[derive(Clone, Debug, Default)]
+pub struct AnimationStateMap {
+    states: HashMap<String, usize>,
+}
+
+impl AnimationStateMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a state name → clip index mapping.
+    pub fn insert(&mut self, state: &str, clip_index: usize) {
+        self.states.insert(state.to_string(), clip_index);
+    }
+
+    /// Look up a clip index for a state name.
+    pub fn get_clip_index(&self, state: &str) -> Option<usize> {
+        self.states.get(state).copied()
+    }
+
+    /// Check if a state is registered.
+    pub fn has_state(&self, state: &str) -> bool {
+        self.states.contains_key(state)
+    }
+
+    /// Iterate all registered states.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.states.iter().map(|(k, &v)| (k.as_str(), v))
+    }
+}
+
 // ── Skeletal Animator ────────────────────────────────────────────────────────
 
 /// Runtime state for playing back an animation clip on an entity.
+///
+/// The animator tracks:
+///   - Which clip is currently playing (`current_clip`).
+///   - A previous clip (`prev_clip`) that is being crossfaded out.
+///   - A blend weight (0.0 = pure old clip, 1.0 = pure new clip).
+///
+/// When `play()` is called:
+///   1. The current clip becomes `prev_clip`.
+///   2. The new clip becomes `current_clip`.
+///   3. `blend_weight` starts at 0.0 and ramps to 1.0 over ~0.25 seconds.
+///
+/// The caller (animation system) evaluates BOTH clips and blends the
+/// per-bone transforms using `blend_animated_locals()`.
 #[derive(Clone, Debug)]
 pub struct SkeletalAnimator {
     /// Index into the clips array (set by the system that owns the clips).
@@ -287,6 +382,10 @@ pub struct SkeletalAnimator {
     pub prev_clip: Option<usize>,
     /// Time of the previous clip during blending.
     pub prev_time: f32,
+    /// Duration of the crossfade blend in seconds (default 0.25).
+    pub blend_duration: f32,
+    /// Current state name (for dedup — don't re-trigger if already in state).
+    pub current_state: String,
 }
 
 impl Default for SkeletalAnimator {
@@ -298,6 +397,8 @@ impl Default for SkeletalAnimator {
             blend_weight: 1.0,
             prev_clip: None,
             prev_time: 0.0,
+            blend_duration: 0.25,
+            current_state: String::new(),
         }
     }
 }
@@ -311,9 +412,19 @@ impl SkeletalAnimator {
     pub fn advance(&mut self, dt: f32, clips: &[AnimationClip]) {
         self.time += dt * self.speed;
 
-        // Handle blend weight transition.
+        // Advance the blend weight toward 1.0 (fully blended to new clip).
         if self.blend_weight < 1.0 {
-            self.blend_weight = (self.blend_weight + dt * 4.0).min(1.0); // 0.25s blend.
+            let blend_speed = 1.0 / self.blend_duration.max(0.01);
+            self.blend_weight = (self.blend_weight + dt * blend_speed).min(1.0);
+        }
+
+        // Advance the previous clip's time during blending (keeps it in sync).
+        if self.prev_clip.is_some() && self.blend_weight < 1.0 {
+            self.prev_time += dt * self.speed;
+            if let Some(idx) = self.prev_clip {
+                let clip = &clips[idx];
+                self.prev_time = clip.effective_time(self.prev_time);
+            }
         }
 
         if let Some(idx) = self.current_clip {
@@ -322,8 +433,8 @@ impl SkeletalAnimator {
         }
     }
 
-    /// Switch to a new clip, starting from time 0.
-    /// The old clip becomes the blend source.
+    /// Switch to a new clip by index, starting a crossfade blend.
+    /// The old clip becomes the blend source. No-op if already playing this clip.
     pub fn play(&mut self, clip_index: usize, _clips: &[AnimationClip]) {
         if self.current_clip == Some(clip_index) {
             return; // Already playing this clip.
@@ -336,12 +447,61 @@ impl SkeletalAnimator {
         self.blend_weight = 0.0; // Start blending from old to new.
     }
 
+    /// Switch to a new clip by index, starting a crossfade blend with a custom duration.
+    pub fn play_with_duration(&mut self, clip_index: usize, duration: f32) {
+        if self.current_clip == Some(clip_index) {
+            return;
+        }
+        self.prev_clip = self.current_clip;
+        self.prev_time = self.time;
+        self.current_clip = Some(clip_index);
+        self.time = 0.0;
+        self.blend_weight = 0.0;
+        self.blend_duration = duration;
+    }
+
     /// Force-set the clip (no blending, instant switch).
     pub fn play_immediate(&mut self, clip_index: usize) {
         self.current_clip = Some(clip_index);
         self.time = 0.0;
         self.blend_weight = 1.0;
         self.prev_clip = None;
+    }
+
+    /// Transition to a named animation state (looks up clip in AnimationStateMap).
+    ///
+    /// This is the main entry point for the BT→animation bridge:
+    ///   1. BT writes "ai_state" = "walk" to blackboard.
+    ///   2. Animation system reads blackboard, calls `play_state("walk", &state_map)`.
+    ///   3. If already in "walk", no-op. If transitioning from "idle" to "walk",
+    ///      triggers a crossfade blend.
+    pub fn play_state(&mut self, state: &str, state_map: &AnimationStateMap) {
+        // Don't re-trigger if already in this state.
+        if self.current_state == state {
+            return;
+        }
+
+        if let Some(clip_index) = state_map.get_clip_index(state) {
+            self.current_state = state.to_string();
+            // play() handles the crossfade logic.
+            self.play(clip_index, &[]);
+        } else {
+            tracing::warn!(
+                "[Animation] Unknown state '{}' — no clip mapped. Available: {:?}",
+                state,
+                state_map.iter().map(|(s, _)| s).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Check whether the current blend is complete (old clip fully faded out).
+    pub fn is_blend_complete(&self) -> bool {
+        self.blend_weight >= 1.0
+    }
+
+    /// Whether the animator is currently blending between two clips.
+    pub fn is_blending(&self) -> bool {
+        self.prev_clip.is_some() && self.blend_weight < 1.0
     }
 }
 
@@ -555,5 +715,193 @@ mod tests {
         let (h, _) = build_test_skeleton();
         // 1 root + 4 spine + 4 left arm + 4 right arm + 3 left leg + 3 right leg = 19
         assert_eq!(h.bone_count(), 19);
+    }
+
+    // ── Blend tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn blend_weight_zero_returns_clip_a() {
+        let locals_a = vec![
+            TransformKeyframe::new(0.0, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+            TransformKeyframe::new(0.0, Vec3::ZERO, Quat::IDENTITY, Vec3::ONE),
+        ];
+        let locals_b = vec![
+            TransformKeyframe::new(0.0, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+            TransformKeyframe::new(0.0, Vec3::ZERO, Quat::IDENTITY, Vec3::ONE),
+        ];
+
+        let blended = blend_animated_locals(&locals_a, &locals_b, 0.0);
+        assert!((blended[0].position.x - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blend_weight_one_returns_clip_b() {
+        let locals_a = vec![
+            TransformKeyframe::new(0.0, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+        let locals_b = vec![
+            TransformKeyframe::new(0.0, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+
+        let blended = blend_animated_locals(&locals_a, &locals_b, 1.0);
+        assert!((blended[0].position.x - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blend_halfway_interpolates() {
+        let locals_a = vec![
+            TransformKeyframe::new(0.0, Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+        let locals_b = vec![
+            TransformKeyframe::new(0.0, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+
+        let blended = blend_animated_locals(&locals_a, &locals_b, 0.5);
+        assert!((blended[0].position.x - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blend_rotation_slerps() {
+        let rot_a = Quat::from_rotation_z(0.0);
+        let rot_b = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2); // 90 degrees.
+
+        let locals_a = vec![TransformKeyframe::new(0.0, Vec3::ZERO, rot_a, Vec3::ONE)];
+        let locals_b = vec![TransformKeyframe::new(0.0, Vec3::ZERO, rot_b, Vec3::ONE)];
+
+        let blended = blend_animated_locals(&locals_a, &locals_b, 0.5);
+        // At 50% blend, rotation should be ~45 degrees around Z.
+        let angle = blended[0].rotation.angle_between(
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_4),
+        );
+        assert!(angle < 0.01, "Expected ~45°, got angle diff {}", angle);
+    }
+
+    #[test]
+    fn blend_different_lengths() {
+        let locals_a = vec![
+            TransformKeyframe::new(0.0, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+            TransformKeyframe::new(0.0, Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+        let locals_b = vec![
+            TransformKeyframe::new(0.0, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE),
+        ];
+
+        // locals_b is shorter — bone 1 should use identity as fallback.
+        let blended = blend_animated_locals(&locals_a, &locals_b, 0.5);
+        assert_eq!(blended.len(), 2);
+        assert!((blended[0].position.x - 3.0).abs() < 0.001);
+        // Bone 1: lerp(2.0, 0.0, 0.5) = 1.0
+        assert!((blended[1].position.x - 1.0).abs() < 0.001);
+    }
+
+    // ── State machine tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn state_map_insert_and_lookup() {
+        let mut map = AnimationStateMap::new();
+        map.insert("idle", 0);
+        map.insert("walk", 1);
+        map.insert("run", 2);
+
+        assert_eq!(map.get_clip_index("idle"), Some(0));
+        assert_eq!(map.get_clip_index("walk"), Some(1));
+        assert_eq!(map.get_clip_index("run"), Some(2));
+        assert_eq!(map.get_clip_index("attack"), None);
+    }
+
+    #[test]
+    fn state_map_has_state() {
+        let mut map = AnimationStateMap::new();
+        map.insert("idle", 0);
+        assert!(map.has_state("idle"));
+        assert!(!map.has_state("walk"));
+    }
+
+    #[test]
+    fn play_state_transitions_clip() {
+        let mut map = AnimationStateMap::new();
+        map.insert("idle", 0);
+        map.insert("walk", 1);
+
+        let mut anim = SkeletalAnimator::new();
+        anim.play_state("idle", &map);
+        assert_eq!(anim.current_clip, Some(0));
+        assert_eq!(anim.current_state, "idle");
+
+        // Transition to walk — triggers crossfade.
+        anim.play_state("walk", &map);
+        assert_eq!(anim.current_clip, Some(1));
+        assert_eq!(anim.current_state, "walk");
+        assert!(anim.blend_weight < 1.0);
+        assert_eq!(anim.prev_clip, Some(0));
+    }
+
+    #[test]
+    fn play_state_no_op_if_same_state() {
+        let mut map = AnimationStateMap::new();
+        map.insert("idle", 0);
+        map.insert("walk", 1);
+
+        let mut anim = SkeletalAnimator::new();
+        anim.play_state("idle", &map);
+        anim.blend_weight = 1.0; // Blend complete.
+
+        // Call idle again — should NOT re-trigger.
+        let old_time = anim.time;
+        anim.time = 0.5;
+        anim.play_state("idle", &map);
+        assert_eq!(anim.time, 0.5); // Time not reset.
+    }
+
+    #[test]
+    fn play_state_unknown_state_logs_warning() {
+        let map = AnimationStateMap::new();
+        let mut anim = SkeletalAnimator::new();
+        // Should not panic — just warn.
+        anim.play_state("nonexistent", &map);
+        assert_eq!(anim.current_clip, None);
+    }
+
+    #[test]
+    fn advance_progresses_blend_weight() {
+        let clips = vec![AnimationClip::new("Idle", 2.0, true)];
+        let mut anim = SkeletalAnimator::new();
+        anim.play_immediate(0);
+        anim.play(0, &clips); // Should be no-op (same clip).
+        // Manually trigger a blend.
+        anim.prev_clip = Some(0);
+        anim.blend_weight = 0.0;
+        anim.blend_duration = 0.25;
+
+        anim.advance(0.1, &clips);
+        // 0.1s / 0.25s = 0.4 weight
+        assert!((anim.blend_weight - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn advance_completes_blend() {
+        let clips = vec![AnimationClip::new("Idle", 2.0, true)];
+        let mut anim = SkeletalAnimator::new();
+        anim.prev_clip = Some(0);
+        anim.blend_weight = 0.0;
+        anim.blend_duration = 0.25;
+
+        anim.advance(0.3, &clips); // > 0.25s blend duration.
+        assert!(anim.blend_weight >= 1.0);
+    }
+
+    #[test]
+    fn is_blending_and_is_blend_complete() {
+        let mut anim = SkeletalAnimator::new();
+        assert!(!anim.is_blending()); // No prev_clip.
+
+        anim.prev_clip = Some(0);
+        anim.blend_weight = 0.5;
+        assert!(anim.is_blending());
+        assert!(!anim.is_blend_complete());
+
+        anim.blend_weight = 1.0;
+        assert!(!anim.is_blending());
+        assert!(anim.is_blend_complete());
     }
 }

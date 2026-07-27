@@ -93,6 +93,7 @@ pub fn create_bind_group_layouts(
                 depth_texture_entry(10), // t_shadow2
                 comparison_sampler_entry(11), // s_shadow
                 uniform_entry(12), // LightUniforms (multi-light array, up to 16)
+                uniform_entry(13), // WeatherData (snow_coverage)
             ],
         },
     );

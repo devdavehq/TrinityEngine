@@ -45,12 +45,15 @@ mod profiler;
 mod renderer;
 mod scene;
 mod levels;
+mod ui;
 mod settings;
 #[cfg(feature = "scripting")]
 mod scripting;
 mod systems;
 mod terrain;
 mod vfs;
+mod resources;
+mod engine_subsystems;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -58,15 +61,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use assets::{AssetStore, Mesh, MeshStreamingQueue};
+use assets::Mesh;
 use animation::{animation_system, AnimState, Animator};
-use camera::Camera3D;
+use animation::blending::animation_blending_system;
+use animation::anim_graph::anim_graph_system;
 use components::{PlayerStart, RigidBody, Script, Position, Rotation, PointLight};
 #[cfg(feature = "editor")]
 use editor::EditorShell;
 #[cfg(feature = "editor")]
+use editor::backend::{EditorBackend, HeadlessEditor, WgpuEditor};
+#[cfg(feature = "editor")]
 use editor_ui::{EditorUi, UiFrameArgs};
-use input::InputState;
+use engine_subsystems::{EnvironmentState, LevelState, AssetState, CameraInputState};
 use jobs::JobSystem;
 use materials::MaterialLibrary;
 use navigation::NavGrid;
@@ -74,13 +80,12 @@ use ai::AiRegistry;
 use physics::{physics_system, character_controller_system, ragdoll_system, water_trigger_system};
 use profiler::FrameProfiler;
 use renderer::Renderer;
-use scene::{SceneManager, PrefabRegistry, SubSceneManager, SceneTransition};
-use levels::{LevelManager, StreamingConfig, WorldStateManager};
+use scene::{SceneManager, SubSceneManager, SceneTransition};
 use settings::EngineSettings;
 #[cfg(feature = "scripting")]
 use scripting::ScriptEngine;
 use systems::scripting_system;
-use terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainGrid};
+use terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainGrid, TerrainWorld};
 
 // New core systems
 use core::{EventBus, BeginFrameEvent, EndFrameEvent, ShutdownEvent};
@@ -90,13 +95,9 @@ use render::{InstancingManager, ShaderManager};
 use audio::AudioSystem;
 
 // Environment system
-use environment::{
-    time_of_day::TimeOfDay,
-    sky::SkyParams,
-    weather::WeatherState,
-    clouds::CloudParams,
-    splash::SplashManager,
-};
+use environment::splash::SplashManager;
+// Flood system function (state now in LevelState).
+use environment::flood::flood_system;
 
 use hecs::World;
 use winit::{
@@ -147,11 +148,11 @@ struct GameApp {
     // winit window wrapped in Arc so wgpu Surface can hold a reference.
     window:     Option<Arc<Window>>,
 
-    input:      InputState,
     world:      World,
-    meshes:     AssetStore<Mesh>,
-    mesh_cache: HashMap<String, assets::Handle<Mesh>>,
-    camera:     Camera3D,
+    // ── Asset subsystem ──────────────────────────────────────────────────
+    assets: AssetState,
+    // ── Camera & input subsystem ─────────────────────────────────────────
+    input_state: CameraInputState,
     #[cfg(feature = "scripting")]
     scripts:    ScriptEngine,
     scene_mgr:  SceneManager,
@@ -162,12 +163,16 @@ struct GameApp {
     settings:   EngineSettings,
     jobs:       JobSystem,
     profiler:   FrameProfiler,
-    mesh_streaming: MeshStreamingQueue,
+    // (mesh_streaming now in assets: AssetState)
+    #[cfg(feature = "editor")]
     editor_shell: EditorShell,
+    #[cfg(feature = "editor")]
     editor_ui: Option<EditorUi>,
-    materials: MaterialLibrary,
+    #[cfg(feature = "editor")]
+    editor_backend: Box<dyn EditorBackend>,
+    // (materials now in assets: AssetState)
     selected_renderable: Option<hecs::Entity>,
-    terrain: TerrainGrid,
+    terrain_world: TerrainWorld,
     terrain_cursor_x: usize,
     terrain_cursor_z: usize,
 
@@ -179,26 +184,14 @@ struct GameApp {
     // Shader management: compilation, caching, hot-reload.
     shader_mgr: ShaderManager,
 
-    // ── Environment system ───────────────────────────────────────────────
-    time_of_day: TimeOfDay,
-    sky: SkyParams,
-    weather: WeatherState,
-    clouds: CloudParams,
-    lightning: crate::environment::lightning::LightningState,
+    // ── Environment subsystem ────────────────────────────────────────────
+    env: EnvironmentState,
 
     // ── Splash visual system ─────────────────────────────────────────────
     splash_manager: SplashManager,
 
-    // ── Prefab system ────────────────────────────────────────────────────
-    prefab_registry: PrefabRegistry,
-
-    // ── Level streaming system ───────────────────────────────────────────
-    // Manages multiple levels that coexist in memory (like UE5 levels).
-    level_manager: LevelManager,
-    // Throttled distance-based streaming check.
-    streaming_config: StreamingConfig,
-    // Persistent world state across level loads/unloads.
-    world_state: WorldStateManager,
+    // ── Level streaming subsystem ────────────────────────────────────────
+    levels: LevelState,
 
     // ── Audio system ────────────────────────────────────────────────────
     #[cfg(feature = "audio")]
@@ -207,6 +200,10 @@ struct GameApp {
     // ── Particle system ────────────────────────────────────────────────
     particles: particles::ParticleSystem,
     particle_indices: [usize; 4],
+
+    // ── Jolt Physics backend ────────────────────────────────────────────
+    #[cfg(feature = "jolt")]
+    jolt: Option<physics::jolt_bridge::JoltBridge>,
 
     // Hot-reload receivers — Option because they're set up after the watcher starts.
     script_watcher: Option<std::sync::mpsc::Receiver<String>>,
@@ -232,16 +229,6 @@ struct GameApp {
     prev_game_preview_mode: bool,
     /// Snapshot of entity state before entering Game Preview — restored on exit.
     play_snapshot: Option<PlaySnapshot>,
-    mouse_look_active: bool,
-    mouse_look_latched: bool,
-    last_cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
-    camera_yaw: f32,
-    camera_pitch: f32,
-    camera_move_velocity: glam::Vec3,
-    nav_speed_scalar: f32,
-    look_sensitivity: f32,
-    orbit_mode: bool,
-    orbit_distance: f32,
     app_stage: AppStage,
     project_stage_started_at: std::time::Instant,
     request_return_to_hub: bool,
@@ -254,17 +241,6 @@ struct GameApp {
 
 impl GameApp {
     fn new() -> Self {
-        // Camera starts behind and above the scene, looking at origin.
-        let mut camera = Camera3D::new(1280.0 / 720.0);
-        camera.position = glam::Vec3::new(0.0, 4.0, 8.0);
-        camera.target   = glam::Vec3::ZERO;
-        let mut dir = (camera.target - camera.position).normalize_or_zero();
-        if dir.length_squared() < 1e-6 {
-            dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
-        }
-        let camera_yaw = dir.z.atan2(dir.x);
-        let camera_pitch = dir.y.asin();
-
         let settings = EngineSettings::load("engine_settings.toml");
         let jobs = JobSystem::new(
             settings.runtime.multithreading_enabled,
@@ -274,7 +250,6 @@ impl GameApp {
             settings.runtime.profiler_enabled,
             settings.runtime.profiler_log_interval_frames,
         );
-        let mesh_streaming = MeshStreamingQueue::new(settings.runtime.asset_streaming_enabled);
         let script_hot_reload_enabled = settings.runtime.script_hot_reload_enabled;
         let preferred_script_editor = settings.runtime.preferred_script_editor.clone();
         let asset_hot_reload_enabled = settings.runtime.asset_hot_reload_enabled;
@@ -285,11 +260,10 @@ impl GameApp {
         Self {
             renderer:       None,
             window:         None,
-            input:          InputState::new(),
             world:          World::new(),
-            meshes:         AssetStore::new(),
-            mesh_cache:     HashMap::new(),
-            camera,
+            assets:         AssetState::with_streaming(settings.runtime.asset_streaming_enabled),
+            input_state:    CameraInputState::new(),
+            #[cfg(feature = "scripting")]
             scripts:        ScriptEngine::new(),
             scene_mgr:      SceneManager::new(&resolve_primary_scene_path(&settings.runtime.startup_scene_path)),
             sub_scene_mgr:  SubSceneManager::new(),
@@ -297,37 +271,34 @@ impl GameApp {
             settings,
             jobs,
             profiler,
-            mesh_streaming,
+            #[cfg(feature = "editor")]
             editor_shell: EditorShell::new(),
+            #[cfg(feature = "editor")]
             editor_ui: None,
-            materials: MaterialLibrary::new_defaults(),
+            #[cfg(feature = "editor")]
+            editor_backend: Box::new(HeadlessEditor::new()),
             selected_renderable: None,
-            terrain: TerrainGrid::new(64, 64, 1.0),
+            terrain_world: TerrainWorld::new(64, 64, 16, 1.0),
             terrain_cursor_x: 32,
             terrain_cursor_z: 32,
             // New core systems
             events:     EventBus::new(),
             instancing: InstancingManager::new(),
             shader_mgr: ShaderManager::new(),
-            // Environment
-            time_of_day: TimeOfDay::new(),
-            sky:         SkyParams::default(),
-            weather:     WeatherState::default(),
-            clouds:      CloudParams::default(),
-            lightning:   crate::environment::lightning::LightningState::new(),
+            // Environment subsystem
+            env: EnvironmentState::new(),
             splash_manager: SplashManager::new(),
-            // Prefabs
-            prefab_registry: PrefabRegistry::new(),
-            // Level streaming system
-            level_manager: LevelManager::new(),
-            streaming_config: StreamingConfig::new(),
-            world_state: WorldStateManager::new(),
+            // Level subsystem
+            levels: LevelState::new(),
             // Audio
+            #[cfg(feature = "audio")]
             audio: AudioSystem::new(),
-            // Particles — weather emitters (rain, snow, mist, splatter).
-            // Initialized to defaults; properly set up in resumed() when we have the renderer.
+            // Particles
             particles: particles::ParticleSystem::new(),
             particle_indices: [0, 1, 2, 3],
+            // Jolt Physics
+            #[cfg(feature = "jolt")]
+            jolt: None,
             script_watcher: None,
             scene_watcher:  None,
             asset_watcher:  None,
@@ -338,7 +309,7 @@ impl GameApp {
             sim_step_once: false,
             script_skip_frames_remaining: 0,
             error_log: Vec::new(),
-            nav_grid: NavGrid::from_terrain(&TerrainGrid::new(64, 64, 1.0), 0.8),
+            nav_grid: NavGrid { width: 64, depth: 64, walkable: vec![true; 64 * 64], max_slope: 0.8, contour_edges: Vec::new(), region_count: 0 },
             ai_registry: AiRegistry::new(),
             nav_rebuild_requested: true,
             frame_interval,
@@ -349,16 +320,6 @@ impl GameApp {
             game_preview_mode: false,
             prev_game_preview_mode: false,
             play_snapshot: None,
-            mouse_look_active: false,
-            mouse_look_latched: false,
-            last_cursor_pos: None,
-            camera_yaw,
-            camera_pitch,
-            camera_move_velocity: glam::Vec3::ZERO,
-            nav_speed_scalar: 6.0,
-            look_sensitivity: 0.0035,
-            orbit_mode: false,
-            orbit_distance: 8.0,
             app_stage: AppStage::BootSplash,
             project_stage_started_at: std::time::Instant::now(),
             request_return_to_hub: false,
@@ -368,6 +329,27 @@ impl GameApp {
             stop_asset_watch: Arc::new(AtomicBool::new(false)),
             stop_scene_watch: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Attempt to initialize the Jolt Physics backend.
+    /// Called once at startup or when the user explicitly requests Jolt.
+    /// Requires CMake to build the Jolt native library — falls back gracefully.
+    #[cfg(feature = "jolt")]
+    fn init_jolt(&mut self) {
+        if self.jolt.is_some() {
+            tracing::info!("[Jolt] Already initialized.");
+            return;
+        }
+        tracing::info!("[Jolt] Attempting to initialize Jolt Physics backend...");
+        // rolt v0.3 wraps Jolt internally. If CMake or the build is missing,
+        // JoltBridge::new() still creates the struct (stub), but we log a warning.
+        let bridge = physics::jolt_bridge::JoltBridge::new();
+        if bridge.initialized {
+            tracing::info!("[Jolt] Physics backend ready (gravity: {:?}).", bridge.gravity);
+        } else {
+            tracing::warn!("[Jolt] Backend created but not fully initialized — using stub.");
+        }
+        self.jolt = Some(bridge);
     }
 
     fn refresh_available_scenes(&mut self) {
@@ -408,14 +390,7 @@ impl GameApp {
     }
 
     fn update_camera_target_from_angles(&mut self) {
-        let cp = self.camera_pitch.cos();
-        let forward = glam::Vec3::new(
-            self.camera_yaw.cos() * cp,
-            self.camera_pitch.sin(),
-            self.camera_yaw.sin() * cp,
-        )
-        .normalize_or_zero();
-        self.camera.target = self.camera.position + forward;
+        self.input_state.update_camera_target_from_angles();
     }
 
     fn push_error(&mut self, msg: String) {
@@ -464,7 +439,7 @@ impl GameApp {
             return;
         };
         if let Ok(mut rend) = self.world.get::<&mut components::Renderable>(entity) {
-            match self.materials.apply_instance(name, &mut rend) {
+            match self.assets.materials.apply_instance(name, &mut rend) {
                 Ok(_) => tracing::info!("[Materials] Applied '{}' to {:?}", name, entity),
                 Err(e) => tracing::error!("[Materials] {}", e),
             }
@@ -480,14 +455,14 @@ impl GameApp {
         };
         if let Ok(pos) = self.world.get::<&components::Position>(entity) {
             // Keep a small offset so camera doesn't sit inside the mesh.
-            self.camera.position = glam::Vec3::new(pos.x + 2.0, pos.y + 1.5, pos.z + 3.0);
-            self.camera.target = glam::Vec3::new(pos.x, pos.y, pos.z);
-            let mut dir = (self.camera.target - self.camera.position).normalize_or_zero();
+            self.input_state.camera.position = glam::Vec3::new(pos.x + 2.0, pos.y + 1.5, pos.z + 3.0);
+            self.input_state.camera.target = glam::Vec3::new(pos.x, pos.y, pos.z);
+            let mut dir = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
             if dir.length_squared() < 1e-6 {
                 dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
             }
-            self.camera_yaw = dir.z.atan2(dir.x);
-            self.camera_pitch = dir.y.asin();
+            self.input_state.camera_yaw = dir.z.atan2(dir.x);
+            self.input_state.camera_pitch = dir.y.asin();
             tracing::info!("[Camera] Snapped to selected entity: {:?}", entity);
         } else {
             tracing::info!("[Camera] Selected entity has no Position component.");
@@ -510,18 +485,18 @@ impl GameApp {
                 .max(0.6)
                 * 2.6;
         }
-        let dir = (self.camera.position - glam::Vec3::new(pos.x, pos.y, pos.z)).normalize_or_zero();
+        let dir = (self.input_state.camera.position - glam::Vec3::new(pos.x, pos.y, pos.z)).normalize_or_zero();
         let fallback = glam::Vec3::new(0.45, 0.25, 0.85).normalize();
         let d = if dir.length_squared() < 1e-6 { fallback } else { dir };
-        self.camera.target = glam::Vec3::new(pos.x, pos.y, pos.z);
-        self.camera.position = self.camera.target + d * radius;
-        self.orbit_distance = radius;
-        let mut view_dir = (self.camera.target - self.camera.position).normalize_or_zero();
+        self.input_state.camera.target = glam::Vec3::new(pos.x, pos.y, pos.z);
+        self.input_state.camera.position = self.input_state.camera.target + d * radius;
+        self.input_state.orbit_distance = radius;
+        let mut view_dir = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
         if view_dir.length_squared() < 1e-6 {
             view_dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
         }
-        self.camera_yaw = view_dir.z.atan2(view_dir.x);
-        self.camera_pitch = view_dir.y.asin();
+        self.input_state.camera_yaw = view_dir.z.atan2(view_dir.x);
+        self.input_state.camera_pitch = view_dir.y.asin();
     }
 
     fn spawn_scene_watcher(&mut self) {
@@ -537,10 +512,15 @@ impl GameApp {
                 use notify::{recommended_watcher, RecursiveMode, Watcher};
                 use std::path::Path;
                 let (ntx, nrx) = std::sync::mpsc::channel();
-                let mut watcher = recommended_watcher(move |res| {
+                let mut watcher = match recommended_watcher(move |res| {
                     let _ = ntx.send(res);
-                })
-                .expect("Scene watcher failed");
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::error!("[Scene] Scene watcher failed: {}", e);
+                        return;
+                    }
+                };
                 watcher.watch(Path::new("scenes"), RecursiveMode::Recursive).ok();
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -579,17 +559,17 @@ impl GameApp {
         self.ensure_content_layout();
         self.mark_editor_content_dirty();
         // Load data-driven materials from Content/Materials/
-        self.materials.load_from_directory(CONTENT_MATERIALS_DIR);
+        self.assets.materials.load_from_directory(CONTENT_MATERIALS_DIR);
         // Load prefabs from Content/Prefabs/
-        self.prefab_registry.load_from_directory("Content/Prefabs");
-        self.mesh_cache.clear();
-        match self.scene_mgr.build(&mut self.world, &mut self.meshes, &mut self.mesh_cache, Some(&self.prefab_registry)) {
+        self.assets.prefab_registry.load_from_directory("Content/Prefabs");
+        self.assets.mesh_cache.clear();
+        match self.scene_mgr.build(&mut self.world, &mut self.assets.meshes, &mut self.assets.mesh_cache, Some(&self.assets.prefab_registry)) {
             Ok(()) => {}
             Err(e) => {
                 self.error_log.push(format!("[Hub] Scene load failed: {}", e));
             }
         }
-        self.nav_grid.rebuild(&self.terrain);
+                                self.nav_grid.rebuild_from_heights(&self.terrain_world);
         self.selected_renderable = None;
 
         self.scripts = ScriptEngine::new();
@@ -611,15 +591,15 @@ impl GameApp {
         }
         self.spawn_scene_watcher();
 
-        if self.mesh_streaming.enabled() {
+        if self.assets.mesh_streaming.enabled() {
             if let Ok(descs) = scene::parse_scene(&self.scene_mgr.scene_path) {
                 for desc in descs {
-                    let dx = desc.position[0] - self.camera.position.x;
-                    let dy = desc.position[1] - self.camera.position.y;
-                    let dz = desc.position[2] - self.camera.position.z;
+                    let dx = desc.position[0] - self.input_state.camera.position.x;
+                    let dy = desc.position[1] - self.input_state.camera.position.y;
+                    let dz = desc.position[2] - self.input_state.camera.position.z;
                     let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
                     let priority = 1.0 / dist;
-                    self.mesh_streaming
+                    self.assets.mesh_streaming
                         .request_mesh_with_priority(&desc.mesh, priority);
                 }
             }
@@ -701,10 +681,10 @@ impl GameApp {
             rotations:    std::collections::HashMap::new(),
             rigid_bodies: std::collections::HashMap::new(),
             point_lights: std::collections::HashMap::new(),
-            camera_pos:   self.camera.position,
-            camera_target: self.camera.target,
-            camera_yaw:   self.camera_yaw,
-            camera_pitch: self.camera_pitch,
+            camera_pos:   self.input_state.camera.position,
+            camera_target: self.input_state.camera.target,
+            camera_yaw:   self.input_state.camera_yaw,
+            camera_pitch: self.input_state.camera_pitch,
         };
         for (entity, pos) in self.world.query_mut::<(hecs::Entity, &Position)>() {
             snap.positions.insert(entity, *pos);
@@ -753,10 +733,10 @@ impl GameApp {
             }
         }
         // Restore camera to editor position.
-        self.camera.position = snap.camera_pos;
-        self.camera.target   = snap.camera_target;
-        self.camera_yaw      = snap.camera_yaw;
-        self.camera_pitch    = snap.camera_pitch;
+        self.input_state.camera.position = snap.camera_pos;
+        self.input_state.camera.target   = snap.camera_target;
+        self.input_state.camera_yaw      = snap.camera_yaw;
+        self.input_state.camera_pitch    = snap.camera_pitch;
         self.update_camera_target_from_angles();
         tracing::info!("[Play] Snapshot restored: {} entities.", restored);
     }
@@ -772,10 +752,15 @@ impl GameApp {
             use notify::{recommended_watcher, RecursiveMode, Watcher};
             use std::path::Path;
             let (ntx, nrx) = std::sync::mpsc::channel();
-            let mut watcher = recommended_watcher(move |res| {
+            let mut watcher = match recommended_watcher(move |res| {
                 let _ = ntx.send(res);
-            })
-            .expect("Asset watcher failed");
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("[Assets] Asset watcher failed: {}", e);
+                    return;
+                }
+            };
             watcher.watch(Path::new("Content"), RecursiveMode::Recursive).ok();
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -870,7 +855,7 @@ impl ApplicationHandler for GameApp {
 
         // Update camera aspect ratio now that we know the window size.
         let phys = window.inner_size();
-        self.camera.aspect = phys.width as f32 / phys.height as f32;
+        self.input_state.camera.aspect = phys.width as f32 / phys.height as f32;
 
         // Build the GPU renderer (blocking — we are on the main thread).
         let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)));
@@ -898,11 +883,11 @@ impl ApplicationHandler for GameApp {
                 self.settings.runtime.worker_threads
             );
         }
-        if self.mesh_streaming.enabled() {
+        if self.assets.mesh_streaming.enabled() {
             tracing::info!("[Engine] Threaded mesh streaming queue enabled");
         }
 
-        self.input.configure_gamepad(
+        self.input_state.input.configure_gamepad(
             self.settings.input.gamepad_enabled,
             self.settings.input.left_stick_deadzone,
         );
@@ -948,7 +933,7 @@ impl ApplicationHandler for GameApp {
             }
 
             WindowEvent::KeyboardInput { event: ke, .. } => {
-                self.input.handle_key(ke.physical_key, ke.state == ElementState::Pressed);
+                self.input_state.input.handle_key(ke.physical_key, ke.state == ElementState::Pressed);
                 if ke.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = ke.physical_key {
                         match code {
@@ -1057,25 +1042,38 @@ impl ApplicationHandler for GameApp {
                             KeyCode::KeyF => {
                                 editor::add_foliage_patch(
                                     &mut self.world,
-                                    &mut self.meshes,
-                                    &mut self.mesh_cache,
+                                    &mut self.assets.meshes,
+                                    &mut self.assets.mesh_cache,
                                 );
                             }
                             KeyCode::KeyT => {
-                                self.terrain.raise_brush(self.terrain_cursor_x, self.terrain_cursor_z, 4, 0.15);
+                                let cs = self.terrain_world.cell_size;
+                                let w = self.terrain_world.grid.total_width;
+                                let d = self.terrain_world.grid.total_depth;
+                                let wx = self.terrain_cursor_x as f32 * cs - (w as f32 * cs * 0.5);
+                                let wz = self.terrain_cursor_z as f32 * cs - (d as f32 * cs * 0.5);
+                                self.terrain_world.raise(wx, wz, 4.0 * cs, 0.15);
                                 tracing::info!("[Terrain] Raised terrain brush at ({}, {})", self.terrain_cursor_x, self.terrain_cursor_z);
                             }
                             KeyCode::KeyG => {
-                                self.terrain.lower_brush(self.terrain_cursor_x, self.terrain_cursor_z, 4, 0.15);
+                                let cs = self.terrain_world.cell_size;
+                                let w = self.terrain_world.grid.total_width;
+                                let d = self.terrain_world.grid.total_depth;
+                                let wx = self.terrain_cursor_x as f32 * cs - (w as f32 * cs * 0.5);
+                                let wz = self.terrain_cursor_z as f32 * cs - (d as f32 * cs * 0.5);
+                                self.terrain_world.lower(wx, wz, 4.0 * cs, 0.15);
                                 tracing::info!("[Terrain] Lowered terrain brush at ({}, {})", self.terrain_cursor_x, self.terrain_cursor_z);
                             }
                             KeyCode::KeyY => {
-                                if let Some(handle) = self.mesh_cache.get("meshes/cube.obj").copied() {
+                                if let Some(handle) = self.assets.mesh_cache.get("meshes/cube.obj").copied() {
+                                    let cs = self.terrain_world.cell_size;
+                                    let w = self.terrain_world.grid.total_width;
+                                    let d = self.terrain_world.grid.total_depth;
                                     spawn_foliage_ring(
                                         &mut self.world,
                                         handle,
-                                        self.terrain_cursor_x as f32 * self.terrain.cell_size - 32.0,
-                                        self.terrain_cursor_z as f32 * self.terrain.cell_size - 32.0,
+                                        self.terrain_cursor_x as f32 * cs - (w as f32 * cs * 0.5),
+                                        self.terrain_cursor_z as f32 * cs - (d as f32 * cs * 0.5),
                                         4.0,
                                         24,
                                         true,
@@ -1086,10 +1084,13 @@ impl ApplicationHandler for GameApp {
                                 }
                             }
                             KeyCode::KeyU => {
+                                let cs = self.terrain_world.cell_size;
+                                let w = self.terrain_world.grid.total_width;
+                                let d = self.terrain_world.grid.total_depth;
                                 let removed = remove_nearby_foliage(
                                     &mut self.world,
-                                    self.terrain_cursor_x as f32 * self.terrain.cell_size - 32.0,
-                                    self.terrain_cursor_z as f32 * self.terrain.cell_size - 32.0,
+                                    self.terrain_cursor_x as f32 * cs - (w as f32 * cs * 0.5),
+                                    self.terrain_cursor_z as f32 * cs - (d as f32 * cs * 0.5),
                                     4.5,
                                 );
                                 tracing::info!("[Terrain/Foliage] Removed {} nearby foliage entities.", removed);
@@ -1097,19 +1098,19 @@ impl ApplicationHandler for GameApp {
                             KeyCode::KeyP => self.snap_camera_to_selected(),
                             KeyCode::Home => self.focus_selected_frame(),
                             KeyCode::KeyO => {
-                                self.orbit_mode = !self.orbit_mode;
+                                self.input_state.orbit_mode = !self.input_state.orbit_mode;
                                 tracing::info!(
                                     "[Camera] Orbit mode: {}",
-                                    if self.orbit_mode { "ON" } else { "OFF" }
+                                    if self.input_state.orbit_mode { "ON" } else { "OFF" }
                                 );
                             }
                             KeyCode::Minus => {
-                                self.nav_speed_scalar = (self.nav_speed_scalar * 0.9).max(0.6);
-                                tracing::info!("[Camera] Move speed: {:.2}", self.nav_speed_scalar);
+                                self.input_state.nav_speed_scalar = (self.input_state.nav_speed_scalar * 0.9).max(0.6);
+                                tracing::info!("[Camera] Move speed: {:.2}", self.input_state.nav_speed_scalar);
                             }
                             KeyCode::Equal => {
-                                self.nav_speed_scalar = (self.nav_speed_scalar * 1.12).min(80.0);
-                                tracing::info!("[Camera] Move speed: {:.2}", self.nav_speed_scalar);
+                                self.input_state.nav_speed_scalar = (self.input_state.nav_speed_scalar * 1.12).min(80.0);
+                                tracing::info!("[Camera] Move speed: {:.2}", self.input_state.nav_speed_scalar);
                             }
                             // ── Scene navigation: go back to previous scene ──
                             // Backspace triggers a transition back to the
@@ -1132,8 +1133,8 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Right {
-                    self.mouse_look_active = state == ElementState::Pressed;
-                    self.last_cursor_pos = None;
+                    self.input_state.mouse_look_active = state == ElementState::Pressed;
+                    self.input_state.last_cursor_pos = None;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1141,48 +1142,48 @@ impl ApplicationHandler for GameApp {
                     MouseScrollDelta::LineDelta(_, y) => y * 0.7,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
                 };
-                if self.orbit_mode && self.selected_renderable.is_some() {
-                    self.orbit_distance = (self.orbit_distance - amount * 0.75).clamp(0.8, 120.0);
-                    let dir = (self.camera.position - self.camera.target).normalize_or_zero();
+                if self.input_state.orbit_mode && self.selected_renderable.is_some() {
+                    self.input_state.orbit_distance = (self.input_state.orbit_distance - amount * 0.75).clamp(0.8, 120.0);
+                    let dir = (self.input_state.camera.position - self.input_state.camera.target).normalize_or_zero();
                     if dir.length_squared() > 1e-6 {
-                        self.camera.position = self.camera.target + dir * self.orbit_distance;
+                        self.input_state.camera.position = self.input_state.camera.target + dir * self.input_state.orbit_distance;
                     }
                 } else {
-                    let forward = (self.camera.target - self.camera.position).normalize_or_zero();
-                    self.camera.position += forward * amount;
+                    let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                    self.input_state.camera.position += forward * amount;
                     self.update_camera_target_from_angles();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_look_active || self.mouse_look_latched {
-                    if let Some(prev) = self.last_cursor_pos {
+                if self.input_state.mouse_look_active || self.input_state.mouse_look_latched {
+                    if let Some(prev) = self.input_state.last_cursor_pos {
                         let dx = (position.x - prev.x) as f32;
                         let dy = (position.y - prev.y) as f32;
                         let mag = ((dx * dx + dy * dy).sqrt() / 24.0).clamp(0.0, 1.8);
-                        let sensitivity = self.look_sensitivity * (1.0 + 0.45 * mag);
-                        self.camera_yaw += dx * sensitivity;
-                        self.camera_pitch =
-                            (self.camera_pitch - dy * sensitivity).clamp(-1.5, 1.5);
-                        if self.orbit_mode && self.selected_renderable.is_some() {
+                        let sensitivity = self.input_state.look_sensitivity * (1.0 + 0.45 * mag);
+                        self.input_state.camera_yaw += dx * sensitivity;
+                        self.input_state.camera_pitch =
+                            (self.input_state.camera_pitch - dy * sensitivity).clamp(-1.5, 1.5);
+                        if self.input_state.orbit_mode && self.selected_renderable.is_some() {
                             let dir = glam::Vec3::new(
-                                self.camera_yaw.cos() * self.camera_pitch.cos(),
-                                self.camera_pitch.sin(),
-                                self.camera_yaw.sin() * self.camera_pitch.cos(),
+                                self.input_state.camera_yaw.cos() * self.input_state.camera_pitch.cos(),
+                                self.input_state.camera_pitch.sin(),
+                                self.input_state.camera_yaw.sin() * self.input_state.camera_pitch.cos(),
                             )
                             .normalize_or_zero();
-                            self.camera.position = self.camera.target - dir * self.orbit_distance;
+                            self.input_state.camera.position = self.input_state.camera.target - dir * self.input_state.orbit_distance;
                         } else {
                             self.update_camera_target_from_angles();
                         }
                     }
-                    self.last_cursor_pos = Some(position);
+                    self.input_state.last_cursor_pos = Some(position);
                 } else {
-                    self.last_cursor_pos = None;
+                    self.input_state.last_cursor_pos = None;
                 }
             }
 
             WindowEvent::Resized(new_size) => {
-                self.camera.aspect = new_size.width as f32 / new_size.height as f32;
+                self.input_state.camera.aspect = new_size.width as f32 / new_size.height as f32;
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
@@ -1197,7 +1198,7 @@ impl ApplicationHandler for GameApp {
                 let now = std::time::Instant::now();
                 let dt  = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
-                self.input.update_gamepads();
+                self.input_state.input.update_gamepads();
 
                 // ── Begin frame event ──────────────────────────────────────
                 self.events.emit(BeginFrameEvent {
@@ -1209,22 +1210,22 @@ impl ApplicationHandler for GameApp {
                 // Advance time of day, update sky/weather/clouds from new state.
                 // This runs every frame (even in editor mode) so the sky preview
                 // stays live. The time speed can be set to 0 to pause.
-                let prev_hour = self.time_of_day.hour;
-                self.time_of_day.advance(dt);
-                self.sky.update_from_time(&self.time_of_day);
-                self.clouds.update(&self.weather, &self.time_of_day, dt);
-                self.lightning.update(&self.weather, dt);
+                let prev_hour = self.env.time_of_day.hour;
+                self.env.time_of_day.advance(dt);
+                self.env.sky.update_from_time(&self.env.time_of_day);
+                self.env.clouds.update(&self.env.weather, &self.env.time_of_day, dt);
+                self.env.lightning.update(&self.env.weather, dt);
 
                 // Play thunder sound + emit event when lightning strikes.
-                if self.lightning.thunder_just_fired {
+                if self.env.lightning.thunder_just_fired {
                     #[cfg(feature = "audio")]
                     if let Some(audio) = &mut self.audio {
-                        let vol = 0.4 + 0.6 * self.weather.intensity;
+                        let vol = 0.4 + 0.6 * self.env.weather.intensity;
                         audio.play_thunder(vol);
                     }
                     self.events.emit(ThunderEvent {
-                        intensity: self.lightning.flash_intensity,
-                        delay: self.lightning.thunder_delay,
+                        intensity: self.env.lightning.flash_intensity,
+                        delay: self.env.lightning.thunder_delay,
                     });
                 }
 
@@ -1233,10 +1234,10 @@ impl ApplicationHandler for GameApp {
                 // override the global weather accordingly.
                 {
                     use crate::environment::weather_zone::evaluate_weather_at;
-                    let cam = [self.camera.position.x, self.camera.position.y, self.camera.position.z];
-                    let zone_weather = evaluate_weather_at(&self.world, &self.weather, cam);
-                    self.weather.condition = zone_weather.condition;
-                    self.weather.intensity = zone_weather.intensity;
+                    let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
+                    let zone_weather = evaluate_weather_at(&self.world, &self.env.weather, cam);
+                    self.env.weather.condition = zone_weather.condition;
+                    self.env.weather.intensity = zone_weather.intensity;
                 }
 
                 // ── Wind Zone evaluation ────────────────────────────────────
@@ -1244,23 +1245,23 @@ impl ApplicationHandler for GameApp {
                 // the global wind accordingly.
                 {
                     use crate::environment::wind_zone::evaluate_wind_at;
-                    let cam = [self.camera.position.x, self.camera.position.y, self.camera.position.z];
-                    let global_dir = [self.weather.wind_direction.x, 0.0, self.weather.wind_direction.y];
+                    let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
+                    let global_dir = [self.env.weather.wind_direction.x, 0.0, self.env.weather.wind_direction.y];
                     let (dir, str) = evaluate_wind_at(
                         &self.world,
                         global_dir,
-                        self.weather.wind_strength,
+                        self.env.weather.wind_strength,
                         cam,
                     );
-                    self.weather.wind_direction = glam::Vec2::new(dir[0], dir[2]);
-                    self.weather.wind_strength = str;
+                    self.env.weather.wind_direction = glam::Vec2::new(dir[0], dir[2]);
+                    self.env.weather.wind_strength = str;
                 }
 
                 // Emit environment events through the event bus.
                 // TimeOfDayChangedEvent fires when the hour changes by >= 0.1 (about 2.4 minutes of game time).
-                if (self.time_of_day.hour - prev_hour).abs() > 0.1 {
+                if (self.env.time_of_day.hour - prev_hour).abs() > 0.1 {
                     self.events.emit(TimeOfDayChangedEvent {
-                        time: self.time_of_day.hour,
+                        time: self.env.time_of_day.hour,
                     });
                 }
 
@@ -1272,27 +1273,31 @@ impl ApplicationHandler for GameApp {
                 }
 
                 // ── Audio system update ────────────────────────────────────
-                // Clean up finished sounds each frame.
+                // Clean up finished sounds each frame; sync 3D listener.
                 if let Some(audio) = &mut self.audio {
+                    let cp = self.input_state.camera.position;
+                    let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                    audio.set_listener_position([cp.x, cp.y, cp.z]);
+                    audio.set_listener_forward([forward.x, forward.y, forward.z]);
                     audio.update();
                 }
 
                 let asset_start = std::time::Instant::now();
-                for (path, result) in self.mesh_streaming.poll_loaded() {
+                for (path, result) in self.assets.mesh_streaming.poll_loaded() {
                     match result {
                         Ok(mesh) => {
-                            if let Some(handle) = self.mesh_cache.get(&path) {
-                                self.meshes.replace(handle, mesh);
+                            if let Some(handle) = self.assets.mesh_cache.get(&path) {
+                                self.assets.meshes.replace(handle, mesh);
                             } else {
-                                let handle = self.meshes.add(mesh);
-                                self.mesh_cache.insert(path.clone(), handle);
+                                let handle = self.assets.meshes.add(mesh);
+                                self.assets.mesh_cache.insert(path.clone(), handle);
                             }
                             tracing::info!("[Assets] Mesh ready: {}", path);
                         }
                         Err(e) => self.push_error(format!("[Assets] Mesh load failed {}: {}", path, e)),
                     }
                 }
-                self.mesh_streaming.pump_requests();
+                self.assets.mesh_streaming.pump_requests();
                 let asset_time = asset_start.elapsed();
 
                 // ── Hot reload: scripts ────────────────────────────────────
@@ -1328,10 +1333,10 @@ impl ApplicationHandler for GameApp {
                     for norm in changed_assets {
                         self.mark_editor_content_dirty();
                         if norm.ends_with(".obj") || norm.ends_with(".gltf") || norm.ends_with(".glb") {
-                            if let Some(handle) = self.mesh_cache.get(&norm).copied() {
+                            if let Some(handle) = self.assets.mesh_cache.get(&norm).copied() {
                                 match Mesh::load(&norm) {
                                     Ok(mesh) => {
-                                        self.meshes.replace(&handle, mesh);
+                                        self.assets.meshes.replace(&handle, mesh);
                                         tracing::info!("[Hot] Mesh reloaded: {}", norm);
                                     }
                                     Err(e) => pending_errors.push(format!("[Hot] Mesh reload failed {}: {}", norm, e)),
@@ -1346,12 +1351,12 @@ impl ApplicationHandler for GameApp {
                             }
                             tracing::info!("[Hot] Texture reloaded: {}", norm);
                         } else if norm.ends_with(".mat") || norm.ends_with(".material") {
-                            match self.materials.reload_material_file(std::path::Path::new(&norm)) {
+                            match self.assets.materials.reload_material_file(std::path::Path::new(&norm)) {
                                 Ok(()) => tracing::info!("[Hot] Material reloaded: {}", norm),
                                 Err(e) => pending_errors.push(format!("[Hot] Material reload failed {}: {}", norm, e)),
                             }
                         } else if norm.ends_with(".prefab") {
-                            match self.prefab_registry.reload_file(std::path::Path::new(&norm)) {
+                            match self.assets.prefab_registry.reload_file(std::path::Path::new(&norm)) {
                                 Ok(()) => tracing::info!("[Hot] Prefab reloaded: {}", norm),
                                 Err(e) => pending_errors.push(format!("[Hot] Prefab reload failed {}: {}", norm, e)),
                             }
@@ -1372,9 +1377,9 @@ impl ApplicationHandler for GameApp {
                         tracing::info!("[Hot] Scene changed: {}", path);
                         match self.scene_mgr.build(
                             &mut self.world,
-                            &mut self.meshes,
-                            &mut self.mesh_cache,
-                            Some(&self.prefab_registry),
+                            &mut self.assets.meshes,
+                            &mut self.assets.mesh_cache,
+                            Some(&self.assets.prefab_registry),
                         ) {
                             Ok(_)  => {
                                 tracing::info!("[Hot] Scene rebuilt");
@@ -1399,7 +1404,7 @@ impl ApplicationHandler for GameApp {
                 }
 
                 if self.nav_rebuild_requested {
-                    self.nav_grid.rebuild(&self.terrain);
+                    self.nav_grid.rebuild_from_heights(&self.terrain_world);
                     self.nav_rebuild_requested = false;
                 }
 
@@ -1411,6 +1416,14 @@ impl ApplicationHandler for GameApp {
                 }
 
                 // ── Systems ────────────────────────────────────────────────
+                // TODO: Migrate these system calls to EngineSystems.scheduler:
+                //   - scripting_system
+                //   - character_controller_system
+                //   - physics_system
+                //   - water_trigger_system
+                //   - ragdoll_system
+                //   - animation_system
+                //   - animation_blending_system
                 // Editor Scene = authoring mode (no gameplay simulation).
                 // Game Preview = runs scripts/physics/animation, like Unreal PIE.
                 let run_sim = self.game_preview_mode && (!self.sim_paused || self.sim_step_once);
@@ -1441,9 +1454,9 @@ impl ApplicationHandler for GameApp {
                         scripting_system(
                             &mut self.world,
                             &mut self.scripts,
-                            &self.input,
-                            self.camera.position.to_array(),
-                            self.camera.target.to_array(),
+                            &self.input_state.input,
+                            self.input_state.camera.position.to_array(),
+                            self.input_state.camera.target.to_array(),
                             dt,
                             self.audio.as_mut(),
                             &self.nav_grid,
@@ -1451,15 +1464,15 @@ impl ApplicationHandler for GameApp {
                         );
                         self.scripts.drain_destroys(&mut self.world);
                         if let Some((pos, target)) = self.scripts.consume_camera_request() {
-                            self.camera.position = glam::Vec3::from_array(pos);
-                            self.camera.target = glam::Vec3::from_array(target);
+                            self.input_state.camera.position = glam::Vec3::from_array(pos);
+                            self.input_state.camera.target = glam::Vec3::from_array(target);
                             let mut dir =
-                                (self.camera.target - self.camera.position).normalize_or_zero();
+                                (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
                             if dir.length_squared() < 1e-6 {
                                 dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
                             }
-                            self.camera_yaw = dir.z.atan2(dir.x);
-                            self.camera_pitch = dir.y.asin();
+                            self.input_state.camera_yaw = dir.z.atan2(dir.x);
+                            self.input_state.camera_pitch = dir.y.asin();
                         }
                         let skip_n = self.scripts.consume_frame_skip_request();
                         if skip_n > 0 {
@@ -1556,6 +1569,17 @@ impl ApplicationHandler for GameApp {
                     ragdoll_system(&mut self.world, dt);
 
                     animation_system(&mut self.world, dt, &self.jobs);
+                    // Skeletal animation blending: reads BT "ai_state" from blackboard,
+                    // triggers crossfade transitions, evaluates blended joint matrices.
+                    animation_blending_system(&mut self.world, dt);
+                    // Node-based animation graph: evaluates state machines per-layer,
+                    // selects states based on parameters (speed, is_attacking, etc.),
+                    // feeds transitions into SkeletalAnimator for crossfade.
+                    anim_graph_system(&mut self.world, dt);
+                    // Flood system: advances water level toward target, logs newly
+                    // submerged entities. Runs after animation so submerged VFX
+                    // can react to the updated water_level on the same frame.
+                    flood_system(&mut self.levels.flood, &mut self.world, dt);
                     if self.sim_step_once {
                         self.sim_step_once = false;
                         self.sim_paused = true;
@@ -1564,23 +1588,23 @@ impl ApplicationHandler for GameApp {
 
                 // Seamless free-fly camera: RMB look + WASD move, Shift sprint, Space/Ctrl up/down.
                 {
-                    let forward = (self.camera.target - self.camera.position).normalize_or_zero();
+                    let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
                     let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
                     let up = glam::Vec3::Y;
                     let mut move_dir = glam::Vec3::ZERO;
-                    if self.input.is_held(KeyCode::KeyW) { move_dir += forward; }
-                    if self.input.is_held(KeyCode::KeyS) { move_dir -= forward; }
-                    if self.input.is_held(KeyCode::KeyD) { move_dir += right; }
-                    if self.input.is_held(KeyCode::KeyA) { move_dir -= right; }
-                    if self.input.is_held(KeyCode::Space) { move_dir += up; }
-                    if self.input.is_held(KeyCode::ControlLeft) || self.input.is_held(KeyCode::ControlRight) {
+                    if self.input_state.input.is_held(KeyCode::KeyW) { move_dir += forward; }
+                    if self.input_state.input.is_held(KeyCode::KeyS) { move_dir -= forward; }
+                    if self.input_state.input.is_held(KeyCode::KeyD) { move_dir += right; }
+                    if self.input_state.input.is_held(KeyCode::KeyA) { move_dir -= right; }
+                    if self.input_state.input.is_held(KeyCode::Space) { move_dir += up; }
+                    if self.input_state.input.is_held(KeyCode::ControlLeft) || self.input_state.input.is_held(KeyCode::ControlRight) {
                         move_dir -= up;
                     }
-                    let mut speed = self.nav_speed_scalar;
-                    if self.input.is_held(KeyCode::ShiftLeft) || self.input.is_held(KeyCode::ShiftRight) {
+                    let mut speed = self.input_state.nav_speed_scalar;
+                    if self.input_state.input.is_held(KeyCode::ShiftLeft) || self.input_state.input.is_held(KeyCode::ShiftRight) {
                         speed *= 2.2;
                     }
-                    if self.input.is_held(KeyCode::AltLeft) || self.input.is_held(KeyCode::AltRight) {
+                    if self.input_state.input.is_held(KeyCode::AltLeft) || self.input_state.input.is_held(KeyCode::AltRight) {
                         speed *= 0.35;
                     }
                     let desired_velocity = if move_dir.length_squared() > 0.0 {
@@ -1589,22 +1613,27 @@ impl ApplicationHandler for GameApp {
                         glam::Vec3::ZERO
                     };
                     let accel_blend = (1.0 - (-dt * 10.0).exp()).clamp(0.0, 1.0);
-                    self.camera_move_velocity =
-                        self.camera_move_velocity.lerp(desired_velocity, accel_blend);
-                    if self.camera_move_velocity.length_squared() < 1e-5 {
-                        self.camera_move_velocity = glam::Vec3::ZERO;
+                    self.input_state.camera_move_velocity =
+                        self.input_state.camera_move_velocity.lerp(desired_velocity, accel_blend);
+                    if self.input_state.camera_move_velocity.length_squared() < 1e-5 {
+                        self.input_state.camera_move_velocity = glam::Vec3::ZERO;
                     }
-                    let delta = self.camera_move_velocity * dt.max(0.0);
+                    let delta = self.input_state.camera_move_velocity * dt.max(0.0);
                     if delta.length_squared() > 0.0 {
-                        if self.orbit_mode && self.selected_renderable.is_some() {
-                            self.camera.target += delta;
-                            self.camera.position += delta;
+                        if self.input_state.orbit_mode && self.selected_renderable.is_some() {
+                            self.input_state.camera.target += delta;
+                            self.input_state.camera.position += delta;
                         } else {
-                            self.camera.position += delta;
+                            self.input_state.camera.position += delta;
                             self.update_camera_target_from_angles();
                         }
                     }
                 }
+
+                // ── Loading screen update ────────────────────────────────────
+                // Advance fade transitions each frame, even outside sim,
+                // so the loading screen fades out smoothly after streaming.
+                self.levels.loading_screen.update(dt);
 
                 // ── Level streaming check ──────────────────────────────────
                 // Periodically check player distance to registered levels and
@@ -1612,25 +1641,36 @@ impl ApplicationHandler for GameApp {
                 // streaming level system — levels load when the player is
                 // nearby and unload when far away.
                 {
-                    let player_pos = self.camera.position.to_array();
+                    let player_pos = self.input_state.camera.position.to_array();
                     if let Some(streaming_result) = levels::check_streaming(
-                        &self.level_manager,
+                        &self.levels.level_manager,
                         player_pos,
                         dt,
-                        &mut self.streaming_config,
+                        &mut self.levels.streaming_config,
                     ) {
                         // Unload levels first (free memory/entity slots).
                         for level_id in &streaming_result.levels_to_unload {
-                            if self.level_manager.unload_level(*level_id) {
+                            if self.levels.level_manager.unload_level(*level_id) {
                                 tracing::info!("[Streaming] Unloaded level {}", level_id);
                             }
+                        }
+                        // Show loading screen before loading new levels so the
+                        // player sees visual feedback during the transition.
+                        if !streaming_result.levels_to_load.is_empty() {
+                            self.levels.loading_screen.show("Loading level...");
                         }
                         // Load levels (mark as loaded; entities are spawned
                         // by the scene system when needed).
                         for level_id in &streaming_result.levels_to_load {
-                            if self.level_manager.load_level(*level_id) {
+                            if self.levels.level_manager.load_level(*level_id) {
                                 tracing::info!("[Streaming] Loaded level {}", level_id);
                             }
+                        }
+                        // Hide loading screen once all levels have been loaded.
+                        // The fade-out is animated by loading_screen.update(dt)
+                        // which runs every frame above.
+                        if !streaming_result.levels_to_load.is_empty() {
+                            self.levels.loading_screen.hide();
                         }
                     }
                 }
@@ -1640,17 +1680,17 @@ impl ApplicationHandler for GameApp {
                 let mut draw_stats = renderer::DrawStats::default();
                 // Sync environment state (sun position, fog) into renderer.
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.apply_environment(&self.time_of_day, &self.weather, &self.sky, &self.clouds, &self.lightning);
+                    renderer.apply_environment(&self.env.time_of_day, &self.env.weather, &self.env.sky, &self.env.clouds, &self.env.lightning);
                 }
                 // ── Particle system update ──────────────────────────────────
                 // Sync weather → emitters (enable rain/snow/mist, adjust intensity).
                 // Then advance particle physics. Particles are passed to draw_world as GpuParticle slice.
                 self.particles.apply_weather(
                     self.particle_indices,
-                    self.weather.condition,
-                    self.weather.intensity,
-                    glam::Vec3::new(self.weather.wind_direction.x, 0.0, self.weather.wind_direction.y),
-                    self.weather.wind_strength,
+                    self.env.weather.condition,
+                    self.env.weather.intensity,
+                    glam::Vec3::new(self.env.weather.wind_direction.x, 0.0, self.env.weather.wind_direction.y),
+                    self.env.weather.wind_strength,
                 );
                 // ── Fire source sync ──────────────────────────────────────────
                 // Query all entities with FireSource + Position and create/update
@@ -1672,8 +1712,83 @@ impl ApplicationHandler for GameApp {
                     }
                 }
                 self.particles.update(dt, glam::Vec3::new(
-                    self.camera.position.x, self.camera.position.y, self.camera.position.z,
+                    self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z,
                 ), self.start_time.elapsed().as_secs_f32());
+                // ── Dynamic light emission for fire and lava surfaces ─────
+                // Every frame, query all FireSurface and LavaSurface entities and
+                // ensure they have a PointLight whose color / intensity matches
+                // their emissive_light fields.  Flicker is applied by sampling a
+                // cheap sin-based function driven by elapsed time and each entity's
+                // unique ID so nearby fires don't pulse in lock-step.
+                {
+                    let sim_t = self.start_time.elapsed().as_secs_f32();
+                    // Collect (entity, is_fire) pairs so we can query the world
+                    // for each surface type and spawn / update a PointLight.
+                    // We build a Vec first to avoid borrowing issues with the world.
+                    struct EmissiveEntry {
+                        entity:  hecs::Entity,
+                        color:   [f32; 3],
+                        base_strength: f32,
+                        radius:  f32,
+                        flicker: f32,
+                    }
+                    let mut entries: Vec<EmissiveEntry> = Vec::new();
+                    // Query FireSurface entities — flicker is derived from the
+                    // surface's flicker_strength field.
+                    for (e, fs) in self.world.query::<(hecs::Entity, &components::FireSurface)>().iter() {
+                        entries.push(EmissiveEntry {
+                            entity: e,
+                            color:  fs.emissive_light_color,
+                            base_strength: fs.emissive_light_strength,
+                            radius: fs.emissive_light_radius,
+                            flicker: fs.flicker_strength,
+                        });
+                    }
+                    // Query LavaSurface entities — lava flickers less than fire,
+                    // using a small fixed flicker factor of 0.08 for subtle
+                    // variation in the glow.
+                    for (e, ls) in self.world.query::<(hecs::Entity, &components::LavaSurface)>().iter() {
+                        entries.push(EmissiveEntry {
+                            entity: e,
+                            color:  ls.emissive_light_color,
+                            base_strength: ls.emissive_light_strength,
+                            radius: ls.emissive_light_radius,
+                            flicker: 0.08,
+                        });
+                    }
+                    // Now spawn or update PointLight for each entry.
+                    for entry in &entries {
+                        // Compute a unique per-entity flicker offset so that
+                        // multiple fires/lava pools don't pulse in sync.
+                        let id_f = entry.entity.to_bits().get() as f32;
+                        // Two-phase sin for a more organic, less periodic feel.
+                        let flicker_a = (sim_t * 4.7 + id_f * 1.3).sin();
+                        let flicker_b = (sim_t * 7.3 + id_f * 2.1).sin();
+                        let flicker_mod = 1.0 + entry.flicker * (0.6 * flicker_a + 0.4 * flicker_b);
+                        let final_intensity = entry.base_strength * flicker_mod;
+                        // Check if entity already has a PointLight — if so,
+                        // update it in-place to avoid re-creating the component.
+                        if let Ok(mut pl) = self.world.get::<&mut components::PointLight>(entry.entity) {
+                            pl.color     = entry.color;
+                            pl.intensity = final_intensity;
+                            pl.range     = entry.radius;
+                            pl.light_type = 1.0; // ensure point light type
+                        } else {
+                            // Entity has no PointLight yet — insert one.  The
+                            // renderer's multi-light pass will pick it up.
+                            let _ = self.world.insert(entry.entity, (
+                                components::PointLight {
+                                    color:          entry.color,
+                                    intensity:      final_intensity,
+                                    range:          entry.radius,
+                                    light_type:     1.0, // point
+                                    spot_angle:     45.0,
+                                    shadow_casting: false,
+                                },
+                            ));
+                        }
+                    }
+                }
                 let gpu_particles = self.particles.gpu_instances();
                 if self.app_stage == AppStage::ProjectHub {
                     let hub_open = match (self.window.as_ref(), self.editor_ui.as_mut()) {
@@ -1719,8 +1834,8 @@ impl ApplicationHandler for GameApp {
                         };
                         draw_stats = renderer.draw_world(
                             &self.world,
-                            &self.meshes,
-                            &self.camera,
+                            &self.assets.meshes,
+                            &self.input_state.camera,
                             &self.jobs,
                             Some(&gpu_particles),
                             Some(&mut draw_ui),
@@ -1748,8 +1863,8 @@ impl ApplicationHandler for GameApp {
                         };
                         draw_stats = renderer.draw_world(
                             &self.world,
-                            &self.meshes,
-                            &self.camera,
+                            &self.assets.meshes,
+                            &self.input_state.camera,
                             &self.jobs,
                             Some(&gpu_particles),
                             Some(&mut draw_ui),
@@ -1773,26 +1888,26 @@ impl ApplicationHandler for GameApp {
                     }
                     if let Some(ui) = self.editor_ui.as_mut() {
                         // Snapshot weather condition before editor can modify it.
-                        let prev_condition = self.weather.condition;
-                        let prev_intensity = self.weather.intensity;
+                        let prev_condition = self.env.weather.condition;
+                        let prev_intensity = self.env.weather.intensity;
                         let mut frame_args = UiFrameArgs {
                             world: &mut self.world,
                             settings: &mut self.settings,
                             renderer,
-                            camera: &self.camera,
+                            camera: &self.input_state.camera,
                             profiler: &self.profiler,
-                            mesh_cache: &mut self.mesh_cache,
-                            meshes: &mut self.meshes,
-                            materials: &mut self.materials,
+                            mesh_cache: &mut self.assets.mesh_cache,
+                            meshes: &mut self.assets.meshes,
+                            materials: &mut self.assets.materials,
                             selected_renderable: &mut self.selected_renderable,
-                            terrain: &mut self.terrain,
+                            terrain_world: &mut self.terrain_world,
                             terrain_cursor_x: self.terrain_cursor_x,
                             terrain_cursor_z: self.terrain_cursor_z,
                             app_time_seconds: self.start_time.elapsed().as_secs_f32(),
                             sim_paused: &mut self.sim_paused,
                             sim_step_once: &mut self.sim_step_once,
                             game_preview_mode: &mut self.game_preview_mode,
-                            mouse_look_latched: &mut self.mouse_look_latched,
+                            mouse_look_latched: &mut self.input_state.mouse_look_latched,
                             error_log: &mut self.error_log,
                             nav_grid: &mut self.nav_grid,
                             nav_rebuild_requested: &mut self.nav_rebuild_requested,
@@ -1805,9 +1920,9 @@ impl ApplicationHandler for GameApp {
                             scene_path: &mut self.scene_mgr.scene_path,
                             available_scene_paths: &self.available_scene_paths,
                             requested_scene_switch: &mut self.requested_scene_switch,
-                            camera_nav_speed: self.nav_speed_scalar,
-                            time_of_day: &mut self.time_of_day,
-                            weather: &mut self.weather,
+                            camera_nav_speed: self.input_state.nav_speed_scalar,
+                            time_of_day: &mut self.env.time_of_day,
+                            weather: &mut self.env.weather,
                             audio: &mut self.audio,
                         };
                         if self.app_stage == AppStage::EditorLoading {
@@ -1816,12 +1931,12 @@ impl ApplicationHandler for GameApp {
                             ui.begin_and_build(window, &mut frame_args);
                         }
                         // Emit WeatherChangedEvent if the editor changed weather.
-                        if self.weather.condition != prev_condition
-                            || (self.weather.intensity - prev_intensity).abs() > 0.01
+                        if self.env.weather.condition != prev_condition
+                            || (self.env.weather.intensity - prev_intensity).abs() > 0.01
                         {
                             self.events.emit(WeatherChangedEvent {
-                                weather_type: format!("{:?}", self.weather.condition),
-                                intensity: self.weather.intensity,
+                                weather_type: format!("{:?}", self.env.weather.condition),
+                                intensity: self.env.weather.intensity,
                             });
                         }
                     }
@@ -1842,15 +1957,15 @@ impl ApplicationHandler for GameApp {
                     if let Some(pending_path) = self.transition.update(dt) {
                         // Screen is fully black — perform the scene swap now.
                         self.scene_mgr.scene_path = pending_path.clone();
-                        self.mesh_cache.clear();
+                        self.assets.mesh_cache.clear();
                         match self.scene_mgr.build(
                             &mut self.world,
-                            &mut self.meshes,
-                            &mut self.mesh_cache,
-                            Some(&self.prefab_registry),
+                            &mut self.assets.meshes,
+                            &mut self.assets.mesh_cache,
+                            Some(&self.assets.prefab_registry),
                         ) {
                             Ok(()) => {
-                                self.nav_grid.rebuild(&self.terrain);
+        self.nav_grid.rebuild_from_heights(&self.terrain_world);
                                 self.selected_renderable = None;
                                 content_dirty_after_render = true;
                                 self.error_log.push(format!(
@@ -1881,8 +1996,8 @@ impl ApplicationHandler for GameApp {
                     };
                     draw_stats = renderer.draw_world(
                         &self.world,
-                        &self.meshes,
-                        &self.camera,
+                        &self.assets.meshes,
+                        &self.input_state.camera,
                         &self.jobs,
                         Some(&gpu_particles),
                         Some(&mut draw_ui),

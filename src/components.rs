@@ -355,6 +355,47 @@ pub struct Renderable {
     pub scale:     [f32; 3],
 }
 
+// MaterialExtras — per-entity material shading overrides.
+// Maps to GpuMaterialExtras in the renderer (binding 6).
+#[derive(Clone, Copy)]
+pub struct MaterialExtras {
+    /// Subsurface scattering amount (0 = off, 1 = full SSS).
+    pub subsurface: f32,
+    /// Clearcoat layer strength (0 = off, 1 = full clearcoat).
+    pub clearcoat: f32,
+    /// Clearcoat roughness (0 = mirror, 1 = rough clearcoat).
+    pub clearcoat_roughness: f32,
+    /// Emissive intensity multiplier (0 = none, 10 = very bright).
+    pub emissive_strength: f32,
+}
+
+impl Default for MaterialExtras {
+    fn default() -> Self {
+        Self {
+            subsurface: 0.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.0,
+            emissive_strength: 0.0,
+        }
+    }
+}
+
+// TerrainBlend — distance-based alpha blending so placed objects smoothly
+// merge into the terrain.  The bottom vertices of the mesh fade out based
+// on blend_distance (world units of fade zone) and blend_offset (model-space Y shift).
+#[derive(Clone, Copy)]
+pub struct TerrainBlend {
+    /// World-space height of the fade zone at the object's base (0 = disabled).
+    pub blend_distance: f32,
+    /// Model-space Y offset for the fade origin (shifts the fade zone up/down).
+    pub blend_offset: f32,
+}
+
+impl Default for TerrainBlend {
+    fn default() -> Self {
+        Self { blend_distance: 0.0, blend_offset: 0.0 }
+    }
+}
 
 // Health — tracks hit points for any entity that can take damage.
 pub struct Health {
@@ -471,6 +512,21 @@ pub struct LavaSurface {
     pub displacement_amp: f32,
     /// Overall opacity (0 = invisible, 1 = fully opaque).
     pub opacity: f32,
+
+    // ── Dynamic light emission fields ──────────────────────────────────────
+    // These control a point light that is automatically spawned at the entity's
+    // position each frame, giving lava surfaces RDR2-quality dynamic lighting
+    // that illuminates nearby geometry in real-time.
+
+    /// Intensity of the dynamic point light emitted by this lava surface.
+    /// Higher values cast brighter light onto surrounding surfaces.
+    pub emissive_light_strength: f32,
+    /// Radius (range) of the dynamic point light in world units.
+    /// Controls how far the light reaches from the lava surface.
+    pub emissive_light_radius: f32,
+    /// RGB colour of the dynamic point light (0-1 per channel).
+    /// Defaults to a deep molten orange to match the emissive crack colour.
+    pub emissive_light_color: [f32; 3],
 }
 
 impl Default for LavaSurface {
@@ -484,6 +540,10 @@ impl Default for LavaSurface {
             crack_threshold:  0.45,
             displacement_amp: 0.08,
             opacity:          1.0,
+            // Dynamic light defaults — deep orange glow, moderate range.
+            emissive_light_strength: 1.5,
+            emissive_light_radius:   12.0,
+            emissive_light_color:    [1.0, 0.3, 0.02],
         }
     }
 }
@@ -513,6 +573,22 @@ pub struct FireSurface {
     pub flame_height: f32,
     /// Overall opacity (0 = invisible, 1 = fully visible).
     pub opacity: f32,
+
+    // ── Dynamic light emission fields ──────────────────────────────────────
+    // These control a point light that is automatically spawned at the entity's
+    // position each frame, giving fire surfaces RDR2-quality dynamic lighting
+    // that casts flickering orange light onto nearby geometry.
+
+    /// Intensity of the dynamic point light emitted by this fire surface.
+    /// This value is modulated by flicker_strength each frame for realistic
+    /// fire-light dancing on nearby surfaces.
+    pub emissive_light_strength: f32,
+    /// Radius (range) of the dynamic point light in world units.
+    /// Controls how far the fire light reaches from the flame.
+    pub emissive_light_radius: f32,
+    /// RGB colour of the dynamic point light (0-1 per channel).
+    /// Defaults to warm orange to match typical fire illumination.
+    pub emissive_light_color: [f32; 3],
 }
 
 impl Default for FireSurface {
@@ -526,6 +602,10 @@ impl Default for FireSurface {
             flicker_strength: 0.15,
             flame_height:     2.0,
             opacity:          0.9,
+            // Dynamic light defaults — warm fire glow, moderate range.
+            emissive_light_strength: 2.0,
+            emissive_light_radius:   8.0,
+            emissive_light_color:    [1.0, 0.6, 0.1],
         }
     }
 }
@@ -710,8 +790,219 @@ impl Default for Children {
     }
 }
 
+// ── Smart Water System ─────────────────────────────────────────────────────
+// Water body types enable auto-generated water surfaces, physics volumes,
+// collision, reflections, and underwater effects per body type.
+
+/// Water body type classification. Each type auto-configures wave params,
+/// physics, rendering, and interaction behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WaterBodyType {
+    Ocean,
+    Lake,
+    River,
+    Pond,
+    Stream,
+    Waterfall,
+    Swamp,
+}
+
+impl WaterBodyType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ocean => "Ocean",
+            Self::Lake => "Lake",
+            Self::River => "River",
+            Self::Pond => "Pond",
+            Self::Stream => "Stream",
+            Self::Waterfall => "Waterfall",
+            Self::Swamp => "Swamp",
+        }
+    }
+}
+
+impl Default for WaterBodyType {
+    fn default() -> Self { Self::Lake }
+}
+
+/// Smart Water Body component — replaces plain WaterSurface for placed water.
+/// Auto-generates surface mesh, material, physics volume, swimming volume,
+/// collision, reflections, LOD, streaming, and underwater rendering.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WaterBody {
+    pub body_type: WaterBodyType,
+    pub size_x: f32,
+    pub size_z: f32,
+    pub depth: f32,
+    pub flow_direction: [f32; 3],
+    pub flow_speed: f32,
+    pub turbulence: f32,
+    pub auto_surface: bool,
+    pub auto_physics: bool,
+    pub auto_collision: bool,
+    pub auto_reflections: bool,
+    pub auto_underwater: bool,
+    pub lod_distance: f32,
+}
+
+impl Default for WaterBody {
+    fn default() -> Self {
+        Self {
+            body_type: WaterBodyType::Lake,
+            size_x: 50.0,
+            size_z: 50.0,
+            depth: 10.0,
+            flow_direction: [1.0, 0.0, 0.0],
+            flow_speed: 1.0,
+            turbulence: 0.3,
+            auto_surface: true,
+            auto_physics: true,
+            auto_collision: true,
+            auto_reflections: true,
+            auto_underwater: true,
+            lod_distance: 200.0,
+        }
+    }
+}
+
+/// Underwater rendering settings applied when camera is below the waterline.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct UnderwaterSettings {
+    pub tint: [f32; 3],
+    pub fog_density: f32,
+    pub caustics_intensity: f32,
+    pub god_rays_intensity: f32,
+    pub bloom_strength: f32,
+    pub distortion_strength: f32,
+    pub swimming_enabled: bool,
+    pub buoyancy_force: f32,
+}
+
+impl Default for UnderwaterSettings {
+    fn default() -> Self {
+        Self {
+            tint: [0.01, 0.08, 0.12],
+            fog_density: 0.04,
+            caustics_intensity: 0.6,
+            god_rays_intensity: 0.3,
+            bloom_strength: 0.15,
+            distortion_strength: 0.003,
+            swimming_enabled: true,
+            buoyancy_force: 8.0,
+        }
+    }
+}
+
 /// Marks an entity as a "folder" or "group" node in the hierarchy.
 /// Folder nodes don't have renderables — they're purely organizational.
+
+/// Terrain brush mode — controls which operation the terrain brush performs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TerrainBrushMode {
+    Raise,
+    Lower,
+    Smooth,
+    Flatten,
+    Paint,
+    Foliage,
+}
+
+impl TerrainBrushMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Raise   => "Raise",
+            Self::Lower   => "Lower",
+            Self::Smooth  => "Smooth",
+            Self::Flatten => "Flatten",
+            Self::Paint   => "Paint",
+            Self::Foliage => "Foliage",
+        }
+    }
+    pub fn key_hint(self) -> &'static str {
+        match self {
+            Self::Raise   => "1",
+            Self::Lower   => "2",
+            Self::Smooth  => "3",
+            Self::Flatten => "4",
+            Self::Paint   => "5",
+            Self::Foliage => "6",
+        }
+    }
+}
+
+impl Default for TerrainBrushMode {
+    fn default() -> Self { Self::Raise }
+}
+
+/// Terrain editor component — attach to any entity to enable terrain brush editing
+/// when that entity is selected. The brush applies operations to the global TerrainWorld
+/// at the cursor position projected from the viewport.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TerrainEditor {
+    pub active: bool,
+    pub brush_mode: TerrainBrushMode,
+    pub brush_radius: f32,
+    pub brush_strength: f32,
+    pub flatten_target: f32,
+    pub show_cursor: bool,
+}
+
+impl Default for TerrainEditor {
+    fn default() -> Self {
+        Self {
+            active: false,
+            brush_mode: TerrainBrushMode::Raise,
+            brush_radius: 5.0,
+            brush_strength: 0.5,
+            flatten_target: 0.0,
+            show_cursor: true,
+        }
+    }
+}
+
+/// Per-asset foliage settings for the Smart Foliage system.
+/// Controls visibility, locking, density, scale, rotation, slope/height limits
+/// for individual foliage species placed by the foliage painter.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SmartFoliageAsset {
+    pub visible: bool,
+    pub locked: bool,
+    pub density_multiplier: f32,
+    pub min_scale: f32,
+    pub max_scale: f32,
+    pub random_rotation: bool,
+    pub min_slope_deg: f32,
+    pub max_slope_deg: f32,
+    pub min_height: f32,
+    pub max_height: f32,
+    pub paint_mode: FoliagePaintMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FoliagePaintMode {
+    Paint,
+    Erase,
+    Fill,
+    Procedural,
+}
+
+impl Default for SmartFoliageAsset {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            locked: false,
+            density_multiplier: 1.0,
+            min_scale: 0.8,
+            max_scale: 1.2,
+            random_rotation: true,
+            min_slope_deg: 0.0,
+            max_slope_deg: 60.0,
+            min_height: -10.0,
+            max_height: 500.0,
+            paint_mode: FoliagePaintMode::Paint,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct GroupNode {
     /// Display name for this group.

@@ -1,10 +1,9 @@
 #![allow(deprecated)]
 
+mod panels;
+
 use std::fs;
 use std::collections::HashMap;
-
-#[path = "editor_ui/panels/mod.rs"]
-mod panels;
 
 use crate::editor;
 use crate::editor_assets::{AssetMetadataDb, IconRegistry};
@@ -14,7 +13,7 @@ use crate::materials::MaterialLibrary;
 use crate::profiler::FrameProfiler;
 use crate::renderer::{RenderFeatures, Renderer};
 use crate::settings::{EngineSettings, RenderPreset};
-use crate::terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainGrid};
+use crate::terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainWorld};
 use crate::navigation::NavGrid;
 use crate::scripting::ScriptEngine;
 use crate::camera::Camera;
@@ -81,7 +80,7 @@ pub(crate) enum GizmoMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GizmoAxis {
+pub(crate) enum GizmoAxis {
     X,
     Y,
     Z,
@@ -144,6 +143,10 @@ pub struct EditorUi {
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDragState>,
     gizmo_space: GizmoSpace,
+    gizmo_axis_lock: Option<GizmoAxis>,
+    terrain_mode: bool,
+    terrain_brush_mode: components::TerrainBrushMode,
+    terrain_brush_radius: f32,
     snap_translate: f32,
     snap_rotate_deg: f32,
     snap_scale: f32,
@@ -222,7 +225,7 @@ pub struct UiFrameArgs<'a> {
     pub meshes: &'a mut assets::AssetStore<assets::Mesh>,
     pub materials: &'a mut MaterialLibrary,
     pub selected_renderable: &'a mut Option<hecs::Entity>,
-    pub terrain: &'a mut TerrainGrid,
+    pub terrain_world: &'a mut TerrainWorld,
     pub terrain_cursor_x: usize,
     pub terrain_cursor_z: usize,
     pub app_time_seconds: f32,
@@ -480,6 +483,10 @@ impl EditorUi {
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
             gizmo_space: GizmoSpace::World,
+            gizmo_axis_lock: None,
+            terrain_mode: false,
+            terrain_brush_mode: components::TerrainBrushMode::Raise,
+            terrain_brush_radius: 5.0,
             snap_translate: 0.25,
             snap_rotate_deg: 5.0,
             snap_scale: 0.1,
@@ -1373,6 +1380,10 @@ impl EditorUi {
                 &mut self.gizmo_mode,
                 &mut self.gizmo_drag,
                 &mut self.gizmo_space,
+                &mut self.gizmo_axis_lock,
+                &mut self.terrain_mode,
+                &mut self.terrain_brush_mode,
+                &mut self.terrain_brush_radius,
                 &mut self.snap_enabled,
                 &mut self.snap_translate,
                 &mut self.snap_rotate_deg,
@@ -1553,6 +1564,10 @@ fn build_ui(
     gizmo_mode: &mut GizmoMode,
     gizmo_drag: &mut Option<GizmoDragState>,
     gizmo_space: &mut GizmoSpace,
+    gizmo_axis_lock: &mut Option<GizmoAxis>,
+    terrain_mode: &mut bool,
+    terrain_brush_mode: &mut components::TerrainBrushMode,
+    terrain_brush_radius: &mut f32,
     snap_enabled: &mut bool,
     snap_translate: &mut f32,
     snap_rotate_deg: &mut f32,
@@ -1593,10 +1608,49 @@ fn build_ui(
         }
         if i.key_pressed(egui::Key::W) {
             *gizmo_mode = GizmoMode::Move;
+            if !*terrain_mode { *gizmo_axis_lock = None; }
         } else if i.key_pressed(egui::Key::E) {
             *gizmo_mode = GizmoMode::Rotate;
+            if !*terrain_mode { *gizmo_axis_lock = None; }
         } else if i.key_pressed(egui::Key::R) {
             *gizmo_mode = GizmoMode::Scale;
+            if !*terrain_mode { *gizmo_axis_lock = None; }
+        }
+        if i.key_pressed(egui::Key::X) && !command && !*terrain_mode {
+            *gizmo_axis_lock = match *gizmo_axis_lock {
+                Some(GizmoAxis::X) => None,
+                _ => Some(GizmoAxis::X),
+            };
+        }
+        if i.key_pressed(egui::Key::Y) && !command && !*terrain_mode {
+            *gizmo_axis_lock = match *gizmo_axis_lock {
+                Some(GizmoAxis::Y) => None,
+                _ => Some(GizmoAxis::Y),
+            };
+        }
+        if i.key_pressed(egui::Key::Z) && !command && !*terrain_mode {
+            *gizmo_axis_lock = match *gizmo_axis_lock {
+                Some(GizmoAxis::Z) => None,
+                _ => Some(GizmoAxis::Z),
+            };
+        }
+        if i.key_pressed(egui::Key::T) {
+            *terrain_mode = !*terrain_mode;
+            if *terrain_mode { *gizmo_axis_lock = None; }
+        }
+        if *terrain_mode {
+            if i.key_pressed(egui::Key::Num1) { *terrain_brush_mode = components::TerrainBrushMode::Raise; }
+            if i.key_pressed(egui::Key::Num2) { *terrain_brush_mode = components::TerrainBrushMode::Lower; }
+            if i.key_pressed(egui::Key::Num3) { *terrain_brush_mode = components::TerrainBrushMode::Smooth; }
+            if i.key_pressed(egui::Key::Num4) { *terrain_brush_mode = components::TerrainBrushMode::Flatten; }
+            if i.key_pressed(egui::Key::Num5) { *terrain_brush_mode = components::TerrainBrushMode::Paint; }
+            if i.key_pressed(egui::Key::Num6) { *terrain_brush_mode = components::TerrainBrushMode::Foliage; }
+            if i.key_pressed(egui::Key::OpenBracket) {
+                *terrain_brush_radius = (*terrain_brush_radius - 0.5).max(0.5);
+            }
+            if i.key_pressed(egui::Key::CloseBracket) {
+                *terrain_brush_radius = (*terrain_brush_radius + 0.5).min(50.0);
+            }
         }
     });
 
@@ -1626,6 +1680,10 @@ fn build_ui(
             gizmo_mode: &'a mut GizmoMode,
             gizmo_drag: &'a mut Option<GizmoDragState>,
             gizmo_space: GizmoSpace,
+            gizmo_axis_lock: &'a mut Option<GizmoAxis>,
+            terrain_mode: &'a mut bool,
+            terrain_brush_mode: &'a mut components::TerrainBrushMode,
+            terrain_brush_radius: &'a mut f32,
             snap_enabled: bool,
             snap_translate: f32,
             snap_rotate_deg: f32,
@@ -1665,6 +1723,10 @@ fn build_ui(
                         self.gizmo_mode,
                         self.gizmo_drag,
                         self.gizmo_space,
+                        *self.gizmo_axis_lock,
+                        *self.terrain_mode,
+                        *self.terrain_brush_mode,
+                        *self.terrain_brush_radius,
                         self.snap_enabled,
                         self.snap_translate,
                         self.snap_rotate_deg,
@@ -2004,6 +2066,10 @@ fn build_ui(
                         gizmo_mode,
                         gizmo_drag,
                         gizmo_space: *gizmo_space,
+                        gizmo_axis_lock,
+                        terrain_mode,
+                        terrain_brush_mode,
+                        terrain_brush_radius,
                         snap_enabled: *snap_enabled,
                         snap_translate: *snap_translate,
                         snap_rotate_deg: *snap_rotate_deg,
@@ -2096,8 +2162,8 @@ fn build_ui(
                         "Foliage",
                         "Brush-style tooling built on the foliage features your engine already has.",
                     );
-                    let wx = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
-                    let wz = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
+                    let wx = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
+                    let wz = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
                     editor_tool_card(ui, "Brush", |ui| {
                         ui.label(format!("Cursor world position: ({wx:.1}, {wz:.1})"));
                         let mut ring_radius = ui.data_mut(|d| d.get_temp::<f32>("foliage_ring_radius_window".into())).unwrap_or(4.0);
@@ -3011,6 +3077,10 @@ UiWidgetKind::Slider => {
         gizmo_mode: &'a mut GizmoMode,
         gizmo_drag: &'a mut Option<GizmoDragState>,
         gizmo_space: GizmoSpace,
+        gizmo_axis_lock: &'a mut Option<GizmoAxis>,
+        terrain_mode: &'a mut bool,
+        terrain_brush_mode: &'a mut components::TerrainBrushMode,
+        terrain_brush_radius: &'a mut f32,
         snap_enabled: bool,
         snap_translate: f32,
         snap_rotate_deg: f32,
@@ -3049,6 +3119,10 @@ UiWidgetKind::Slider => {
                         self.gizmo_mode,
                         self.gizmo_drag,
                         self.gizmo_space,
+                        *self.gizmo_axis_lock,
+                        *self.terrain_mode,
+                        *self.terrain_brush_mode,
+                        *self.terrain_brush_radius,
                         self.snap_enabled,
                         self.snap_translate,
                         self.snap_rotate_deg,
@@ -3152,6 +3226,10 @@ UiWidgetKind::Slider => {
                 gizmo_mode,
                 gizmo_drag,
                 gizmo_space: *gizmo_space,
+                gizmo_axis_lock,
+                terrain_mode,
+                terrain_brush_mode,
+                terrain_brush_radius,
                 snap_enabled: *snap_enabled,
                 snap_translate: *snap_translate,
                 snap_rotate_deg: *snap_rotate_deg,
@@ -3610,16 +3688,16 @@ UiWidgetKind::Slider => {
         ui.collapsing("Terrain Auto Material", |ui| {
             ui.label("Grass on flats, dirt transitions, rock on steep/high areas.");
             ui.add(
-                egui::Slider::new(&mut args.terrain.material.slope_rock_start, 0.1..=1.6)
+                egui::Slider::new(&mut args.terrain_world.material.slope_rock_start, 0.1..=1.6)
                     .text("Rock from slope"),
             );
             ui.add(
-                egui::Slider::new(&mut args.terrain.material.height_rock_start, 0.0..=6.0)
+                egui::Slider::new(&mut args.terrain_world.material.height_rock_start, 0.0..=6.0)
                     .text("Rock from height"),
             );
-            let world_x = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
-            let world_z = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
-            let preview = args.terrain.auto_surface_color_world(world_x, world_z);
+            let world_x = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
+            let world_z = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
+            let preview = args.terrain_world.auto_surface_color_world(world_x, world_z);
             let col = Color32::from_rgb(
                 (preview[0] * 255.0) as u8,
                 (preview[1] * 255.0) as u8,
@@ -3921,8 +3999,8 @@ UiWidgetKind::Slider => {
                         spawn_foliage_ring(
                             args.world,
                             handle,
-                            args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0,
-                            args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0,
+                            args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0,
+                            args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0,
                             4.0,
                             24,
                             true,
@@ -3932,8 +4010,8 @@ UiWidgetKind::Slider => {
                 if ui.button("Remove nearby foliage").clicked() {
                     let _ = remove_nearby_foliage(
                         args.world,
-                        args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0,
-                        args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0,
+                        args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0,
+                        args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0,
                         4.5,
                     );
                 }
@@ -4053,6 +4131,7 @@ UiWidgetKind::Slider => {
                 gizmo_mode,
                 gizmo_drag,
                 *gizmo_space,
+                *gizmo_axis_lock,
                 *snap_enabled,
                 *snap_translate,
                 *snap_rotate_deg,
@@ -4732,9 +4811,9 @@ UiWidgetKind::Slider => {
 }
 
 fn terrain_color_at_cursor(args: &UiFrameArgs<'_>) -> [f32; 3] {
-    let world_x = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
-    let world_z = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
-    args.terrain.auto_surface_color_world(world_x, world_z)
+    let world_x = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
+    let world_z = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
+    args.terrain_world.auto_surface_color_world(world_x, world_z)
 }
 
 fn save_dock_layout(dock_state: &DockState<EditorDockTab>, workspace_preset: &str) {
@@ -5031,10 +5110,16 @@ fn nearest_axis_hit(
         (GizmoAxis::YZ, d(pointer, yz_center)),
         (GizmoAxis::ZX, d(pointer, zx_center)),
     ];
+    let mut best_plane: Option<(GizmoAxis, f32)> = None;
     for (ax, dist) in plane_hits {
         if dist <= 10.0 {
-            return Some(ax);
+            if best_plane.map_or(true, |(_, best)| dist < best) {
+                best_plane = Some((ax, dist));
+            }
         }
+    }
+    if let Some((ax, _)) = best_plane {
+        return Some(ax);
     }
     if d(pointer, origin) < 8.0 {
         return if matches!(mode, GizmoMode::Move) {
@@ -5069,6 +5154,7 @@ pub(crate) fn draw_transform_gizmo(
     mode: &mut GizmoMode,
     drag: &mut Option<GizmoDragState>,
     space: GizmoSpace,
+    axis_lock: Option<GizmoAxis>,
     snap_enabled: bool,
     snap_translate: f32,
     snap_rotate_deg: f32,
@@ -5108,7 +5194,7 @@ pub(crate) fn draw_transform_gizmo(
     let z_col = Color32::from_rgb(105, 165, 255);
     let hover_axis = if drag.is_none() {
         pointer.and_then(|ptr| {
-            nearest_axis_hit(
+            let hit = nearest_axis_hit(
                 ptr,
                 origin,
                 x_end,
@@ -5118,7 +5204,17 @@ pub(crate) fn draw_transform_gizmo(
                 yz_center,
                 zx_center,
                 *mode,
-            )
+            );
+            if let Some(lock) = axis_lock {
+                match lock {
+                    GizmoAxis::X => hit.filter(|a| matches!(a, GizmoAxis::X)),
+                    GizmoAxis::Y => hit.filter(|a| matches!(a, GizmoAxis::Y)),
+                    GizmoAxis::Z => hit.filter(|a| matches!(a, GizmoAxis::Z)),
+                    _ => hit,
+                }
+            } else {
+                hit
+            }
         })
     } else {
         None
@@ -5192,24 +5288,39 @@ pub(crate) fn draw_transform_gizmo(
             p.circle_stroke(origin, 66.0, stroke_for(GizmoAxis::Z, z_col));
         }
     }
-    p.text(x_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "X", egui::FontId::proportional(11.0), x_col);
-    p.text(y_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "Y", egui::FontId::proportional(11.0), y_col);
-    p.text(z_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "Z", egui::FontId::proportional(11.0), z_col);
+    let lock_label = |ax: GizmoAxis, col: Color32| {
+        if Some(ax) == axis_lock { Color32::from_rgb(255, 255, 100) } else { col }
+    };
+    p.text(x_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "X", egui::FontId::proportional(11.0), lock_label(GizmoAxis::X, x_col));
+    p.text(y_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "Y", egui::FontId::proportional(11.0), lock_label(GizmoAxis::Y, y_col));
+    p.text(z_end + egui::vec2(5.0, -5.0), egui::Align2::LEFT_BOTTOM, "Z", egui::FontId::proportional(11.0), lock_label(GizmoAxis::Z, z_col));
 
     if let Some(ptr) = pointer {
         let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
         if drag.is_none() && primary_down {
-            if let Some(axis) = nearest_axis_hit(
-                ptr,
-                origin,
-                x_end,
-                y_end,
-                z_end,
-                xy_center,
-                yz_center,
-                zx_center,
-                *mode,
-            ) {
+            if let Some(axis) = {
+                let hit = nearest_axis_hit(
+                    ptr,
+                    origin,
+                    x_end,
+                    y_end,
+                    z_end,
+                    xy_center,
+                    yz_center,
+                    zx_center,
+                    *mode,
+                );
+                if let Some(lock) = axis_lock {
+                    match lock {
+                        GizmoAxis::X => hit.filter(|a| matches!(a, GizmoAxis::X)),
+                        GizmoAxis::Y => hit.filter(|a| matches!(a, GizmoAxis::Y)),
+                        GizmoAxis::Z => hit.filter(|a| matches!(a, GizmoAxis::Z)),
+                        _ => hit,
+                    }
+                } else {
+                    hit
+                }
+            } {
                 let rot = args.world.get::<&components::Rotation>(entity).ok();
                 let rend = args.world.get::<&components::Renderable>(entity).ok();
                 let (axis_screen, axis_screen_2) = match axis {
@@ -5509,9 +5620,9 @@ fn spawn_mesh_entity(
     color: [f32; 3],
     with_physics: bool,
 ) -> Result<(), String> {
-    let x = args.terrain_cursor_x as f32 * args.terrain.cell_size - 32.0;
-    let z = args.terrain_cursor_z as f32 * args.terrain.cell_size - 32.0;
-    let y = args.terrain.sample_height_world(x, z) + 0.5;
+    let x = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
+    let z = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
+    let y = args.terrain_world.height_at(x, z) + 0.5;
     let entity = args.world.spawn((
         components::Position { x, y, z },
         components::Rotation {
