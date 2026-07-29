@@ -109,7 +109,9 @@ impl PrefabRegistry {
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("prefab") {
-                self.load_file(&path);
+                if let Err(e) = self.load_file(&path) {
+                    tracing::error!("[Prefab] Failed to load {}: {}", path.display(), e);
+                }
             }
         }
     }

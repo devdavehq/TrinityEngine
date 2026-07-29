@@ -15,7 +15,7 @@
 //   apply_delta(world, delta); // only processes changes
 // ──────────────────────────────────────────────────────────────────────────────
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

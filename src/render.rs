@@ -20,6 +20,5 @@ pub mod instancing;
 pub mod graph;
 pub mod shader_manager;
 
-pub use instancing::{InstanceData, InstancingManager};
-pub use graph::{RenderGraph, ResourceId, ResourceDesc, build_default_graph};
+pub use instancing::InstancingManager;
 pub use shader_manager::ShaderManager;

@@ -96,6 +96,8 @@ pub struct InstanceBatch {
     pub buffer: Option<wgpu::Buffer>,
     /// True if instances changed this frame and buffer needs upload.
     pub dirty: bool,
+    /// Vertex count for the last uploaded LOD of this mesh (for draw call).
+    pub vertex_count: u32,
 }
 
 impl InstanceBatch {
@@ -106,6 +108,7 @@ impl InstanceBatch {
             instances: Vec::new(),
             buffer: None,
             dirty: true,
+            vertex_count: 0,
         }
     }
 }

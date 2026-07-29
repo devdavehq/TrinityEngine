@@ -362,7 +362,7 @@ impl TerrainBiomeSystem {
         let wl = self.water_level;
         let h_factor = self.height_moisture_factor;
         let radius = self.water_influence_radius;
-        let radius_i = radius.ceil() as isize;
+        let _radius_i = radius.ceil() as isize;
 
         // Collect water-cell positions for the proximity pass.
         let water_cells: Vec<(isize, isize)> = (0..d)

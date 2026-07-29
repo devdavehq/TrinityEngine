@@ -218,6 +218,129 @@ impl Default for CapsuleCollider {
     }
 }
 
+// PhysicsMaterial — defines surface properties for collision response.
+// Separate from RigidBody so multiple bodies can share the same material.
+// This is the foundation for a full physics material system like Chaos/PhysX.
+#[derive(Clone, Copy)]
+pub struct PhysicsMaterial {
+    /// Static friction coefficient (0 = ice, >1 = rubber).
+    pub static_friction: f32,
+    /// Dynamic friction coefficient (usually slightly less than static).
+    pub dynamic_friction: f32,
+    /// Restitution (bounciness): 0 = inelastic, 1 = perfectly elastic.
+    pub restitution: f32,
+    /// How to combine friction with the other material in a collision.
+    pub friction_combine: CombineMode,
+    /// How to combine restitution with the other material in a collision.
+    pub restitution_combine: CombineMode,
+    /// Density in kg/m^3 (affects mass when computed from volume).
+    pub density: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CombineMode {
+    /// Average: (a + b) / 2
+    Average,
+    /// Minimum: min(a, b)
+    Minimum,
+    /// Maximum: max(a, b)
+    Maximum,
+    /// Multiply: a * b
+    Multiply,
+}
+
+impl PhysicsMaterial {
+    /// Default physical material (generic solid object).
+    pub fn solid() -> Self {
+        Self {
+            static_friction: 0.6,
+            dynamic_friction: 0.5,
+            restitution: 0.1,
+            friction_combine: CombineMode::Average,
+            restitution_combine: CombineMode::Average,
+            density: 1000.0,
+        }
+    }
+
+    /// Ice: very slippery, low friction.
+    pub fn ice() -> Self {
+        Self {
+            static_friction: 0.05,
+            dynamic_friction: 0.03,
+            restitution: 0.2,
+            friction_combine: CombineMode::Minimum,
+            restitution_combine: CombineMode::Average,
+            density: 900.0,
+        }
+    }
+
+    /// Rubber: high friction, moderate bounce.
+    pub fn rubber() -> Self {
+        Self {
+            static_friction: 1.2,
+            dynamic_friction: 1.0,
+            restitution: 0.6,
+            friction_combine: CombineMode::Average,
+            restitution_combine: CombineMode::Maximum,
+            density: 1200.0,
+        }
+    }
+
+    /// Metal: moderate friction, low restitution.
+    pub fn metal() -> Self {
+        Self {
+            static_friction: 0.5,
+            dynamic_friction: 0.4,
+            restitution: 0.05,
+            friction_combine: CombineMode::Average,
+            restitution_combine: CombineMode::Average,
+            density: 7800.0,
+        }
+    }
+
+    /// Combined friction value from two materials.
+    pub fn combine_friction(a: &Self, b: &Self) -> f32 {
+        match (a.friction_combine, b.friction_combine) {
+            (CombineMode::Average, _) | (_, CombineMode::Average) => {
+                (a.static_friction + b.static_friction) * 0.5
+            }
+            (CombineMode::Minimum, _) | (_, CombineMode::Minimum) => {
+                a.static_friction.min(b.static_friction)
+            }
+            (CombineMode::Maximum, _) | (_, CombineMode::Maximum) => {
+                a.static_friction.max(b.static_friction)
+            }
+            (CombineMode::Multiply, CombineMode::Multiply) => {
+                a.static_friction * b.static_friction
+            }
+        }
+    }
+
+    /// Combined restitution from two materials.
+    pub fn combine_restitution(a: &Self, b: &Self) -> f32 {
+        match (a.restitution_combine, b.restitution_combine) {
+            (CombineMode::Average, _) | (_, CombineMode::Average) => {
+                (a.restitution + b.restitution) * 0.5
+            }
+            (CombineMode::Minimum, _) | (_, CombineMode::Minimum) => {
+                a.restitution.min(b.restitution)
+            }
+            (CombineMode::Maximum, _) | (_, CombineMode::Maximum) => {
+                a.restitution.max(b.restitution)
+            }
+            (CombineMode::Multiply, CombineMode::Multiply) => {
+                a.restitution * b.restitution
+            }
+        }
+    }
+}
+
+impl Default for PhysicsMaterial {
+    fn default() -> Self {
+        Self::solid()
+    }
+}
+
 // CharacterController — first/third-person movement with slope, step, wall handling.
 #[derive(Clone, Copy)]
 pub struct CharacterController {

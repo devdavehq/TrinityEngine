@@ -14,7 +14,9 @@ pub struct Vertex {
     pub metallic:  f32,       // 60 — 0 = non-metal, 1 = metal
     pub roughness: f32,       // 64 — 0 = mirror, 1 = fully matte
     pub ao:        f32,       // 68 — ambient occlusion (0 = occluded, 1 = open)
-    _pad: f32,                // 72 — total 76 bytes, aligns to 16
+    pub bone_indices: [u32; 4], // 72 — bone indices for GPU skinning (4 × u32 = 16 bytes)
+    pub bone_weights: [f32; 4], // 88 — bone weights for GPU skinning (4 × f32 = 16 bytes)
+    // Total: 104 bytes (padded to 112 via repr(C) alignment)
 }
 
 impl Vertex {
@@ -29,8 +31,9 @@ impl Vertex {
             color,
             metallic:  0.0,
             roughness: 0.5,
-            ao:        1.0,
-            _pad:      0.0,
+            ao:           1.0,
+            bone_indices: [0, 0, 0, 0],
+            bone_weights: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -56,7 +59,7 @@ pub fn compute_tangents(vertices: &mut [Vertex]) {
         let p2 = glam::Vec3::from_array(tri[2].position);
 
         let edge1 = p1 - p0;
-        let edge2 = p2 - p0;
+        let _edge2 = p2 - p0;
 
         // Tangent = first edge direction (approximation without UVs).
         let t = edge1;
@@ -76,7 +79,6 @@ pub fn compute_tangents(vertices: &mut [Vertex]) {
     // Normalize and re-orthogonalize via Gram-Schmidt.
     for v in vertices.iter_mut() {
         let mut t = glam::Vec3::from_array(v.tangent);
-        let mut b = glam::Vec3::from_array(v.bitangent);
         let n = glam::Vec3::from_array(v.normal);
 
         if t.length_squared() < 1e-10 {
@@ -93,7 +95,7 @@ pub fn compute_tangents(vertices: &mut [Vertex]) {
         t = (t - n * n.dot(t)).normalize();
 
         // Recompute bitangent to ensure right-handed frame.
-        b = n.cross(t);
+        let b = n.cross(t);
 
         v.tangent   = t.to_array();
         v.bitangent = b.to_array();

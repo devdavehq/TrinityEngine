@@ -27,8 +27,10 @@ use winit::window::Window;
 
 use crate::assets::{AssetStore, Mesh};
 use crate::camera::Camera;
+use crate::animation::blending::BlendedPose;
 use crate::components::{MaterialTexture, PointLight, Position, Renderable, Rotation};
 use crate::jobs::JobSystem;
+use crate::render::instancing::{InstanceData, InstancingManager};
 use hecs::World;
 use rayon::prelude::*;
 
@@ -879,6 +881,15 @@ pub struct Renderer {
     lightning_bolt_renderer: lightning_bolt::LightningBoltRenderer,
     /// Cached lightning state for bolt rendering.
     lightning_state: crate::environment::lightning::LightningState,
+    /// ── GPU Skinning ──────────────────────────────────────────────────────
+    /// Bind group layout for group 2 (joint matrix uniform).
+    skinning_bgl:  wgpu::BindGroupLayout,
+    /// Render pipeline for skinned meshes (uses vs_main_skinned).
+    skinning_pipeline: wgpu::RenderPipeline,
+    /// Uniform buffer for joint matrices (64 × mat4 = 4096 bytes).
+    joint_uniform_buf: wgpu::Buffer,
+    /// Bind group for the skinning buffer (group 2).
+    skinning_bg:  wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -2042,6 +2053,35 @@ impl Renderer {
             })
         };
 
+        // ── GPU Skinning ───────────────────────────────────────────────────
+        // Bind group layout + pipeline + joint matrix buffer for skinned meshes.
+        let skinning_bgl = pipeline::create_skinning_bgl(&device);
+        let joint_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Joint Uniforms"),
+            // 64 × mat4<f32> = 64 × 64 bytes = 4096 bytes.
+            size: 4096,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let skinning_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Skinning BG"),
+            layout: &skinning_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: joint_uniform_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let skinning_pipeline = pipeline::create_skinning_pipeline(
+            &device,
+            surf_fmt,
+            &global_bgl,
+            &material_bgl,
+            &skinning_bgl,
+            &shader,
+        );
+
         // Construct sub-renderers that borrow device before it moves into Self.
         let lightning_bolt_renderer = lightning_bolt::LightningBoltRenderer::new(&device, surf_fmt);
 
@@ -2156,6 +2196,10 @@ impl Renderer {
             lightning_intensity: 0.0,
             weather_intensity: 0.0,
             elapsed_time: 0.0,
+            skinning_bgl,
+            skinning_pipeline,
+            joint_uniform_buf,
+            skinning_bg,
             lightning_bolt_renderer,
             lightning_state: crate::environment::lightning::LightningState::default(),
         }
@@ -2215,6 +2259,7 @@ impl Renderer {
         meshes: &AssetStore<Mesh>,
         camera: &dyn Camera,
         jobs: &JobSystem,
+        instancing: &mut InstancingManager,
         particles: Option<&[crate::particles::GpuParticle]>,
         mut overlay_pass: Option<&mut dyn FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView)>,
     ) -> DrawStats {
@@ -2325,7 +2370,7 @@ impl Renderer {
         // Populates the LightUniforms buffer with the directional sun light
         // (index 0) plus all PointLight entities from the ECS world (up to 16).
         let mut gpu_lights = [GpuLightData::default(); 16];
-        let mut light_count: u32 = 0;
+        let mut light_count: u32 = 1;
 
         // Index 0: directional sun light (always present).
         gpu_lights[0] = GpuLightData {
@@ -2341,7 +2386,6 @@ impl Renderer {
             _pad:          0.0,
             _pad2:         [0.0; 2],
         };
-        light_count = 1;
 
         // Add all PointLight entities (point + spot + additional directional).
         for (pos, pl) in world.query::<(&Position, &PointLight)>().iter() {
@@ -2477,6 +2521,9 @@ impl Renderer {
             let candidates: Vec<DrawCandidate> = world
                 .query::<(hecs::Entity, &Position, &Renderable)>()
                 .iter()
+                .filter(|(entity, _pos, _renderable)| {
+                    world.get::<&BlendedPose>(*entity).is_err()
+                })
                 .map(|(entity, pos, renderable)| DrawCandidate {
                     entity,
                     pos: *pos,
@@ -2484,6 +2531,17 @@ impl Renderer {
                 })
                 .collect();
             stats.total = candidates.len();
+
+            // Collect skinned entities separately (drawn with the skinning pipeline).
+            let skinned_candidates: Vec<(hecs::Entity, Position, Renderable)> = world
+                .query::<(hecs::Entity, &Position, &Renderable)>()
+                .iter()
+                .filter(|(entity, _pos, _renderable)| {
+                    world.get::<&BlendedPose>(*entity).is_ok()
+                })
+                .map(|(entity, pos, renderable)| (entity, *pos, *renderable))
+                .collect();
+            stats.total += skinned_candidates.len();
 
             let visible: Vec<DrawCandidate> = if self.features.culling_enabled {
                 let cam_pos = camera.position();
@@ -2519,13 +2577,12 @@ impl Renderer {
             };
             stats.visible = visible.len();
 
-            // ── GPU Instanced Drawing ──────────────────────────────────────
-            // Group visible entities by mesh_id. Each group is drawn with ONE
-            // draw call using instance_count = number of entities sharing that mesh.
-            // This replaces the old per-entity CPU transform + draw approach.
-            use std::collections::HashMap;
+            // ── GPU Instanced Drawing via InstancingManager ────────────────
+            // Group visible entities by (mesh_id, material_id). Each unique
+            // pair gets one batch, rendered with a single instanced draw call.
+            instancing.begin_frame();
+            let mut material_map: HashMap<u32, hecs::Entity> = HashMap::new();
             let cam_pos = camera.position();
-            let mut mesh_groups: HashMap<u32, Vec<(&DrawCandidate, glam::Mat4)>> = HashMap::new();
 
             for cand in &visible {
                 let entity = cand.entity;
@@ -2546,29 +2603,59 @@ impl Renderer {
                 ));
                 let model = t * ry * rp * rr * s;
 
-                mesh_groups.entry(renderable.mesh.id).or_default().push((cand, model));
+                // Derive material_id from the entity's MaterialTexture.
+                // Entities without a material texture share material_id=0.
+                let material_id = if let Ok(tex) = world.get::<&MaterialTexture>(entity) {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    tex.path.hash(&mut hasher);
+                    (hasher.finish() & 0x7FFFFFFF) as u32
+                } else { 0 };
+
+                // Store first entity for each material (for bind group creation).
+                material_map.entry(material_id).or_insert(entity);
+
+                instancing.add_instance(
+                    renderable.mesh.id,
+                    material_id,
+                    InstanceData {
+                        model: model.to_cols_array_2d(),
+                        color_metallic: [
+                            renderable.color[0],
+                            renderable.color[1],
+                            renderable.color[2],
+                            renderable.metallic,
+                        ],
+                        roughness_ao_pad: [
+                            renderable.roughness,
+                            renderable.ao,
+                            0.0, 0.0,
+                        ],
+                    },
+                );
             }
+            instancing.upload_buffers(&self.device, &self.queue);
 
-            // Sort groups by mesh_id for consistent draw order.
-            let mut sorted_groups: Vec<_> = mesh_groups.into_iter().collect();
-            sorted_groups.sort_by_key(|(id, _)| *id);
+            for batch in instancing.batches() {
+                let instances = &batch.instances;
+                if instances.is_empty() { continue; }
+                let mesh_id = batch.mesh_id;
 
-            for (mesh_id, group) in sorted_groups {
-                // Use first entity's renderable to look up mesh data.
-                let first_renderable = group[0].0.renderable;
-                let Some(mesh) = meshes.get(&first_renderable.mesh) else { continue };
+                // Resolve mesh from the first batch instance's representative entity.
+                let Some(rep_entity) = material_map.get(&batch.material_id) else { continue };
+                let Ok(rep_renderable) = world.get::<&Renderable>(*rep_entity) else { continue };
+                let Some(mesh) = meshes.get(&rep_renderable.mesh) else { continue };
 
-                // Pick the highest LOD level needed by any entity in this group.
-                // (We use the same LOD vertices for all instances of the same mesh.)
-                let max_lod_distance = group.iter().map(|(cand, _)| {
-                    let dx = cand.pos.x - cam_pos.x;
-                    let dy = cand.pos.y - cam_pos.y;
-                    let dz = cand.pos.z - cam_pos.z;
-                    let max_scale = cand.renderable.scale[0].abs()
-                        .max(cand.renderable.scale[1].abs())
-                        .max(cand.renderable.scale[2].abs())
-                        .max(0.25);
-                    ((dx * dx + dy * dy + dz * dz).sqrt()) / max_scale
+                // Pick the highest LOD level across all instances in this batch.
+                let max_lod_distance = instances.iter().enumerate().map(|(_i, _inst)| {
+                    // Approximate distance from the model matrix translation column.
+                    let tx = batch.instances[0].model[3][0] as f64;
+                    let ty = batch.instances[0].model[3][1] as f64;
+                    let tz = batch.instances[0].model[3][2] as f64;
+                    let dx = tx - cam_pos.x as f64;
+                    let dy = ty - cam_pos.y as f64;
+                    let dz = tz - cam_pos.z as f64;
+                    ((dx * dx + dy * dy + dz * dz).sqrt() / 0.25) as f32
                 }).fold(0.0f32, f32::max);
 
                 let lod_band = if max_lod_distance > self.features.mesh_lod_threshold_4 { 4u8 }
@@ -2598,53 +2685,19 @@ impl Renderer {
                 };
                 if lod_vertices.is_empty() { continue; }
 
-                // Upload mesh vertices ONCE for this group.
+                // Upload mesh vertices for this batch.
                 let vertex_bytes = bytemuck::cast_slice(&lod_vertices);
                 if vertex_bytes.len() > self.vertex_buffer.size() as usize {
                     tracing::error!(
-                        "[Renderer] Mesh too large ({} verts); skipping group mesh_id={}.",
+                        "[Renderer] Mesh too large ({} verts); skipping batch mesh_id={}.",
                         lod_vertices.len(), mesh_id
                     );
                     continue;
                 }
                 self.queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
 
-                // Build instance data for all entities in this group.
-                let instances: Vec<crate::render::instancing::InstanceData> = group
-                    .iter()
-                    .map(|(cand, model)| {
-                        crate::render::instancing::InstanceData {
-                            model: model.to_cols_array_2d(),
-                            color_metallic: [
-                                cand.renderable.color[0],
-                                cand.renderable.color[1],
-                                cand.renderable.color[2],
-                                cand.renderable.metallic,
-                            ],
-                            roughness_ao_pad: [
-                                cand.renderable.roughness,
-                                cand.renderable.ao,
-                                0.0, 0.0,
-                            ],
-                        }
-                    })
-                    .collect();
-
-                let instance_bytes: &[u8] = bytemuck::cast_slice(&instances);
-                let instance_buf_size = self.instance_buffer.size() as usize;
-                if instance_bytes.len() > instance_buf_size {
-                    tracing::error!(
-                        "[Renderer] Instance buffer overflow ({} bytes needed, {} available). \
-                         Group mesh_id={} with {} instances skipped.",
-                        instance_bytes.len(), instance_buf_size, mesh_id, instances.len()
-                    );
-                    continue;
-                }
-                self.queue.write_buffer(&self.instance_buffer, 0, instance_bytes);
-
-                // Bind material for the first entity (all instances in a batch share material).
-                let first_entity = group[0].0.entity;
-                let (albedo_view, albedo_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(first_entity) {
+                // Bind material for this batch.
+                let (albedo_view, albedo_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*rep_entity) {
                     self.get_or_load_texture(&tex.path, true).unwrap_or((
                         self.default_albedo_view.clone(),
                         self.default_albedo_sampler.clone(),
@@ -2652,7 +2705,7 @@ impl Renderer {
                 } else {
                     (self.default_albedo_view.clone(), self.default_albedo_sampler.clone())
                 };
-                let (normal_view, normal_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(first_entity) {
+                let (normal_view, normal_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*rep_entity) {
                     self.get_or_load_texture(&tex.normal_path, false).unwrap_or((
                         self.default_normal_view.clone(),
                         self.default_normal_sampler.clone(),
@@ -2660,7 +2713,7 @@ impl Renderer {
                 } else {
                     (self.default_normal_view.clone(), self.default_normal_sampler.clone())
                 };
-                let (mr_view, mr_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(first_entity) {
+                let (mr_view, mr_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*rep_entity) {
                     self.get_or_load_texture(&tex.metallic_roughness_path, false).unwrap_or((
                         self.default_mr_view.clone(),
                         self.default_mr_sampler.clone(),
@@ -2678,17 +2731,127 @@ impl Renderer {
                         wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&normal_sampler) },
                         wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mr_view) },
                         wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&mr_sampler) },
-                        // Material extras (binding 6) — default all-zeros (no SSS/clearcoat).
                         wgpu::BindGroupEntry { binding: 6, resource: self.default_material_extras_buf.as_entire_binding() },
                     ],
                 });
                 pass.set_bind_group(1, &material_bg, &[]);
 
-                // Bind both vertex and instance buffers, then draw instanced.
+                // Draw instanced: vertex buffer at slot 0, instance buffer at slot 1.
+                let instance_buffer = batch.buffer.as_ref()
+                    .expect("InstanceBatch buffer should be Some after upload_buffers()");
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+                pass.set_vertex_buffer(1, instance_buffer.slice(..));
                 pass.draw(0..lod_vertices.len() as u32, 0..instances.len() as u32);
                 stats.drawn += 1;
+            }
+
+            // ── Skinned entity pass ──────────────────────────────────────────
+            // Draw entities with BlendedPose using the skinning pipeline.
+            // Each skinned entity gets a separate draw call (per-instance joint data).
+            if !skinned_candidates.is_empty() {
+                pass.set_pipeline(&self.skinning_pipeline);
+                pass.set_bind_group(2, &self.skinning_bg, &[]);
+
+                for (sk_entity, sk_pos, sk_renderable) in &skinned_candidates {
+                    let Ok(pose) = world.get::<&BlendedPose>(*sk_entity) else { continue };
+                    let Some(mesh) = meshes.get(&sk_renderable.mesh) else { continue };
+                    let lod_vertices = &mesh.vertices;
+                    if lod_vertices.is_empty() { continue; }
+
+                    // Upload joint matrices.
+                    let joint_count = pose.joint_matrices.len().min(64);
+                    let mut joint_data = [0u8; 4096];
+                    for i in 0..joint_count {
+                        let mat_bytes = bytemuck::bytes_of(&pose.joint_matrices[i]);
+                        let offset = i * 64;
+                        joint_data[offset..offset + 64].copy_from_slice(mat_bytes);
+                    }
+                    self.queue.write_buffer(&self.joint_uniform_buf, 0, &joint_data);
+
+                    // Upload vertex buffer.
+                    let vertex_bytes = bytemuck::cast_slice(lod_vertices);
+                    if vertex_bytes.len() <= self.vertex_buffer.size() as usize {
+                        self.queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
+                    } else { continue; }
+
+                    // Rotation for model matrix.
+                    let rotation = world
+                        .get::<&Rotation>(*sk_entity)
+                        .map(|r| *r)
+                        .unwrap_or(Rotation { pitch: 0.0, yaw: 0.0, roll: 0.0 });
+                    let t = glam::Mat4::from_translation(glam::Vec3::new(sk_pos.x, sk_pos.y, sk_pos.z));
+                    let ry = glam::Mat4::from_rotation_y(rotation.yaw);
+                    let rp = glam::Mat4::from_rotation_x(rotation.pitch);
+                    let rr = glam::Mat4::from_rotation_z(rotation.roll);
+                    let s = glam::Mat4::from_scale(glam::Vec3::new(
+                        sk_renderable.scale[0], sk_renderable.scale[1], sk_renderable.scale[2],
+                    ));
+                    let model = t * ry * rp * rr * s;
+
+                    // Upload instance data (single instance).
+                    let instance_data = crate::render::instancing::InstanceData {
+                        model: model.to_cols_array_2d(),
+                        color_metallic: [
+                            sk_renderable.color[0],
+                            sk_renderable.color[1],
+                            sk_renderable.color[2],
+                            sk_renderable.metallic,
+                        ],
+                        roughness_ao_pad: [
+                            sk_renderable.roughness,
+                            sk_renderable.ao,
+                            0.0, 0.0,
+                        ],
+                    };
+                    self.queue.write_buffer(
+                        &self.instance_buffer, 0,
+                        bytemuck::bytes_of(&instance_data),
+                    );
+
+                    // Material bind group.
+                    let (albedo_view, albedo_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*sk_entity) {
+                        self.get_or_load_texture(&tex.path, true).unwrap_or((
+                            self.default_albedo_view.clone(),
+                            self.default_albedo_sampler.clone(),
+                        ))
+                    } else {
+                        (self.default_albedo_view.clone(), self.default_albedo_sampler.clone())
+                    };
+                    let (normal_view, normal_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*sk_entity) {
+                        self.get_or_load_texture(&tex.normal_path, false).unwrap_or((
+                            self.default_normal_view.clone(),
+                            self.default_normal_sampler.clone(),
+                        ))
+                    } else {
+                        (self.default_normal_view.clone(), self.default_normal_sampler.clone())
+                    };
+                    let (mr_view, mr_sampler) = if let Ok(tex) = world.get::<&MaterialTexture>(*sk_entity) {
+                        self.get_or_load_texture(&tex.metallic_roughness_path, false).unwrap_or((
+                            self.default_mr_view.clone(),
+                            self.default_mr_sampler.clone(),
+                        ))
+                    } else {
+                        (self.default_mr_view.clone(), self.default_mr_sampler.clone())
+                    };
+                    let material_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Skinned Material BG"),
+                        layout: &self.material_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&albedo_view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&albedo_sampler) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&normal_view) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&normal_sampler) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mr_view) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&mr_sampler) },
+                            wgpu::BindGroupEntry { binding: 6, resource: self.default_material_extras_buf.as_entire_binding() },
+                        ],
+                    });
+                    pass.set_bind_group(1, &material_bg, &[]);
+                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+                    pass.draw(0..lod_vertices.len() as u32, 0..1);
+                    stats.drawn += 1;
+                }
             }
         } // main pass is dropped here — commands are finalised
 

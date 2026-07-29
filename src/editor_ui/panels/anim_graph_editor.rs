@@ -18,10 +18,8 @@
 // • Context menu: Right-click on canvas for quick actions
 
 use crate::animation::anim_graph::{
-    AnimGraph, AnimGraphBuilder, AnimParamValue, AnimStateNode, AnimTransition,
-    BoneMask, TransitionCondition,
+    AnimGraph, AnimStateNode, AnimTransition, TransitionCondition,
 };
-use crate::animation::blending::AnimationClips;
 use egui::{Color32, Pos2, Rect, RichText, Vec2};
 
 // ── Editor State ─────────────────────────────────────────────────────────────
@@ -368,7 +366,7 @@ pub fn render_anim_graph_editor(ui: &mut egui::Ui, state: &mut AnimGraphEditorSt
                             ("Idle", 0), ("Walk", 1), ("Run", 2), ("Attack", 3),
                             ("Jump", 4), ("Fall", 5), ("Land", 6), ("Dash", 7),
                         ] {
-                    if ui.selectable_label(false, name.clone()).clicked() {
+                    if ui.selectable_label(false, *name).clicked() {
                                 state.add_state(name, *clip_idx, [
                                     50.0 + state.nodes.len() as f32 * 220.0,
                                     100.0 + (state.nodes.len() % 3) as f32 * 100.0,
@@ -464,7 +462,7 @@ pub fn render_anim_graph_editor(ui: &mut egui::Ui, state: &mut AnimGraphEditorSt
     }
 
     // ── Draw transitions ──
-    for (ti, trans) in state.transitions.iter().enumerate() {
+    for (_ti, trans) in state.transitions.iter().enumerate() {
         let from_node = state.nodes.iter().find(|n| n.id == trans.from_state);
         let to_node = state.nodes.iter().find(|n| n.id == trans.to_state);
         if let (Some(from), Some(to)) = (from_node, to_node) {

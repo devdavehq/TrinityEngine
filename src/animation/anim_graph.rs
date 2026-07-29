@@ -48,10 +48,9 @@
 use std::collections::HashMap;
 
 use crate::animation::skeletal::{
-    AnimationClip, AnimationStateMap, BoneHierarchy, SkeletalAnimator, TransformKeyframe,
-    blend_animated_locals, compute_joint_matrices,
+    SkeletalAnimator, TransformKeyframe, compute_joint_matrices,
 };
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 
 // AiAgent carries the per-entity Blackboard that the BT writes to.
 // We read it here to sync blackboard values into AnimGraph parameters.

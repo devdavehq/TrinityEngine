@@ -191,7 +191,7 @@ impl LightningBoltRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
         // Only render when a bolt was just fired

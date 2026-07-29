@@ -25,7 +25,7 @@ use crate::assets::{Handle, Mesh};
 use crate::components::{Collider, FoliageWind, Position, Renderable, RigidBody};
 use hecs::World;
 
-use self::biome::{BiomeConfig, BiomeResult, MoistureMap, TerrainBiomeSystem, default_biome_config, evaluate_biome};
+use self::biome::{BiomeResult, MoistureMap, TerrainBiomeSystem, default_biome_config, evaluate_biome};
 use self::chunk::{ChunkGrid, new_grid, sample_height, sample_normal, sample_slope};
 use self::erosion::{ErosionConfig, ErosionState};
 use self::foliage::{

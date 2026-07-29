@@ -29,7 +29,7 @@ pub fn render_style_panel(ui: &mut egui::Ui, design: &mut UiDesign) -> bool {
     };
 
     // Get widget info for header
-    let (kind, id_clone, visible, locked) = {
+    let (kind, id_clone, _visible, _locked) = {
         let w = &design.widgets[selected_idx];
         (w.kind, w.id.clone(), w.visible, w.locked)
     };

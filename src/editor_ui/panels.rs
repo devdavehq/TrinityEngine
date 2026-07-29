@@ -26,5 +26,3 @@ pub use content_browser::render_content_browser_panel;
 pub use details::render_details_panel;
 pub use outliner::render_outliner_panel;
 pub use viewport::render_viewport_panel;
-pub use bt_editor::{render_bt_editor, BtEditorState};
-pub use anim_graph_editor::{render_anim_graph_editor, AnimGraphEditorState};

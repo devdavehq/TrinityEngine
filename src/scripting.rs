@@ -514,6 +514,10 @@ impl ScriptEngine {
         })?;
         globals.set("vec_lerp", vec_lerp_fn)?;
 
+        // ── UI Lua API ────────────────────────────────────────────────────
+        // Register UI-related Lua bindings (ui.create, ui.show, etc.).
+        crate::ui::register_ui_lua_api(&self.lua)?;
+
         // ── Sandbox enforcement ─────────────────────────────────────────
         // Remove dangerous Lua standard libraries based on SandboxConfig.
         // By default everything is restricted; enable only what is allowed.
@@ -1575,8 +1579,8 @@ impl ScriptEngine {
             let ndc_y = 1.0 - (2.0 * sy / sh);
             let near4 = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
             let far4  = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
-            let near3 = near4.xyz() / near4.w;
-            let far3  = far4.xyz() / far4.w;
+            let near3 = near4.truncate() / near4.w;
+            let far3  = far4.truncate() / far4.w;
             let dir = (far3 - near3).normalize_or_zero();
             Ok((near3.x, near3.y, near3.z, dir.x, dir.y, dir.z))
         })?;
@@ -1896,7 +1900,7 @@ impl ScriptEngine {
             // bt.set_blackboard(entity, key, value)
             // Generic set — accepts booleans.  For other types use the
             // typed variants below.
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_set_bb = self.lua.create_function(
                 move |_, (eid, key, value): (u64, String, bool)| {
@@ -1914,7 +1918,7 @@ impl ScriptEngine {
             bt_table.set("set_blackboard", bt_set_bb)?;
 
             // bt.get_blackboard(entity, key) → bool
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_get_bb = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
@@ -1934,7 +1938,7 @@ impl ScriptEngine {
             bt_table.set("get_blackboard", bt_get_bb)?;
 
             // bt.set_blackboard_vec3(entity, key, x, y, z)
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_set_bb_vec3 = self.lua.create_function(
                 move |_, (eid, key, x, y, z): (u64, String, f32, f32, f32)| {
@@ -1954,7 +1958,7 @@ impl ScriptEngine {
             bt_table.set("set_blackboard_vec3", bt_set_bb_vec3)?;
 
             // bt.get_blackboard_vec3(entity, key) → x, y, z
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_get_bb_vec3 = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
@@ -1974,7 +1978,7 @@ impl ScriptEngine {
             bt_table.set("get_blackboard_vec3", bt_get_bb_vec3)?;
 
             // bt.set_blackboard_float(entity, key, value)
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_set_bb_float = self.lua.create_function(
                 move |_, (eid, key, value): (u64, String, f32)| {
@@ -1994,7 +1998,7 @@ impl ScriptEngine {
             bt_table.set("set_blackboard_float", bt_set_bb_float)?;
 
             // bt.get_blackboard_float(entity, key) → float
-            let sp = script_ptr;
+            let _sp = script_ptr;
             let wp = world_ptr;
             let bt_get_bb_float = self.lua.create_function(
                 move |_, (eid, key): (u64, String)| {
@@ -2047,7 +2051,7 @@ impl ScriptEngine {
             // nav.find_path(x1, y1, z1, x2, y2, z2)
             // A* pathfinding in world space.  Returns a Lua table of
             // {x, y, z} waypoints.  Returns empty table if no path exists.
-            let find_path = self.lua.create_function(move |lua, (x1, y1, z1, x2, y2, z2): (f32, f32, f32, f32, f32, f32)| {
+            let find_path = self.lua.create_function(move |lua, (x1, y1, z1, x2, _y2, z2): (f32, f32, f32, f32, f32, f32)| {
                 let table = lua.create_table()?;
                 if np == 0 {
                     return Ok(table);
@@ -2104,6 +2108,76 @@ impl ScriptEngine {
             nav_table.set("is_walkable", is_walkable)?;
 
             globals.set("nav", nav_table)?;
+        }
+
+        // ── Terrain API ────────────────────────────────────────────────────
+        // Exposes terrain height queries and brush operations to Lua.
+        {
+            let terrain_table = self.lua.create_table()?;
+            let tp = self.terrain_world_ptr;
+
+            // terrain.height(x, z) → y
+            let th = self.lua.create_function(move |_, (x, z): (f32, f32)| -> LuaResult<f32> {
+                if tp == 0 { return Ok(0.0); }
+                let terrain = unsafe { &*(tp as *const crate::terrain::TerrainWorld) };
+                Ok(terrain.height_at(x, z))
+            })?;
+            terrain_table.set("height", th)?;
+
+            // terrain.normal(x, z) → nx, ny, nz
+            let tn = self.lua.create_function(move |_, (x, z): (f32, f32)| -> LuaResult<(f32, f32, f32)> {
+                if tp == 0 { return Ok((0.0, 1.0, 0.0)); }
+                let terrain = unsafe { &*(tp as *const crate::terrain::TerrainWorld) };
+                let n = terrain.normal_at(x, z);
+                Ok((n[0], n[1], n[2]))
+            })?;
+            terrain_table.set("normal", tn)?;
+
+            // terrain.slope(x, z) → degrees
+            let ts = self.lua.create_function(move |_, (x, z): (f32, f32)| -> LuaResult<f32> {
+                if tp == 0 { return Ok(0.0); }
+                let terrain = unsafe { &*(tp as *const crate::terrain::TerrainWorld) };
+                Ok(terrain.slope_at(x, z))
+            })?;
+            terrain_table.set("slope", ts)?;
+
+            // terrain.surface_color(x, z) → r, g, b
+            let tc = self.lua.create_function(move |_, (x, z): (f32, f32)| -> LuaResult<(f32, f32, f32)> {
+                if tp == 0 { return Ok((0.3, 0.6, 0.2)); }
+                let terrain = unsafe { &*(tp as *const crate::terrain::TerrainWorld) };
+                let c = terrain.auto_surface_color_world(x, z);
+                Ok((c[0], c[1], c[2]))
+            })?;
+            terrain_table.set("surface_color", tc)?;
+
+            // terrain.raise(x, z, radius, amount)
+            let tr = self.lua.create_function(move |_, (x, z, radius, amount): (f32, f32, f32, f32)| {
+                if tp == 0 { return Ok(()); }
+                let terrain = unsafe { &mut *(tp as *mut crate::terrain::TerrainWorld) };
+                terrain.raise(x, z, radius, amount);
+                Ok(())
+            })?;
+            terrain_table.set("raise", tr)?;
+
+            // terrain.lower(x, z, radius, amount)
+            let tl = self.lua.create_function(move |_, (x, z, radius, amount): (f32, f32, f32, f32)| {
+                if tp == 0 { return Ok(()); }
+                let terrain = unsafe { &mut *(tp as *mut crate::terrain::TerrainWorld) };
+                terrain.lower(x, z, radius, amount);
+                Ok(())
+            })?;
+            terrain_table.set("lower", tl)?;
+
+            // terrain.smooth(x, z, radius, strength)
+            let tsm = self.lua.create_function(move |_, (x, z, radius, strength): (f32, f32, f32, f32)| {
+                if tp == 0 { return Ok(()); }
+                let terrain = unsafe { &mut *(tp as *mut crate::terrain::TerrainWorld) };
+                terrain.smooth(x, z, radius, strength);
+                Ok(())
+            })?;
+            terrain_table.set("smooth", tsm)?;
+
+            globals.set("terrain", terrain_table)?;
         }
 
         // ── Call entity-local update(entity_id, dt) ───────────────────────

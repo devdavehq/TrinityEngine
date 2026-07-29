@@ -83,25 +83,27 @@ struct MaterialExtras {
 
 // ── Vertex input/output ────────────────────────────────────────────────────
 struct VertIn {
-    @location(0) position:  vec3<f32>,
-    @location(1) normal:    vec3<f32>,
-    @location(2) tangent:   vec3<f32>,
-    @location(3) bitangent: vec3<f32>,
-    @location(4) color:     vec3<f32>,
-    @location(5) metallic:  f32,
-    @location(6) roughness: f32,
-    @location(7) ao:        f32,
+    @location(0) position:     vec3<f32>,
+    @location(1) normal:       vec3<f32>,
+    @location(2) tangent:      vec3<f32>,
+    @location(3) bitangent:    vec3<f32>,
+    @location(4) color:        vec3<f32>,
+    @location(5) metallic:     f32,
+    @location(6) roughness:    f32,
+    @location(7) ao:           f32,
+    @location(8) bone_indices: vec4<u32>,
+    @location(9) bone_weights: vec4<f32>,
 }
 
 // ── Per-instance data (matches InstanceData in instancing.rs) ──────────────
-// Two buffers: slot 0 = per-vertex, slot 1 = per-instance.
+// Two buffers: slot 1 = per-instance (locations 14-19).
 struct InstanceIn {
-    @location(8)  model_row0:     vec4<f32>,
-    @location(9)  model_row1:     vec4<f32>,
-    @location(10) model_row2:     vec4<f32>,
-    @location(11) model_row3:     vec4<f32>,
-    @location(12) color_metallic: vec4<f32>,
-    @location(13) roughness_ao:   vec4<f32>,
+    @location(14) model_row0:     vec4<f32>,
+    @location(15) model_row1:     vec4<f32>,
+    @location(16) model_row2:     vec4<f32>,
+    @location(17) model_row3:     vec4<f32>,
+    @location(18) color_metallic: vec4<f32>,
+    @location(19) roughness_ao:   vec4<f32>,
 }
 
 struct VertOut {
@@ -114,6 +116,101 @@ struct VertOut {
     @location(5)       metallic:  f32,
     @location(6)       roughness: f32,
     @location(7)       ao:        f32,
+}
+
+// ── GPU Skinning support ───────────────────────────────────────────────────
+// Joint matrices storage buffer (group 2, binding 0).
+// Each row is a 4x4 matrix in column-major order (64 bytes per matrix).
+// Max 64 bones per entity = 64 × 64 = 4096 bytes.
+struct JointData {
+    matrices: array<mat4x4<f32>, 64>, // 64 × 64 = 4096 bytes
+}
+@group(2) @binding(0) var<uniform> joint_matrices: JointData;
+
+// Skinned vertex shader entry point.
+// Transforms vertex position and normal by up to 4 bone matrices (LBS),
+// then proceeds with the same model/wind/etc. transform as vs_main.
+@vertex
+fn vs_main_skinned(in: VertIn, instance: InstanceIn) -> VertOut {
+    // Linear blend skinning: sum of (bone_matrix × vertex) * bone_weight for up to 4 bones.
+    var skinned_pos = vec4<f32>(0.0);
+    var skinned_normal = vec3<f32>(0.0);
+    let weights = in.bone_weights;
+    let indices = in.bone_indices;
+
+    // Sum weighted bone transforms (unroll 4 iterations for WGSL).
+    let m0 = joint_matrices.matrices[indices.x];
+    skinned_pos += m0 * vec4<f32>(in.position, 1.0) * weights.x;
+    skinned_normal += mat3x3<f32>(m0[0].xyz, m0[1].xyz, m0[2].xyz) * in.normal * weights.x;
+
+    let m1 = joint_matrices.matrices[indices.y];
+    skinned_pos += m1 * vec4<f32>(in.position, 1.0) * weights.y;
+    skinned_normal += mat3x3<f32>(m1[0].xyz, m1[1].xyz, m1[2].xyz) * in.normal * weights.y;
+
+    let m2 = joint_matrices.matrices[indices.z];
+    skinned_pos += m2 * vec4<f32>(in.position, 1.0) * weights.z;
+    skinned_normal += mat3x3<f32>(m2[0].xyz, m2[1].xyz, m2[2].xyz) * in.normal * weights.z;
+
+    let m3 = joint_matrices.matrices[indices.w];
+    skinned_pos += m3 * vec4<f32>(in.position, 1.0) * weights.w;
+    skinned_normal += mat3x3<f32>(m3[0].xyz, m3[1].xyz, m3[2].xyz) * in.normal * weights.w;
+
+    // Use skinned position as input to the standard transform.
+    let skin_pos = skinned_pos.xyz;
+    let skin_normal = normalize(skinned_normal);
+
+    // ── Standard transform (same as vs_main) ──────────────────────────────
+    let model = mat4x4<f32>(
+        instance.model_row0,
+        instance.model_row1,
+        instance.model_row2,
+        instance.model_row3,
+    );
+    var world_pos = (model * vec4<f32>(skin_pos, 1.0)).xyz;
+
+    // ── Wind displacement ──────────────────────────────────────────────────
+    {
+        let wind = uniforms.wind_dir_strength;
+        let strength = wind.w;
+        if (strength > 0.001) {
+            let height_factor = max(in.position.y, 0.0);
+            let phase = uniforms.fog_color.w * 2.0
+                      + in.position.x * 0.5
+                      + in.position.z * 0.3;
+            let phase2 = uniforms.fog_color.w * 3.3
+                       + in.position.x * 0.2
+                       + in.position.z * 0.7;
+            let sway = vec3<f32>(
+                sin(phase)  * strength * height_factor,
+                sin(phase2) * strength * height_factor * 0.15,
+                cos(phase * 0.7) * strength * height_factor * 0.5,
+            );
+            world_pos += sway;
+        }
+    }
+
+    let normal_matrix = mat3x3<f32>(
+        instance.model_row0.xyz,
+        instance.model_row1.xyz,
+        instance.model_row2.xyz,
+    );
+    var world_normal = normalize(normal_matrix * skin_normal);
+    var world_tangent   = normalize(normal_matrix * in.tangent);
+    var world_bitangent = normalize(normal_matrix * in.bitangent);
+    world_tangent = normalize(world_tangent - dot(world_tangent, world_normal) * world_normal);
+    world_bitangent = cross(world_normal, world_tangent);
+
+    var out: VertOut;
+    out.clip_pos  = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    out.world_pos = world_pos;
+    out.normal    = world_normal;
+    out.tangent   = world_tangent;
+    out.bitangent = world_bitangent;
+    out.color     = select(in.color, instance.color_metallic.xyz, instance.color_metallic.xyz != vec3<f32>(0.0));
+    out.metallic  = select(in.metallic, instance.color_metallic.w, instance.color_metallic.w >= 0.0);
+    out.roughness = select(in.roughness, instance.roughness_ao.x, instance.roughness_ao.x > 0.0);
+    out.ao        = select(in.ao, instance.roughness_ao.y, instance.roughness_ao.y > 0.0);
+    return out;
 }
 
 @vertex

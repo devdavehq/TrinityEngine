@@ -15,7 +15,6 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::components::{Position, WaterSurface};
 
 /// GPU uniform data matching WaterUniforms in water.wgsl.
 /// Total: 192 bytes (12 × vec4).

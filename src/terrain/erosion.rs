@@ -250,7 +250,7 @@ pub fn simulate_hydraulic(
     state: &mut ErosionState,
     width: usize,
     depth: usize,
-    cell_size: f32,
+    _cell_size: f32,
     config: &ErosionConfig,
     iterations: u32,
 ) {

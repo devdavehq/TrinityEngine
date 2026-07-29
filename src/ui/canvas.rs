@@ -400,7 +400,7 @@ pub enum CanvasEvent {
 /// Get resize handle rectangles for a widget.
 fn get_handle_rects(widget_rect: egui::Rect, handle_size: f32) -> Vec<(ResizeHandle, egui::Rect)> {
     let hs = handle_size;
-    let half = hs * 0.5;
+    let _half = hs * 0.5;
     vec![
         (ResizeHandle::TopLeft,      egui::Rect::from_center_size(egui::pos2(widget_rect.left(), widget_rect.top()), egui::vec2(hs, hs))),
         (ResizeHandle::TopRight,     egui::Rect::from_center_size(egui::pos2(widget_rect.right(), widget_rect.top()), egui::vec2(hs, hs))),

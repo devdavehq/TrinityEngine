@@ -126,7 +126,7 @@ impl ParticleEmitter {
         *rng_seed = (*rng_seed * 16807.0 + 1.0) % 2147483647.0;
         let r4 = (*rng_seed / 2147483647.0) * 2.0 - 1.0;
         *rng_seed = (*rng_seed * 16807.0 + 1.0) % 2147483647.0;
-        let r5 = (*rng_seed / 2147483647.0); // [0, 1]
+        let r5 = *rng_seed / 2147483647.0; // [0, 1]
 
         let pos = self.position + Vec3::new(
             r1 * self.spawn_extents.x,

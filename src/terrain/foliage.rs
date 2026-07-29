@@ -3,8 +3,6 @@
 //! Provides species-based foliage placement using Poisson disk sampling,
 //! biome rule filtering, density maps, and exclusion zones.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 // ---------------------------------------------------------------------------
 // RNG (hash-based, no external crate)
@@ -341,8 +339,8 @@ pub fn place_foliage(
     let map_depth = placement.density_map.depth as f32 * placement.density_map.cell_size;
 
     let cell = config.min_distance_between;
-    let cols = (map_width / cell).ceil().max(1.0) as usize;
-    let rows = (map_depth / cell).ceil().max(1.0) as usize;
+    let _cols = (map_width / cell).ceil().max(1.0) as usize;
+    let _rows = (map_depth / cell).ceil().max(1.0) as usize;
 
     // Active-point list for Poisson disk sampling.
     let mut active: Vec<(f32, f32)> = Vec::new();

@@ -349,7 +349,7 @@ pub fn apply_csg_box(
     for gz in min_gz..max_gz {
         for gx in min_gx..max_gx {
             let idx = gz as usize * width + gx as usize;
-            let current = heights[idx];
+            let _current = heights[idx];
 
             // World position of this column. The Y coordinate is set to the brush's
             // center Y (brush.position[1]) so the lateral OBB test works correctly:

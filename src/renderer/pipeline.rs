@@ -140,15 +140,17 @@ pub fn create_pipeline(
     );
 
     // Byte offsets for each field inside Vertex (must match mesh.rs exactly):
-    //   position  [f32;3]  offset  0  (12 bytes)
-    //   normal    [f32;3]  offset 12  (12 bytes)
-    //   tangent   [f32;3]  offset 24  (12 bytes)
-    //   bitangent [f32;3]  offset 36  (12 bytes)
-    //   color     [f32;3]  offset 48  (12 bytes)
-    //   metallic  f32      offset 60  ( 4 bytes)
-    //   roughness f32      offset 64  ( 4 bytes)
-    //   ao        f32      offset 68  ( 4 bytes)
-    //   _pad      f32      offset 72  ( 4 bytes)  — total 76 bytes, aligns to 16
+    //   position      [f32;3]  offset  0  (12 bytes)
+    //   normal        [f32;3]  offset 12  (12 bytes)
+    //   tangent       [f32;3]  offset 24  (12 bytes)
+    //   bitangent     [f32;3]  offset 36  (12 bytes)
+    //   color         [f32;3]  offset 48  (12 bytes)
+    //   metallic      f32      offset 60  ( 4 bytes)
+    //   roughness     f32      offset 64  ( 4 bytes)
+    //   ao            f32      offset 68  ( 4 bytes)
+    //   bone_indices  [u32;4]  offset 72  (16 bytes)
+    //   bone_weights  [f32;4]  offset 88  (16 bytes)
+    //   Total: 104 bytes (repr(C) padded to 112)
     let vertex_attributes = [
         wgpu::VertexAttribute { shader_location: 0, format: wgpu::VertexFormat::Float32x3, offset:  0 },
         wgpu::VertexAttribute { shader_location: 1, format: wgpu::VertexFormat::Float32x3, offset: 12 },
@@ -158,7 +160,9 @@ pub fn create_pipeline(
         wgpu::VertexAttribute { shader_location: 5, format: wgpu::VertexFormat::Float32,   offset: 60 },
         wgpu::VertexAttribute { shader_location: 6, format: wgpu::VertexFormat::Float32,   offset: 64 },
         wgpu::VertexAttribute { shader_location: 7, format: wgpu::VertexFormat::Float32,   offset: 68 },
-        // slot 8 = _pad, GPU reads it but shader ignores it
+        // bone indices and weights — used by skinned mesh pipeline (location 8-9)
+        wgpu::VertexAttribute { shader_location: 8,  format: wgpu::VertexFormat::Uint32x4, offset: 72 },
+        wgpu::VertexAttribute { shader_location: 9,  format: wgpu::VertexFormat::Float32x4, offset: 88 },
     ];
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -184,14 +188,14 @@ pub fn create_pipeline(
                     step_mode:    wgpu::VertexStepMode::Instance,
                     attributes:   &[
                         // model matrix — 4 rows of float32x4
-                        wgpu::VertexAttribute { shader_location: 8,  format: wgpu::VertexFormat::Float32x4, offset:  0 },
-                        wgpu::VertexAttribute { shader_location: 9,  format: wgpu::VertexFormat::Float32x4, offset: 16 },
-                        wgpu::VertexAttribute { shader_location: 10, format: wgpu::VertexFormat::Float32x4, offset: 32 },
-                        wgpu::VertexAttribute { shader_location: 11, format: wgpu::VertexFormat::Float32x4, offset: 48 },
+                        wgpu::VertexAttribute { shader_location: 14, format: wgpu::VertexFormat::Float32x4, offset:  0 },
+                        wgpu::VertexAttribute { shader_location: 15, format: wgpu::VertexFormat::Float32x4, offset: 16 },
+                        wgpu::VertexAttribute { shader_location: 16, format: wgpu::VertexFormat::Float32x4, offset: 32 },
+                        wgpu::VertexAttribute { shader_location: 17, format: wgpu::VertexFormat::Float32x4, offset: 48 },
                         // color_metallic (rgb + metallic)
-                        wgpu::VertexAttribute { shader_location: 12, format: wgpu::VertexFormat::Float32x4, offset: 64 },
+                        wgpu::VertexAttribute { shader_location: 18, format: wgpu::VertexFormat::Float32x4, offset: 64 },
                         // roughness_ao_pad
-                        wgpu::VertexAttribute { shader_location: 13, format: wgpu::VertexFormat::Float32x4, offset: 80 },
+                        wgpu::VertexAttribute { shader_location: 19, format: wgpu::VertexFormat::Float32x4, offset: 80 },
                     ],
                 },
             ],
@@ -241,6 +245,116 @@ pub fn create_pipeline(
         // ── wgpu 29: cache field added ────────────────────────────────────
         // Pipeline cache speeds up shader compilation on Android. None elsewhere.
         cache: None,
+    })
+}
+
+// create_skinning_bind_group_layout() — group 2 joint matrix buffer for GPU skinning.
+// Group 2 binding 0: JointData uniform (64 × mat4 = 4096 bytes).
+pub fn create_skinning_bgl(device: &Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Skinning BGL"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+// create_skinning_pipeline() — PBR + GPU skinning render pipeline.
+// Uses groups 0 (global), 1 (material), and 2 (joint matrices).
+pub fn create_skinning_pipeline(
+    device:       &Device,
+    surf_fmt:     wgpu::TextureFormat,
+    global_bgl:   &wgpu::BindGroupLayout,
+    material_bgl: &wgpu::BindGroupLayout,
+    skinning_bgl: &wgpu::BindGroupLayout,
+    shader:       &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(
+        &wgpu::PipelineLayoutDescriptor {
+            label:              Some("Skinning PBR Layout"),
+            bind_group_layouts: &[Some(global_bgl), Some(material_bgl), Some(skinning_bgl)],
+            immediate_size:     0,
+        },
+    );
+
+    let vertex_attributes = [
+        wgpu::VertexAttribute { shader_location: 0, format: wgpu::VertexFormat::Float32x3, offset:  0 },
+        wgpu::VertexAttribute { shader_location: 1, format: wgpu::VertexFormat::Float32x3, offset: 12 },
+        wgpu::VertexAttribute { shader_location: 2, format: wgpu::VertexFormat::Float32x3, offset: 24 },
+        wgpu::VertexAttribute { shader_location: 3, format: wgpu::VertexFormat::Float32x3, offset: 36 },
+        wgpu::VertexAttribute { shader_location: 4, format: wgpu::VertexFormat::Float32x3, offset: 48 },
+        wgpu::VertexAttribute { shader_location: 5, format: wgpu::VertexFormat::Float32,   offset: 60 },
+        wgpu::VertexAttribute { shader_location: 6, format: wgpu::VertexFormat::Float32,   offset: 64 },
+        wgpu::VertexAttribute { shader_location: 7, format: wgpu::VertexFormat::Float32,   offset: 68 },
+        wgpu::VertexAttribute { shader_location: 8, format: wgpu::VertexFormat::Uint32x4, offset: 72 },
+        wgpu::VertexAttribute { shader_location: 9, format: wgpu::VertexFormat::Float32x4, offset: 88 },
+    ];
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label:  Some("Skinning PBR Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main_skinned"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<crate::assets::mesh::Vertex>() as u64,
+                    step_mode:    wgpu::VertexStepMode::Vertex,
+                    attributes:   &vertex_attributes,
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 96,
+                    step_mode:    wgpu::VertexStepMode::Instance,
+                    attributes:   &[
+                        wgpu::VertexAttribute { shader_location: 14, format: wgpu::VertexFormat::Float32x4, offset:  0 },
+                        wgpu::VertexAttribute { shader_location: 15, format: wgpu::VertexFormat::Float32x4, offset: 16 },
+                        wgpu::VertexAttribute { shader_location: 16, format: wgpu::VertexFormat::Float32x4, offset: 32 },
+                        wgpu::VertexAttribute { shader_location: 17, format: wgpu::VertexFormat::Float32x4, offset: 48 },
+                        wgpu::VertexAttribute { shader_location: 18, format: wgpu::VertexFormat::Float32x4, offset: 64 },
+                        wgpu::VertexAttribute { shader_location: 19, format: wgpu::VertexFormat::Float32x4, offset: 80 },
+                    ],
+                },
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module:      shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format:     surf_fmt,
+                    blend:      Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format:     wgpu::TextureFormat::Rgba16Float,
+                    blend:      Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format:              wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare:       Some(wgpu::CompareFunction::LessEqual),
+            stencil:             wgpu::StencilState::default(),
+            bias:                wgpu::DepthBiasState::default(),
+        }),
+        multisample:    wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache:          None,
     })
 }
 

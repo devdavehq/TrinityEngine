@@ -2762,7 +2762,7 @@ fn build_ui(
                 (w.bg_color[0] * 255.0) as u8, (w.bg_color[1] * 255.0) as u8,
                 (w.bg_color[2] * 255.0) as u8, (w.bg_color[3] * 255.0) as u8,
             );
-            let text_style = egui::RichText::new("").size(w.font_size).color(fg);
+            let _text_style = egui::RichText::new("").size(w.font_size).color(fg);
             // Compute anchored position based on screen size and anchor.
             let anchor_pos = match w.anchor {
                 UiAnchor::TopLeft      => egui::pos2(w.x, w.y),
@@ -2839,7 +2839,7 @@ UiWidgetKind::Slider => {
                         // Foreground arc
                         let start_angle = -std::f32::consts::FRAC_PI_2; // 12 o'clock
                         let sweep = v * std::f32::consts::TAU;
-                        let rect_ring = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0));
+                        let _rect_ring = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0));
                         let arc_points: Vec<egui::Pos2> = (0..=64)
                             .map(|i| {
                                 let a = start_angle + sweep * (i as f32 / 64.0);

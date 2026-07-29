@@ -29,9 +29,6 @@ pub mod style_panel;
 pub mod library;
 
 pub use widget::*;
-pub use canvas::*;
-pub use style_panel::*;
-pub use library::*;
 
 use std::collections::HashMap;
 

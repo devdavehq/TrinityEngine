@@ -1,4 +1,5 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![allow(dead_code)]
 
 // src/main.rs
 // Engine entry point. Wires all systems together.
@@ -55,7 +56,7 @@ mod vfs;
 mod resources;
 mod engine_subsystems;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -69,7 +70,7 @@ use components::{PlayerStart, RigidBody, Script, Position, Rotation, PointLight}
 #[cfg(feature = "editor")]
 use editor::EditorShell;
 #[cfg(feature = "editor")]
-use editor::backend::{EditorBackend, HeadlessEditor, WgpuEditor};
+use editor::backend::{EditorBackend, HeadlessEditor};
 #[cfg(feature = "editor")]
 use editor_ui::{EditorUi, UiFrameArgs};
 use engine_subsystems::{EnvironmentState, LevelState, AssetState, CameraInputState};
@@ -77,6 +78,7 @@ use jobs::JobSystem;
 use materials::MaterialLibrary;
 use navigation::NavGrid;
 use ai::AiRegistry;
+use ai::components::ai_system;
 use physics::{physics_system, character_controller_system, ragdoll_system, water_trigger_system};
 use profiler::FrameProfiler;
 use renderer::Renderer;
@@ -85,10 +87,10 @@ use settings::EngineSettings;
 #[cfg(feature = "scripting")]
 use scripting::ScriptEngine;
 use systems::scripting_system;
-use terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainGrid, TerrainWorld};
+use terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainWorld};
 
 // New core systems
-use core::{EventBus, BeginFrameEvent, EndFrameEvent, ShutdownEvent};
+use core::{EventBus, BeginFrameEvent, EndFrameEvent};
 use core::events::{TimeOfDayChangedEvent, WeatherChangedEvent, ThunderEvent};
 use render::{InstancingManager, ShaderManager};
 #[cfg(feature = "audio")]
@@ -1451,6 +1453,10 @@ impl ApplicationHandler for GameApp {
                     if self.script_skip_frames_remaining > 0 {
                         self.script_skip_frames_remaining -= 1;
                     } else {
+                        let (screen_w, screen_h) = self.window.as_ref()
+                            .map(|w| { let s = w.inner_size(); (s.width as f32, s.height as f32) })
+                            .unwrap_or((1280.0, 720.0));
+                        let camera_fov = self.input_state.camera.fov_degrees;
                         scripting_system(
                             &mut self.world,
                             &mut self.scripts,
@@ -1461,6 +1467,10 @@ impl ApplicationHandler for GameApp {
                             self.audio.as_mut(),
                             &self.nav_grid,
                             &mut self.ai_registry,
+                            &mut self.terrain_world,
+                            screen_w,
+                            screen_h,
+                            camera_fov,
                         );
                         self.scripts.drain_destroys(&mut self.world);
                         if let Some((pos, target)) = self.scripts.consume_camera_request() {
@@ -1567,6 +1577,8 @@ impl ApplicationHandler for GameApp {
                     }
                     // Ragdoll: post-physics bone constraint solving.
                     ragdoll_system(&mut self.world, dt);
+
+                    ai_system(&mut self.world, &mut self.ai_registry, &self.nav_grid, dt, sim_time);
 
                     animation_system(&mut self.world, dt, &self.jobs);
                     // Skeletal animation blending: reads BT "ai_state" from blackboard,
@@ -1837,6 +1849,7 @@ impl ApplicationHandler for GameApp {
                             &self.assets.meshes,
                             &self.input_state.camera,
                             &self.jobs,
+                            &mut self.instancing,
                             Some(&gpu_particles),
                             Some(&mut draw_ui),
                         );
@@ -1866,6 +1879,7 @@ impl ApplicationHandler for GameApp {
                             &self.assets.meshes,
                             &self.input_state.camera,
                             &self.jobs,
+                            &mut self.instancing,
                             Some(&gpu_particles),
                             Some(&mut draw_ui),
                         );
@@ -1999,6 +2013,7 @@ impl ApplicationHandler for GameApp {
                         &self.assets.meshes,
                         &self.input_state.camera,
                         &self.jobs,
+                        &mut self.instancing,
                         Some(&gpu_particles),
                         Some(&mut draw_ui),
                     );

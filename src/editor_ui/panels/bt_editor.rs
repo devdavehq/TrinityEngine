@@ -2,7 +2,7 @@ use crate::ai::behavior_tree::{
     BehaviorTree, BehaviorNode, Cooldown, Inverter, Log, MoveTo, Parallel, Patrol,
     Selector, Sequence, SetState, Wait,
 };
-use egui::{Color32, Pos2, Rect, RichText, Vec2};
+use egui::{Color32, Pos2, Rect, RichText};
 
 #[derive(Clone)]
 pub enum BtEditorNodeType {
