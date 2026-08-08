@@ -614,3 +614,139 @@ Camera Lua API: expose get/set camera position, direction, screen-to-ray, and ca
 [ ] Runtime terrain modification from Lua scripts (called per-frame in update loop)
 [ ] Mesh blending system: vertex-paint blending so placed objects blend with terrain (distance-based alpha, decal projection)
 [ ] Verify compilation + tests after all implementations continue from here
+
+
+
+continue 
+
+also do we have  a save and load system, disaster system, prefabsystem, fractured mesh system
+
+2. Entity / component APIs
+- Create/spawn entities: NOT exposed. There is no spawn_entity, no prefab/primitive/model spawn function in the Lua surface (confirmed by grep: spawn_mesh_entity, spawn_prefab, spawn_primitive exist in src/editor_ui.rs:5616/5793/5597 but are Rust/editor-only). Scripts can only destroy (destroy(eid), scripting.rs:1472).
+- Transform: full position/rotation/scale read/write + move_by (§1B).
+- Component query: yes — has_component / get_component / set_component but only for a hard-coded whitelist of 12 component names; no iteration over entities (query_all equivalent absent), no lookup by name/tag.
+- Query by component across the world: NOT possible. No Lua equivalent of world.query::<&T>().
+- Load models: NOT exposed. No mesh/asset loading from Lua.
+- Particles: NOT exposed. src/particles.rs is Rust-only (weather emitters are engine-driven, not script-driven).
+- Audio: yes — 2D/system-level only (channels music/sfx/ambient), no positional/3D sounds.
+- Camera control: yes — get_camera/set_camera/look_at/get_camera_direction/screen_to_ray/skip_next_frames (§1B).
+- UI: partial — HUD value/text/visibility push (set_ui_value etc. drive egui widgets in editor_ui.rs:2809–2816), but the ui.* design API is stubbed (§1A).
+- Terrain/nav/BT/AI: rich — see §1B tables.
+3. Events and the event bus
+- EventBus exists but is Rust-only and NOT exposed to Lua. src/core/event_bus.rs implements typed pub/sub (subscribe, emit, dispatch, flush, lines 112–170). Event types live in src/core/events.rs (CollisionStartedEvent, EntityCreatedEvent, WeatherChangedEvent, etc.). There is no Lua binding for subscribe/emit — no globals.set("subscribe"...), no event_bus global anywhere in scripting.rs.
+- Collision events reach Lua only via per-entity callback dispatch, not the bus: dispatch_collision_events() (scripting.rs:2216–2234) is called from main.rs:1525 with physics output, and fans out to the two involved entities' on_collision_enter/stay/exit Lua functions (dispatch_collision_for_entity, 2236–2267). The same collisions are also pushed onto the Rust EventBus (main.rs:1532–1552), but a Lua script cannot subscribe to that bus.
+- Input events: not event-driven; scripts poll is_key_held() each frame.
+- UI click events: not event-driven either — the editor writes a single global ui_click_event that scripts poll (editor_ui.rs:2801: args.scripts.lua_create().globals().set("ui_click_event", w.id.clone())).
+- Timers: none — only elapsed_time() and the dt arg.
+- Custom events / event bus for scripts: ABSENT — this is a significant gap.
+
+Missing capabilities a game developer would need
+Capability	Status	Evidence
+Spawn entities / prefabs / primitives	❌ Missing	No spawn binding in scripting.rs; Rust helpers exist only in editor_ui.rs:5597–5830
+Entity lookup / query world	❌ Missing	No find-by-name, no iterate-all-entities binding
+Load models/meshes	❌ Missing	Asset system not bridged
+Particles / VFX	❌ Missing	particles.rs not bridged
+UI scripting	⚠️ Stubs	ui.* design API is canned responses (ui.rs:197–275); only value/text/visible HUD push + ui_click_event poll works
+Event subscription (custom events, timers, input events)	❌ Missing	EventBus (core/event_bus.rs) not exposed to Lua; only hard-coded collision callbacks; input/timers are poll-only
+Cinematics / cutscenes	❌ Missing	nothing
+Save / load game scripting	❌ Missing	levels.rs, editor_persist.rs not bridged
+Pathfinding / AI scripting hooks	✅ Present	nav.*, bt.*, bt.set_state (drives anim blending via ai_state blackboard), terrain.*
+Physics raycasts / overlap queries	⚠️ Partial	screen_to_ray() returns a ray but no raycast/overlap API exposed
+Gamepad / mouse input	⚠️ Partial	only virtual-key is_key_held
+Positional audio / attenuation	❌ Missing	only channel-volume level audio (1605–1666)
+Timers / delayed calls	❌ Missing	no set_timeout/schedule; only elapsed_time and per-frame update
+Coroutines	⚠️ Available	Lua 5.4 coroutine lib is present (not stripped), but engine provides no yield/delay integration
+Sandbox enforcement (memory/time limits)	⚠️ Inert	SandboxConfig fields set but never enforced; only os/io/loadfile/dofile stripped fix all these thoroughly
+No combat/enemy AI, no Enemy/AIController/AIState types, no boids, and no hardcoded built-in trees. Trees are authored at runtime via Lua (scripting.rs) or the BT editor (bt_editor.rs).
+Navigation is grid-based A* (navigation.rs:69) over a binary slope/height walkability mask — a cell grid, not a navmesh.
+For passive open-world creatures, the missing pieces are specifically: Wander, Flee, native Idle, Graze/Consume, a Perception/FindNearestEntity leaf, and a distance/range condition node (plus seeded per-agent RNG). A boids/flocking layer is entirely absent make the A* into a real navmesh, the ai did u mean its lua that controlls enemy ai behaviour, ad the animal passive behaviour but add them only if theyre meant to be defaultly embedded int the engine 
+
+There is no formal registry / plugin pattern. Registration is a hand-written, centralized set of globals.set() calls in three locations: why and how would we use plugins or formal registry
+
+
+
+
+also do we have  a save and load system, disaster system, prefabsystem, fractured mesh system
+
+what type of plugin can i create 
+why do we have a healt bar widget i want to creat it myself not follow come 
+why do we have spawn prefab in lua how does it work and shoulding that be for the editor
+and fix the bug in scripting_api.rs
+isnt this hardcoded = "meshes/cube.obj".to_string(); explain why 
+can i create the plugin in lua and it compiles to rust also what if game creators want to create games plugin themselves(what will be the issue and toll of that creating the plugin in lua compiling to rust)
+wha default plugins would we need to have in the engine
+hope our particle system is really powerful what does it need to be more powerful
+also what else does the engine need
+
+do we have backface culling?
+whats the use and diff from a navmeshand navgrid
+whats bt
+Issues / trade-offs
+Cost: NavMesh::find_path runs A* over triangle adjacency and uses nearest_triangle (an O(n) linear scan per query). For many agents it's heavier than the grid A* — fine for tens of agents, not thousands.
+Anchored path: triangle-center waypoints snap the path to triangle centroids; the built-in smooth() drops near-collinear points but won't produce string-pulled corner-hugging paths like a true geodesic navmesh. Good for ambient AI, less optimal for tight corridor navigation.
+Held path: I left is_walkable_at on NavMesh (used by Wander candidates) doing a full scan per call — acceptable since it's only per target-pick, not per move-step. will these affect gameplay badly or affect at all and how, also how do we fix these? tell me?
+-- Content/Scripts/guard_ai.lua
+-- Enemy AI built from engine-native behavior-tree nodes via the `bt.*` API.
+-- There is NO hardcoded Enemy/AIController type in the engine — enemy behavior
+-- is a behavior tree you compose here and assign to the entity's AiAgent.  The
+-- ai_system() ticks that tree every frame.
+--
+-- ANIMATION: bt.set_state(entity, "chase"/"idle"/"attack"/"hurt") writes
+-- "ai_state" to the entity's blackboard.  The animation blending system reads
+-- it each frame and crossfades the SkeletalAnimator to the matching clip
+-- (see animation/blending.rs and skeletal.rs:474).  So AI decisions drive
+-- animation automatically — the exact answer to "how do we animate enemy AI".
+
+function start(entity)
+    -- Build the tree once, assign it to this entity's AiAgent.
+    build_guard_tree()
+    bt.assign(entity, "guard")
+    log("guard_ai: tree assigned to " .. entity)
+end
+
+-- The Lua bt.* builder is a flat, single-root tree.  Nodes are added in order
+-- onto one root; decorators (bt.in_range/cooldown) wrap the previously added
+-- node.  Action leaves use blackboard keys set by other systems:
+--   * perceive writes "target_pos" (nearest entity with the given tag)
+--   * move_to reads "target_pos" and walks the NavGrid A* path
+function build_guard_tree()
+    bt.create("guard")            -- fresh builder
+    bt.sequence("guard")           -- implicit; children run in order
+
+    -- 1. Sense the nearest "player"-tagged entity within 10 units.
+    bt.perceive("guard", 10.0, "player")
+
+    -- 2. Chase it (NavGrid A* toward blackboard "target_pos").
+    bt.move_to("guard")
+end
+
+function update(entity, dt)
+    -- Per-frame decision + animation steering that complements the tree.
+    local hp, hp_max = get_health(entity)
+    if hp <= 0 then
+        bt.set_state(entity, "dead")
+        return
+    end
+    if hp < hp_max * 0.25 then
+        bt.set_state(entity, "hurt")
+    else
+        -- If blackboard has a target we're chasing, play the run clip,
+        -- otherwise idle. A real game reads bt.get_blackboard_bool/float.
+        bt.set_state(entity, "chase")
+    end
+end explain how to use this expecially that this is just code and ill need to be able to see the enemy movve animatedly so how do we do that
+what are the limitations om the inbuilt ai and do i need to create mine in lua incase i want to add diff behaviours myself in a game
+also in the scripting.rs i saw that setcomponents and get components has position and rotation but no scale is this purposely 
+whats boids
+answer all questions and explain easily but understandablly 
+is the cinamitics very powerful and what can and wil it do
+hope the engine can allow larg amount of like players like it can rener lot of objects crowds? without destroying runtime or crashing
+
+also hope the engine tho big is efficient uses bestpractices and manages memory very well so it reduces tasks on the system being used but doesnt compromise visual fidelity and engine capability
+whats the sandbox for
+
+
+ NavGrid = uniform grid over terrain heights + A* on cells (cheap, good for heightmap terrain). NavMesh = triangulated polygon surface (NavMesh::from_terrain) for natural, non-grid navigation.
+
+
+ server-authoritative networked multiplayer, no (no networking module).

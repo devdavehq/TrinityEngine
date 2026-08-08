@@ -1,6 +1,8 @@
 use crate::ai::blackboard::{Blackboard, BlackboardValue};
+use crate::ai::components::AiAgent;
 use crate::components::Position;
 use crate::navigation::NavGrid;
+use crate::navmesh::NavMesh;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BEHAVIOR TREE FRAMEWORK
@@ -46,6 +48,9 @@ pub struct BTContext<'a> {
     pub dt: f32,
     pub time_s: f32,
     pub nav_grid: &'a NavGrid,
+    /// Optional triangle navmesh. Movement nodes prefer it for paths and fall
+    /// back to `nav_grid` when it is absent or cannot route.
+    pub navmesh: Option<&'a NavMesh>,
     pub blackboard: &'a mut Blackboard,
 }
 
@@ -600,17 +605,6 @@ impl MoveTo {
             name: name.to_string(),
         }
     }
-
-    /// Convert world-space [f32;3] to NavGrid grid coordinates.
-    /// The NavGrid spans from (-half_w, -half_d) to (+half_w, +half_d) in
-    /// world space, with (0,0) at the grid center.
-    fn world_to_grid(pos: [f32; 3], grid_w: usize, grid_d: usize) -> (usize, usize) {
-        let half_w = grid_w as f32 * 0.5;
-        let half_d = grid_d as f32 * 0.5;
-        let gx = (pos[0] + half_w).round().clamp(0.0, (grid_w - 1) as f32) as usize;
-        let gz = (pos[2] + half_d).round().clamp(0.0, (grid_d - 1) as f32) as usize;
-        (gx, gz)
-    }
 }
 
 impl BehaviorNode for MoveTo {
@@ -643,36 +637,20 @@ impl BehaviorNode for MoveTo {
         };
 
         if needs_new_path {
-            let start = Self::world_to_grid(current_pos, ctx.nav_grid.width, ctx.nav_grid.depth);
-            let goal = Self::world_to_grid(target_pos, ctx.nav_grid.width, ctx.nav_grid.depth);
-
-            match ctx.nav_grid.find_path(start, goal) {
-                Some(grid_path) => {
-                    // Convert grid path to world-space waypoints.
-                    let half_w = ctx.nav_grid.width as f32 * 0.5;
-                    let half_d = ctx.nav_grid.depth as f32 * 0.5;
-                    let waypoints: Vec<[f32; 3]> = grid_path
-                        .iter()
-                        .map(|&(gx, gz)| {
-                            [
-                                gx as f32 - half_w,
-                                current_pos[1], // Keep current height.
-                                gz as f32 - half_d,
-                            ]
-                        })
-                        .collect();
-                    // Store the raw waypoints (we'll pop from the front).
-                    ctx.blackboard.set(
-                        "current_path",
-                        BlackboardValue::Path(waypoints),
-                    );
-                    ctx.blackboard.set(
-                        "path_waypoint_index",
-                        BlackboardValue::Float(0.0),
-                    );
-                }
+            let from = [current_pos[0], current_pos[1], current_pos[2]];
+            let waypoints = match find_agent_path(ctx, from, target_pos, current_pos[1]) {
+                Some(wp) => wp,
                 None => return Status::Failure, // No path exists.
-            }
+            };
+            // Store the raw waypoints (we'll pop from the front).
+            ctx.blackboard.set(
+                "current_path",
+                BlackboardValue::Path(waypoints),
+            );
+            ctx.blackboard.set(
+                "path_waypoint_index",
+                BlackboardValue::Float(0.0),
+            );
         }
 
         // Pop the next waypoint from the path.
@@ -957,6 +935,628 @@ impl BehaviorNode for SetState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PER-AGENT SEEDED RNG
+// ═══════════════════════════════════════════════════════════════════════════════
+// A lightweight, deterministic LCG stored ON the agent's blackboard so each
+// entity has its own reproducible random stream.  This fixes the existing
+// `RandomSelector` problem where every agent using the same tree gets the SAME
+// random pick (it seeds off SystemTime, ignoring the entity).  Wander/Flee/
+// Graze and the editor's random branches all advance this per-agent stream.
+//
+// The seed lives under a reserved blackboard key `_rng_seed` as a Float.
+// It is initialised lazily from a per-agent source (entity bits) so that two
+// agents with identical trees behave differently.
+
+/// Reserved blackboard key holding the per-agent RNG state.
+pub const AGENT_RNG_KEY: &str = "_rng_seed";
+
+struct AgentRng {
+    state: u64,
+}
+
+impl AgentRng {
+    // FNV-1a style avalanche mix for the Fowler-Noll hash. Non-cryptographic.
+    fn mix(a: u64) -> u64 {
+        let mut h = a;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+        h ^= h >> 33;
+        h
+    }
+
+    fn from_seed(seed: u64) -> Self {
+        Self { state: Self::mix(seed).max(1) }
+    }
+
+    /// Uniform float in [0, 1).
+    fn next(&mut self) -> f32 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let hi = (self.state >> 32) as u32;
+        (hi as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+
+    /// Uniform float in [lo, hi).
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.next()
+    }
+
+    /// Random point in [0,1)^3 (for velocity spread, etc.).
+    fn vec3(&mut self) -> [f32; 3] {
+        [self.next(), self.next(), self.next()]
+    }
+}
+
+/// Obtain (or lazily initialise) a per-agent RNG borrowed from the blackboard.
+/// The agent's identity (entity bits) determines its default seed so results
+/// differ between agents even when trees are identical.
+fn agent_rng<'a>(blackboard: &'a mut Blackboard, entity: hecs::Entity) -> AgentRng {
+    match blackboard.get_float(AGENT_RNG_KEY) {
+        Some(state) => AgentRng { state: state as u64 },
+        None => {
+            // Initialise from the entity identifier for per-agent uniqueness.
+            // XOR (not OR) with the golden constant so that differing low bits
+            // of the entity id actually change the seed.
+            let seed = entity.to_bits().get() ^ 0x9E3779B97F4A7C15u64;
+            let rng = AgentRng::from_seed(seed);
+            // Persist the starting state so it behaves deterministically.
+            blackboard.set(AGENT_RNG_KEY, BlackboardValue::Float(rng.state as f32));
+            rng
+        }
+    }
+}
+
+/// Persist the RNG state back onto the blackboard after advancing it.
+fn store_agent_rng(blackboard: &mut Blackboard, rng: &AgentRng) {
+    blackboard.set(AGENT_RNG_KEY, BlackboardValue::Float(rng.state as f32));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PASSIVE OPEN-WORLD BEHAVIOR NODES
+// ═══════════════════════════════════════════════════════════════════════════════
+// A small set of engine-native behaviors for ambient creatures: Wander, Flee,
+// Idle, Graze/Consume, Perception (FindNearestEntity) and a Distance condition.
+// Most require the ECS World or the NavGrid — things that are awkward/impossible
+// to express purely in Lua — so they are embedded as BehaviorNode impls.  The
+// Lua `bt.*` builder (and the BT editor) can compose them into trees.
+//
+// All of these drive the `ai_state` blackboard value so the animation-blending
+// system selects an appropriate clip ("idle", "walk", "run", "graze").
+
+// ── Idle ──────────────────────────────────────────────────────────────────────
+// Native idle: drives `ai_state` = "idle".  With `duration == 0` it returns
+// Running indefinitely (the agent stands still).  With a positive duration it
+// runs for that many seconds then returns Success, letting a parent Selector
+// fall through to another behavior.
+
+pub struct Idle {
+    duration: f32,
+    remained: f32,
+    name: String,
+}
+
+impl Idle {
+    pub fn new(name: &str, duration: f32) -> Self {
+        Self { duration, remained: duration, name: name.to_string() }
+    }
+}
+
+impl BehaviorNode for Idle {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        ctx.blackboard.set("ai_state", BlackboardValue::String("idle".to_string()));
+        if self.duration <= 0.0 {
+            return Status::Running;
+        }
+        self.remained -= ctx.dt;
+        if self.remained <= 0.0 {
+            self.remained = self.duration;
+            Status::Success
+        } else {
+            Status::Running
+        }
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Wander ────────────────────────────────────────────────────────────────────
+// Picks a random reachable point within `radius` of `anchor` and walks there
+// using the NavGrid.  On arrival it picks a fresh target and keeps wandering
+// (returns Running while moving).  Uses the per-agent RNG so each creature
+// wanders on its own path.  The `home` blackboard key (Vec3) may override the
+// fixed anchor so the wanderer stays near a den/territory.
+
+pub struct Wander {
+    speed: f32,
+    radius: f32,
+    anchor: [f32; 3],
+    name: String,
+}
+
+impl Wander {
+    pub fn new(name: &str, speed: f32, radius: f32, anchor: [f32; 3]) -> Self {
+        Self { speed, radius, anchor, name: name.to_string() }
+    }
+}
+
+impl BehaviorNode for Wander {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        // Per-agent RNG for deterministic-but-distinct wandering.
+        let mut rng = agent_rng(ctx.blackboard, ctx.entity);
+
+        let anchor = ctx
+            .blackboard
+            .get_vec3("home")
+            .unwrap_or(self.anchor);
+
+        // Move toward the currently-latched target if one exists.
+        let target = ctx.blackboard.get_vec3("target_pos");
+
+        if target.is_none() {
+            // Pick a new random point within radius around the anchor.
+            let mut candidate = [anchor[0], anchor[1], anchor[2]];
+            for _ in 0..8 {
+                let dir = rng.vec3();
+                let dx = (dir[0] * 2.0 - 1.0) * self.radius;
+                let dz = (dir[2] * 2.0 - 1.0) * self.radius;
+                candidate = [anchor[0] + dx, anchor[1], anchor[2] + dz];
+                // Ensure the candidate is walkable; retry with a new point.
+                if Self::grid_walkable(ctx, candidate) {
+                    break;
+                }
+            }
+            ctx.blackboard.set("target_pos", BlackboardValue::Vec3(candidate));
+            ctx.blackboard.set("ai_state", BlackboardValue::String("walk".to_string()));
+            store_agent_rng(ctx.blackboard, &rng);
+            return Status::Running;
+        }
+
+        let target_pos = target.as_ref().copied().unwrap();
+        let status = Self::move_step(ctx, target_pos, self.speed);
+        store_agent_rng(ctx.blackboard, &rng);
+
+        if status == Status::Success {
+            // Arrived — clear the target so the next tick picks a new one.
+            ctx.blackboard.remove("target_pos");
+            ctx.blackboard.set("ai_state", BlackboardValue::String("idle".to_string()));
+            Status::Running
+        } else {
+            ctx.blackboard.set("ai_state", BlackboardValue::String("walk".to_string()));
+            status
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Wander {
+    fn grid_walkable(ctx: &mut BTContext, pos: [f32; 3]) -> bool {
+        // Prefer the polygon navmesh for reachability when available.
+        if let Some(nm) = ctx.navmesh {
+            if !nm.is_walkable_at(pos) {
+                return false;
+            }
+        }
+        let half_w = ctx.nav_grid.width as f32 * 0.5;
+        let half_d = ctx.nav_grid.depth as f32 * 0.5;
+        let gx = (pos[0] + half_w).round() as isize;
+        let gz = (pos[2] + half_d).round() as isize;
+        if gx < 0 || gz < 0 || gx >= ctx.nav_grid.width as isize || gz >= ctx.nav_grid.depth as isize {
+            return false;
+        }
+        ctx.nav_grid.walkable[gz as usize * ctx.nav_grid.width + gx as usize]
+    }
+
+    fn move_step(ctx: &mut BTContext, target: [f32; 3], speed: f32) -> Status {
+        move_toward(ctx, target, speed)
+    }
+}
+
+// ── Flee ─────────────────────────────────────────────────────────────────────
+// Reads the current threat (either a Vec3 `threat_pos` or an Entity
+// `threat`→its position) and moves directly away from it at `run_speed`.
+// Continues running until the threat is farther than `safe_distance`, then
+// returns Success.  Fails immediately if no threat is recorded.
+
+pub struct Flee {
+    run_speed: f32,
+    safe_distance: f32,
+    threat_pos_key: String,
+    threat_entity_key: String,
+    name: String,
+}
+
+impl Flee {
+    pub fn new(name: &str, run_speed: f32, safe_distance: f32) -> Self {
+        Self {
+            run_speed,
+            safe_distance,
+            threat_pos_key: "threat_pos".to_string(),
+            threat_entity_key: "threat".to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl BehaviorNode for Flee {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        let current = match ctx.world.get::<&Position>(ctx.entity) {
+            Ok(p) => [p.x, p.y, p.z],
+            Err(_) => return Status::Failure,
+        };
+
+        // Resolve threat position from either source.
+        let mut threat = ctx.blackboard.get_vec3(&self.threat_pos_key);
+        if threat.is_none() {
+            if let Some(eid) = ctx.blackboard.get_entity(&self.threat_entity_key) {
+                if let Some(e) = hecs::Entity::from_bits(eid) {
+                    if let Ok(p) = ctx.world.get::<&Position>(e) {
+                        threat = Some([p.x, p.y, p.z]);
+                    }
+                }
+            }
+        }
+        let Some(threat_pos) = threat else {
+            return Status::Failure;
+        };
+
+        let dx = current[0] - threat_pos[0];
+        let dz = current[2] - threat_pos[2];
+        let dist = (dx * dx + dz * dz).sqrt();
+        if dist > self.safe_distance {
+            ctx.blackboard.set("ai_state", BlackboardValue::String("idle".to_string()));
+            return Status::Success;
+        }
+
+        // Run away: direction from threat, kept on the ground plane.
+        let dir_len = dist.max(1e-4);
+        let nx = dx / dir_len;
+        let nz = dz / dir_len;
+        // Step to the escape cell; clamp to nav bounds but allow ground movement.
+        let target = [current[0] + nx * 1.0, current[1], current[2] + nz * 1.0];
+        move_toward(ctx, target, self.run_speed);
+        ctx.blackboard.set("ai_state", BlackboardValue::String("run".to_string()));
+        Status::Running
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Graze / Consume ───────────────────────────────────────────────────────────
+// Finds the nearest entity tagged as consumable within `radius`, walks to it,
+// and on contact "consumes" it (despawns it from the world) and succeeds.
+// Fails if no consumable is in range.  This drives the "graze" animation state.
+
+pub struct Graze {
+    speed: f32,
+    radius: f32,
+    consume_tag: String,
+    name: String,
+}
+
+impl Graze {
+    pub fn new(name: &str, speed: f32, radius: f32) -> Self {
+        Self {
+            speed,
+            radius,
+            consume_tag: "grazeable".to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl BehaviorNode for Graze {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        let current = match ctx.world.get::<&Position>(ctx.entity) {
+            Ok(p) => [p.x, p.y, p.z],
+            Err(_) => return Status::Failure,
+        };
+
+        // Do we already have a latched food target?
+        let mut food_bits = ctx.blackboard.get_entity("graze_target");
+
+        if food_bits.is_none() {
+            // Scan the world for the nearest grazeable entity.
+            food_bits = find_nearest_entity_fast(ctx, current, &self.consume_tag, self.radius);
+            let Some(bits) = food_bits else { return Status::Failure; };
+            ctx.blackboard.set("graze_target", BlackboardValue::Entity(bits));
+        }
+
+        let Some(bits) = food_bits else { return Status::Failure; };
+        let Some(food) = hecs::Entity::from_bits(bits) else {
+            ctx.blackboard.remove("graze_target");
+            return Status::Failure;
+        };
+
+        let food_pos = match ctx.world.get::<&Position>(food) {
+            Ok(p) => [p.x, p.y, p.z],
+            Err(_) => {
+                // Target vanished — clear and retry next tick.
+                ctx.blackboard.remove("graze_target");
+                return Status::Running;
+            }
+        };
+
+        let dx = food_pos[0] - current[0];
+        let dy = food_pos[1] - current[1];
+        let dz = food_pos[2] - current[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        ctx.blackboard.set("ai_state", BlackboardValue::String("graze".to_string()));
+
+        if dist < 0.5 {
+            // Consume it.
+            let _ = ctx.world.despawn(food);
+            ctx.blackboard.remove("graze_target");
+            ctx.blackboard.set("ai_state", BlackboardValue::String("idle".to_string()));
+            return Status::Success;
+        }
+
+        move_toward(ctx, food_pos, self.speed);
+        Status::Running
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Perception / FindNearestEntity ────────────────────────────────────────────
+// A leaf that scans the ECS World for the closest entity within `radius` that
+// carries a provided tag (matched against a per-entity "faction"/"tag" string
+// stored on the blackboard side; a tag of "*" matches any entity).  When a
+// target is found it writes its entity bits to the `result_entity_key` and its
+// position to the `result_pos_key`, then returns Success.  Otherwise it
+// returns Failure.  This is the engine-side primitive that pure-Lua cannot do.
+
+pub struct Perception {
+    radius: f32,
+    look_for_tag: String,
+    result_entity_key: String,
+    result_pos_key: String,
+    name: String,
+}
+
+impl Perception {
+    pub fn new(name: &str, radius: f32, look_for_tag: &str) -> Self {
+        Self {
+            radius,
+            look_for_tag: look_for_tag.to_string(),
+            result_entity_key: "perceived_entity".to_string(),
+            result_pos_key: "perceived_pos".to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl BehaviorNode for Perception {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        let current = match ctx.world.get::<&Position>(ctx.entity) {
+            Ok(p) => [p.x, p.y, p.z],
+            Err(_) => return Status::Failure,
+        };
+
+        let nearest = find_nearest_entity_fast(ctx, current, &self.look_for_tag, self.radius);
+        match nearest {
+            Some(bits) => {
+                if let Some(e) = hecs::Entity::from_bits(bits) {
+                    if let Ok(p) = ctx.world.get::<&Position>(e) {
+                        ctx.blackboard.set(&self.result_entity_key, BlackboardValue::Entity(bits));
+                        ctx.blackboard.set(&self.result_pos_key, BlackboardValue::Vec3([p.x, p.y, p.z]));
+                    }
+                }
+                Status::Success
+            }
+            None => Status::Failure,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── DistanceCondition ─────────────────────────────────────────────────────────
+// A gate (decorator-style) that ticks its child only while the distance between
+// the entity and a reference position (blackboard Vec3 or result of a
+// Perception) is within [min, max].  Stores the distance in the blackboard key
+// `dist_to_target`.  Used to gate e.g. "attack only when within 5u" or "flee
+// only when the creature is within 8u".
+
+pub struct DistanceCondition {
+    child_ptr: *mut Box<dyn BehaviorNode>,
+    child: Box<Box<dyn BehaviorNode>>,
+    reference_pos_key: String,
+    min: f32,
+    max: f32,
+    distance_key: String,
+    name: String,
+}
+
+// SAFETY: exclusively owned raw pointer, main-thread only (same as Repeater).
+unsafe impl Send for DistanceCondition {}
+unsafe impl Sync for DistanceCondition {}
+
+impl DistanceCondition {
+    pub fn new(
+        name: &str,
+        child: Box<dyn BehaviorNode>,
+        reference_pos_key: &str,
+        min: f32,
+        max: f32,
+    ) -> Self {
+        let mut boxed_child = Box::new(child);
+        let child_ptr = &mut *boxed_child as *mut Box<dyn BehaviorNode>;
+        Self {
+            child_ptr,
+            child: boxed_child,
+            reference_pos_key: reference_pos_key.to_string(),
+            min,
+            max,
+            distance_key: "dist_to_target".to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl BehaviorNode for DistanceCondition {
+    fn tick(&mut self, ctx: &mut BTContext) -> Status {
+        let Some(reference) = ctx.blackboard.get_vec3(&self.reference_pos_key) else {
+            return Status::Failure;
+        };
+        let current = match ctx.world.get::<&Position>(ctx.entity) {
+            Ok(p) => [p.x, p.y, p.z],
+            Err(_) => return Status::Failure,
+        };
+        let dx = current[0] - reference[0];
+        let dy = current[1] - reference[1];
+        let dz = current[2] - reference[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        ctx.blackboard.set(&self.distance_key, BlackboardValue::Float(dist));
+
+        if dist < self.min || dist > self.max {
+            return Status::Failure;
+        }
+        // SAFETY: exclusively owned child, no aliasing (same as Conditional).
+        let child = unsafe { &mut *self.child_ptr };
+        child.tick(ctx)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Find a path from `from` to `to`, preferring the triangle navmesh and
+/// falling back to the NavGrid A*. Returns world-space waypoints (including
+/// both endpoints). The grid fallback keeps its own height on all waypoints,
+/// so `ref_height` (typically the agent's current Y) is used there.
+fn find_agent_path(
+    ctx: &BTContext,
+    from: [f32; 3],
+    to: [f32; 3],
+    ref_height: f32,
+) -> Option<Vec<[f32; 3]>> {
+    // 1. Real navmesh first — smooth 3D paths on the actual surface.
+    if let Some(nm) = ctx.navmesh {
+        if let Some(path) = nm.find_path(from, to) {
+            if path.len() > 1 {
+                return Some(path);
+            }
+        }
+    }
+
+    // 2. Grid fallback — same result as legacy MoveTo.
+    let start = world_to_grid(from, ctx.nav_grid.width, ctx.nav_grid.depth);
+    let goal = world_to_grid(to, ctx.nav_grid.width, ctx.nav_grid.depth);
+    let grid_path = ctx.nav_grid.find_path(start, goal)?;
+
+    let half_w = ctx.nav_grid.width as f32 * 0.5;
+    let half_d = ctx.nav_grid.depth as f32 * 0.5;
+    let mut waypoints: Vec<[f32; 3]> = Vec::with_capacity(grid_path.len());
+    for &(gx, gz) in &grid_path {
+        waypoints.push([gx as f32 - half_w, ref_height, gz as f32 - half_d]);
+    }
+    if waypoints.last().map(|l| *l != to).unwrap_or(true) {
+        waypoints.push(to);
+    }
+    Some(waypoints)
+}
+
+/// Convert world-space [f32;3] to NavGrid grid coordinates.
+/// The NavGrid spans from (-half_w, -half_d) to (+half_w, +half_d) in
+/// world space, with (0,0) at the grid center.
+fn world_to_grid(pos: [f32; 3], grid_w: usize, grid_d: usize) -> (usize, usize) {
+    let half_w = grid_w as f32 * 0.5;
+    let half_d = grid_d as f32 * 0.5;
+    let gx = (pos[0] + half_w).round().clamp(0.0, (grid_w - 1) as f32) as usize;
+    let gz = (pos[2] + half_d).round().clamp(0.0, (grid_d - 1) as f32) as usize;
+    (gx, gz)
+}
+
+/// Move the entity one step toward `target` at `speed`.  Returns Success when
+/// within snap tolerance, Running otherwise.  Shares the stepping logic between
+/// Wander, Flee and Graze so movement is consistent.
+fn move_toward(ctx: &mut BTContext, target: [f32; 3], speed: f32) -> Status {
+    let current = match ctx.world.get::<&Position>(ctx.entity) {
+        Ok(p) => [p.x, p.y, p.z],
+        Err(_) => return Status::Failure,
+    };
+    let dx = target[0] - current[0];
+    let dy = target[1] - current[1];
+    let dz = target[2] - current[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist < 0.15 {
+        return Status::Success;
+    }
+    let step = speed * ctx.dt.max(0.0);
+    let s = step.min(dist);
+    if let Ok(mut pos) = ctx.world.get::<&mut Position>(ctx.entity) {
+        pos.x += dx / dist * s;
+        pos.y += dy / dist * s;
+        pos.z += dz / dist * s;
+    }
+    Status::Running
+}
+
+/// Shared nearest-entity scan used by Perception and Graze.
+/// Matches any entity with a Position that is not `ctx.entity`, optionally
+/// filtered by a tag.  Returns its entity bits, or None.
+fn find_nearest_entity_fast(
+    ctx: &mut BTContext,
+    origin: [f32; 3],
+    tag: &str,
+    radius: f32,
+) -> Option<u64> {
+    let mut nearest: Option<(f32, u64)> = None;
+    for (entity, pos) in ctx.world.query::<(hecs::Entity, &Position)>().iter() {
+        if entity == ctx.entity {
+            continue;
+        }
+        if tag != "*" {
+            // Match either an optional EntityTag component or a "tag" value on
+            // an AiAgent blackboard.  Entities without a matching tag are skipped.
+            let component_tag = ctx.world.get::<&EntityTag>(entity).ok().map(|t| t.0.clone());
+            let bb_tag = ctx
+                .world
+                .get::<&AiAgent>(entity)
+                .ok()
+                .and_then(|a| a.blackboard.get_string("tag").map(|t| t.to_string()));
+            let ok = component_tag
+                .or(bb_tag)
+                .map_or(false, |t: String| t == tag);
+            if !ok {
+                continue;
+            }
+        }
+        let dx = pos.x - origin[0];
+        let dy = pos.y - origin[1];
+        let dz = pos.z - origin[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= radius {
+            if nearest.map_or(true, |(best, _)| dist < best) {
+                nearest = Some((dist, entity.to_bits().get()));
+            }
+        }
+    }
+    nearest.map(|(_, bits)| bits)
+}
+
+/// Marker that tags an entity for `find_nearest_entity_fast` scanning even when
+/// it has no AiAgent component.  This is a lightweight, optional extension used
+/// by game code to mark plants, food, or hazards that other AI should perceive.
+/// Without it, tags are read from an AiAgent's blackboard.
+pub struct EntityTag(pub String);
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // BEHAVIOR TREE WRAPPER
 // ═══════════════════════════════════════════════════════════════════════════════
 // Wraps a root node with a name.  This is what gets registered in the
@@ -1015,6 +1615,7 @@ mod tests {
             dt: 0.016,
             time_s: 0.0,
             nav_grid: nav,
+            navmesh: None,
             blackboard: bb,
         }
     }
@@ -1329,5 +1930,256 @@ mod tests {
             assert_eq!(node.tick(&mut ctx), Status::Success);
         }
         assert_eq!(bb.get_string("ai_state"), Some("walk"));
+    }
+
+    // ── Passive open-world behavior node tests ─────────────────────────────
+
+    #[test]
+    fn idle_drives_ai_state() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Idle::new("Idle", 0.0);
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Running);
+        }
+        assert_eq!(bb.get_string("ai_state"), Some("idle"));
+    }
+
+    #[test]
+    fn idle_finite_duration_succeeds() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Idle::new("Idle", 0.2);
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            ctx.dt = 0.3;
+            assert_eq!(node.tick(&mut ctx), Status::Success);
+        }
+    }
+
+    #[test]
+    fn wander_moves_and_writes_seed() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Wander::new("Wander", 2.0, 4.0, [0.0, 0.0, 0.0]);
+
+        // First tick picks a target and starts moving.
+        let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+        ctx.dt = 0.1;
+        assert_eq!(node.tick(&mut ctx), Status::Running);
+        assert!(ctx.blackboard.get_vec3("target_pos").is_some());
+        // The per-agent RNG seed must now exist on the blackboard.
+        assert!(ctx.blackboard.get_float(AGENT_RNG_KEY).is_some());
+
+        let start = ctx.world.get::<&Position>(entity).unwrap();
+        let start_x = start.x;
+        let start_z = start.z;
+        drop(start);
+        let mut moved = false;
+        for _ in 0..200 {
+            ctx.dt = 0.1;
+            node.tick(&mut ctx);
+            let p = ctx.world.get::<&Position>(entity).unwrap();
+            let dist = ((p.x - start_x).powi(2) + (p.z - start_z).powi(2)).sqrt();
+            if dist > 1.0 {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "Wander never moved the entity");
+    }
+
+    #[test]
+    fn flee_runs_away_from_threat() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        // Threat at +X, directly adjacent.
+        let threat = world.spawn((
+            crate::components::Position { x: 2.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        bb.set("threat", BlackboardValue::Entity(threat.to_bits().get()));
+        let nav = test_nav_grid();
+        let mut node = Flee::new("Flee", 2.0, 8.0);
+
+        let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+        ctx.dt = 0.1;
+        assert_eq!(node.tick(&mut ctx), Status::Running);
+        // Entity should have moved away from +X (towards -X).
+        let p = ctx.world.get::<&Position>(entity).unwrap();
+        assert!(p.x < 0.0, "Flee moved entity toward the threat (x={})", p.x);
+        assert_eq!(ctx.blackboard.get_string("ai_state"), Some("run"));
+    }
+
+    #[test]
+    fn flee_succeeds_when_threat_far() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        bb.set("threat_pos", BlackboardValue::Vec3([100.0, 0.0, 0.0]));
+        let nav = test_nav_grid();
+        let mut node = Flee::new("Flee", 2.0, 8.0);
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Success);
+        }
+    }
+
+    #[test]
+    fn perception_finds_nearest_entity() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        // Two candidates: near and far.
+        let near = world.spawn((
+            crate::components::Position { x: 1.0, y: 0.0, z: 0.0 },
+            EntityTag("prey".to_string()),
+        ));
+        let _far = world.spawn((
+            crate::components::Position { x: 30.0, y: 0.0, z: 0.0 },
+            EntityTag("prey".to_string()),
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Perception::new("Perception", 5.0, "prey");
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Success);
+        }
+        assert_eq!(bb.get_entity("perceived_entity"), Some(near.to_bits().get()));
+        let pos = bb.get_vec3("perceived_pos").unwrap();
+        assert!((pos[0] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn perception_ignores_out_of_range() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let _far = world.spawn((
+            crate::components::Position { x: 100.0, y: 0.0, z: 0.0 },
+            EntityTag("prey".to_string()),
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Perception::new("Perception", 5.0, "prey");
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Failure);
+        }
+    }
+
+    #[test]
+    fn graze_consumes_grazeable() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let grass = world.spawn((
+            crate::components::Position { x: 0.3, y: 0.0, z: 0.0 },
+            EntityTag("grazeable".to_string()),
+        ));
+        let mut bb = Blackboard::new();
+        let nav = test_nav_grid();
+        let mut node = Graze::new("Graze", 2.0, 5.0);
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            ctx.dt = 0.1;
+            // Walk up to it and consume.
+            let mut done = false;
+            for _ in 0..20 {
+                if node.tick(&mut ctx) == Status::Success {
+                    done = true;
+                    break;
+                }
+                ctx.dt += 0.1;
+            }
+            assert!(done, "Graze never consumed the target");
+        }
+        // The grazeable entity should be despawned.
+        assert!(world.get::<&Position>(grass).is_err());
+        assert_eq!(bb.get_string("ai_state"), Some("idle"));
+    }
+
+    #[test]
+    fn distance_condition_gates_child() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let mut bb = Blackboard::new();
+        // Reference point is far away → gate fails.
+        bb.set("perceived_pos", BlackboardValue::Vec3([50.0, 0.0, 0.0]));
+        let nav = test_nav_grid();
+
+        let mut node = DistanceCondition::new(
+            "InRange",
+            Box::new(AlwaysSucceed),
+            "perceived_pos",
+            0.0,
+            10.0,
+        );
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node.tick(&mut ctx), Status::Failure);
+            let d = bb.get_float("dist_to_target").unwrap();
+            assert!(d > 10.0);
+        }
+
+        // Bring the reference within range → gate passes and child runs.
+        bb.set("perceived_pos", BlackboardValue::Vec3([2.0, 0.0, 0.0]));
+        let mut node2 = DistanceCondition::new(
+            "InRange2",
+            Box::new(AlwaysSucceed),
+            "perceived_pos",
+            0.0,
+            10.0,
+        );
+        {
+            let mut ctx = make_ctx(&mut world, entity, &mut bb, &nav);
+            assert_eq!(node2.tick(&mut ctx), Status::Success);
+        }
+    }
+
+    #[test]
+    fn seeded_rng_differs_per_agent() {
+        let mut world = hecs::World::new();
+        let e1 = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let e2 = world.spawn((
+            crate::components::Position { x: 0.0, y: 0.0, z: 0.0 },
+        ));
+        let nav = test_nav_grid();
+        let mut bb1 = Blackboard::new();
+        let mut bb2 = Blackboard::new();
+        {
+            let mut ctx1 = make_ctx(&mut world, e1, &mut bb1, &nav);
+            let r1 = agent_rng(ctx1.blackboard, e1);
+            let s1 = r1.state;
+            drop(ctx1);
+            let mut ctx2 = make_ctx(&mut world, e2, &mut bb2, &nav);
+            let r2 = agent_rng(ctx2.blackboard, e2);
+            assert_ne!(s1, r2.state, "Two agents should have distinct RNG seeds");
+        }
     }
 }

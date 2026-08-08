@@ -65,7 +65,8 @@ impl Default for EnvironmentState {
 pub struct LevelState {
     pub level_manager: LevelManager,
     pub streaming_config: StreamingConfig,
-    pub world_state: WorldStateManager,
+    /// Persistent world state (shared with the save.* Lua plugin via Arc<Mutex>).
+    pub world_state: std::sync::Arc<std::sync::Mutex<WorldStateManager>>,
     pub loading_screen: LoadingScreen,
     pub flood: FloodSystem,
 }
@@ -75,7 +76,7 @@ impl LevelState {
         Self {
             level_manager: LevelManager::new(),
             streaming_config: StreamingConfig::new(),
-            world_state: WorldStateManager::new(),
+            world_state: std::sync::Arc::new(std::sync::Mutex::new(WorldStateManager::new())),
             loading_screen: LoadingScreen::new(),
             flood: FloodSystem::new(),
         }

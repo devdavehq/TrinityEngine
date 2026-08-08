@@ -57,8 +57,14 @@ pub fn scripting_system(
     dt: f32,
     mut audio: Option<&mut AudioSystem>,
     nav_grid: &NavGrid,
+    navmesh: &crate::navmesh::NavMesh,
     ai_registry: &mut AiRegistry,
     terrain_world: &mut TerrainWorld,
+    meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
+    weather: &mut crate::environment::weather::WeatherState,
+    particles: &mut crate::particles::ParticleSystem,
+    levels: &mut crate::engine_subsystems::LevelState,
+    boids: &mut crate::boids::BoidRegistry,
     screen_w: f32,
     screen_h: f32,
     camera_fov: f32,
@@ -75,7 +81,10 @@ pub fn scripting_system(
 
     // Now run each script — world is free to borrow mutably.
     // Provide NavGrid and AiRegistry pointers for bt/nav Lua APIs.
-    scripts.set_external_refs(nav_grid, ai_registry, terrain_world);
+    scripts.set_external_refs(nav_grid, ai_registry, terrain_world, meshes, weather, navmesh);
+    scripts.set_particles(particles);
+    scripts.set_levels(levels);
+    scripts.set_boids(boids);
     for (entity, path) in script_entities {
         // Load and run the script for this entity.
         // Why load here? For simplicity — later we'll cache loaded scripts.

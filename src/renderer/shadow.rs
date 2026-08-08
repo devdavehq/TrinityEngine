@@ -17,12 +17,16 @@ use wgpu::{Device, Queue};
 pub const CASCADE_COUNT: usize = 3;
 
 // ShadowCascade holds one cascade's GPU depth texture and CPU light matrix.
+// Each cascade owns its own tiny uniform buffer + bind group so the depth
+// shader can be re-bound per cascade with a single mat4 (the light matrix).
 pub struct ShadowCascade {
     pub texture:      wgpu::Texture,
     pub view:         wgpu::TextureView,
     pub light_matrix: Mat4,
     pub near_dist:    f32,
     pub far_dist:     f32,
+    pub uniform_buf:  wgpu::Buffer,
+    pub bind_group:   wgpu::BindGroup,
 }
 
 // ShadowSystem manages all cascades and the depth-only render pipeline.
@@ -30,13 +34,37 @@ pub struct ShadowSystem {
     pub cascades:    Vec<ShadowCascade>,
     pub sampler:     wgpu::Sampler,   // comparison sampler for PCF
     pub pipeline:    wgpu::RenderPipeline,
-    pub uniform_buf: wgpu::Buffer,    // light matrices uploaded here
     pub shadow_bgl:  wgpu::BindGroupLayout,
 }
 
 impl ShadowSystem {
     pub fn new(device: &Device, shadow_resolution: u32) -> Self {
         // ── Cascade textures ───────────────────────────────────────────────
+        // Distance ranges per cascade.
+        let (near, far) = [
+            (0.1_f32, 10.0_f32),   // close  — sharp
+            (10.0,    40.0),        // medium
+            (40.0,   150.0),        // far    — softer
+        ][0]; // placeholder; replaced by per-index match below
+        let _ = (near, far);
+
+        // ── Bind group layout for shadow pass ─────────────────────────────
+        let shadow_bgl = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label:   Some("Shadow BGL"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding:    0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                }],
+            },
+        );
+
         let cascades: Vec<ShadowCascade> = (0..CASCADE_COUNT)
             .map(|i| {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -67,12 +95,28 @@ impl ShadowSystem {
                     1 => (10.0,     40.0),        // medium
                     _ => (40.0,    150.0),        // far    — softer
                 };
+                let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("Shadow Cascade {} Uniform", i)),
+                    size:               64,
+                    usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label:   Some(&format!("Shadow Cascade {} BG", i)),
+                    layout:  &shadow_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buf.as_entire_binding(),
+                    }],
+                });
                 ShadowCascade {
                     texture,
                     view,
                     light_matrix: Mat4::IDENTITY,
                     near_dist: near,
                     far_dist:  far,
+                    uniform_buf,
+                    bind_group,
                 }
             })
             .collect();
@@ -93,37 +137,25 @@ impl ShadowSystem {
             ..Default::default()
         });
 
-        // ── Uniform buffer ─────────────────────────────────────────────────
-        // Stores one Mat4 (64 bytes) per cascade.
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("Shadow Uniforms"),
-            size:               (64 * CASCADE_COUNT) as u64,
-            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // ── Bind group layout for shadow pass ─────────────────────────────
-        let shadow_bgl = device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label:   Some("Shadow BGL"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding:    0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty:                 wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size:   None,
-                    },
-                    count: None,
-                }],
-            },
-        );
-
         // ── Shadow depth-only pipeline ────────────────────────────────────
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some("Shadow Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
         });
+
+        // Instance model matrix is read from vertex buffer slot 1
+        // (step mode = Instance). It matches InstanceData in instancing.rs.
+        const INSTANCE_STRIDE: u64 = 96;
+        const MODEL_OFFSETS: [u64; 4] = [0, 16, 32, 48];
+        const MODEL_LOCATIONS: [u32; 4] = [1, 2, 3, 4];
+
+        let instance_attrs: Vec<wgpu::VertexAttribute> = (0..4)
+            .map(|k| wgpu::VertexAttribute {
+                shader_location: MODEL_LOCATIONS[k],
+                format:          wgpu::VertexFormat::Float32x4,
+                offset:          MODEL_OFFSETS[k],
+            })
+            .collect();
 
         let shadow_layout = device.create_pipeline_layout(
             &wgpu::PipelineLayoutDescriptor {
@@ -144,17 +176,23 @@ impl ShadowSystem {
                     entry_point: Some("vs_shadow"),
                     // ── wgpu 29: compilation_options required ─────────────
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        // Stride matches the full Vertex struct in mesh.rs.
-                        // We only read position (offset 0) but stride must be correct.
-                        array_stride: std::mem::size_of::<crate::assets::mesh::Vertex>() as u64,
-                        step_mode:    wgpu::VertexStepMode::Vertex,
-                        attributes:   &[wgpu::VertexAttribute {
-                            shader_location: 0,
-                            format:          wgpu::VertexFormat::Float32x3,
-                            offset:          0,
-                        }],
-                    }],
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            // Stride matches the full Vertex struct in mesh.rs.
+                            array_stride: std::mem::size_of::<crate::assets::mesh::Vertex>() as u64,
+                            step_mode:    wgpu::VertexStepMode::Vertex,
+                            attributes:   &[wgpu::VertexAttribute {
+                                shader_location: 0,
+                                format:          wgpu::VertexFormat::Float32x3,
+                                offset:          0,
+                            }],
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: INSTANCE_STRIDE,
+                            step_mode:    wgpu::VertexStepMode::Instance,
+                            attributes:   &instance_attrs,
+                        },
+                    ],
                 },
                 // No fragment shader — GPU writes depth automatically.
                 fragment: None,
@@ -186,7 +224,7 @@ impl ShadowSystem {
             },
         );
 
-        Self { cascades, sampler, pipeline, uniform_buf, shadow_bgl }
+        Self { cascades, sampler, pipeline, shadow_bgl }
     }
 
     // update_light_matrices() — call every frame (or when light/camera moves).
@@ -202,8 +240,6 @@ impl ShadowSystem {
 
         // Stable up vector — switch to forward if light is nearly vertical.
         let up = if light_dir.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-
-        let mut matrices: Vec<[[f32; 4]; 4]> = Vec::new();
 
         for cascade in &mut self.cascades {
             // Frustum centre for this cascade's distance slice.
@@ -229,14 +265,14 @@ impl ShadowSystem {
             );
 
             cascade.light_matrix = proj * cascade_view;
-            matrices.push(cascade.light_matrix.to_cols_array_2d());
+            let matrix_bytes: Vec<u8> = bytemuck::cast_slice(
+                &cascade.light_matrix.to_cols_array_2d(),
+            ).to_vec();
+            queue.write_buffer(
+                &cascade.uniform_buf, 0,
+                &matrix_bytes,
+            );
         }
-
-        // Upload all cascade matrices in one write call.
-        queue.write_buffer(
-            &self.uniform_buf, 0,
-            bytemuck::cast_slice(&matrices),
-        );
     }
 
     // render_shadow_pass() — render the scene into one cascade's depth texture.
@@ -244,7 +280,6 @@ impl ShadowSystem {
     pub fn render_shadow_pass(
         &self,
         encoder:          &mut wgpu::CommandEncoder,
-        shadow_bind_group: &wgpu::BindGroup,
         vertex_buffer:    &wgpu::Buffer,
         vertex_count:     u32,
         cascade_index:    usize,
@@ -266,8 +301,18 @@ impl ShadowSystem {
         });
 
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, shadow_bind_group, &[]);
+        pass.set_bind_group(0, &cascade.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.draw(0..vertex_count, 0..1);
+    }
+
+    /// Depth view for a cascade — used when the caller draws instanced geometry.
+    pub fn cascade_view(&self, index: usize) -> &wgpu::TextureView {
+        &self.cascades[index].view
+    }
+
+    /// Per-cascade light-matrix bind group for the depth pipeline.
+    pub fn cascade_bind_group(&self, index: usize) -> &wgpu::BindGroup {
+        &self.cascades[index].bind_group
     }
 }

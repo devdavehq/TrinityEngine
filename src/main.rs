@@ -39,6 +39,9 @@ mod input;
 mod jobs;
 mod materials;
 mod navigation;
+mod navmesh;
+mod boids;
+mod cinematics;
 mod ai;
 mod physics;
 mod particles;
@@ -50,11 +53,15 @@ mod ui;
 mod settings;
 #[cfg(feature = "scripting")]
 mod scripting;
+#[cfg(feature = "scripting")]
+mod scripting_api;
 mod systems;
 mod terrain;
 mod vfs;
 mod resources;
 mod engine_subsystems;
+mod demo_plugin;
+mod save_plugin;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -111,6 +118,7 @@ use winit::{
 };
 
 const CONTENT_SCRIPTS_DIR: &str = "Content/Scripts";
+const CONTENT_PLUGINS_DIR: &str = "Content/Scripts/plugins";
 const CONTENT_MESHES_DIR: &str = "Content/Meshes";
 const CONTENT_TEXTURES_DIR: &str = "Content/Textures";
 const CONTENT_MATERIALS_DIR: &str = "Content/Materials";
@@ -157,6 +165,10 @@ struct GameApp {
     input_state: CameraInputState,
     #[cfg(feature = "scripting")]
     scripts:    ScriptEngine,
+    /// Demo plugin: shows the engine's formal ScriptPlugin extension pattern.
+    /// Registered onto Lua globals and ticked each frame so Lua can call its
+    /// `demo.*` functions and read per-frame state.
+    demo_plugin: demo_plugin::DemoPlugin,
     scene_mgr:  SceneManager,
     /// Sub-scene manager: loads scenes inside the current scene at world offsets.
     sub_scene_mgr: SubSceneManager,
@@ -203,6 +215,9 @@ struct GameApp {
     particles: particles::ParticleSystem,
     particle_indices: [usize; 4],
 
+    // ── Boids / flocking system ─────────────────────────────────────────
+    boids: boids::BoidRegistry,
+
     // ── Jolt Physics backend ────────────────────────────────────────────
     #[cfg(feature = "jolt")]
     jolt: Option<physics::jolt_bridge::JoltBridge>,
@@ -220,6 +235,7 @@ struct GameApp {
     script_skip_frames_remaining: u32,
     error_log: Vec<String>,
     nav_grid: NavGrid,
+    navmesh: navmesh::NavMesh,
     ai_registry: AiRegistry,
     nav_rebuild_requested: bool,
     frame_interval: std::time::Duration,
@@ -267,6 +283,7 @@ impl GameApp {
             input_state:    CameraInputState::new(),
             #[cfg(feature = "scripting")]
             scripts:        ScriptEngine::new(),
+            demo_plugin:    demo_plugin::DemoPlugin::new(),
             scene_mgr:      SceneManager::new(&resolve_primary_scene_path(&settings.runtime.startup_scene_path)),
             sub_scene_mgr:  SubSceneManager::new(),
             transition:     SceneTransition::new(),
@@ -298,6 +315,8 @@ impl GameApp {
             // Particles
             particles: particles::ParticleSystem::new(),
             particle_indices: [0, 1, 2, 3],
+            // Boids
+            boids: boids::BoidRegistry::new(),
             // Jolt Physics
             #[cfg(feature = "jolt")]
             jolt: None,
@@ -312,6 +331,7 @@ impl GameApp {
             script_skip_frames_remaining: 0,
             error_log: Vec::new(),
             nav_grid: NavGrid { width: 64, depth: 64, walkable: vec![true; 64 * 64], max_slope: 0.8, contour_edges: Vec::new(), region_count: 0 },
+            navmesh: navmesh::NavMesh::empty(),
             ai_registry: AiRegistry::new(),
             nav_rebuild_requested: true,
             frame_interval,
@@ -571,10 +591,26 @@ impl GameApp {
                 self.error_log.push(format!("[Hub] Scene load failed: {}", e));
             }
         }
-                                self.nav_grid.rebuild_from_heights(&self.terrain_world);
+self.nav_grid.rebuild_from_heights(&self.terrain_world);
+                                        self.navmesh = navmesh::NavMesh::from_terrain(&self.nav_grid, &self.terrain_world);
         self.selected_renderable = None;
 
         self.scripts = ScriptEngine::new();
+        // Enforce the scripting sandbox: 128 MB heap cap and a ~25 ms
+        // execution budget per Lua call.  os/io/loadfile/dofile/load/require
+        // are stripped by default in register_api(); these caps stop runaway
+        // scripts from exhausting memory or stalling a frame.
+        self.scripts.set_sandbox(crate::scripting::SandboxConfig {
+            max_memory_bytes: 128 << 20,
+            max_execution_time_ms: 25,
+            ..crate::scripting::SandboxConfig::default()
+        });
+        self.scripts.register_plugin(Box::new(demo_plugin::DemoPlugin::with_runtime(
+            self.demo_plugin.runtime(),
+        )));
+        self.scripts.register_plugin(Box::new(save_plugin::WorldStatePlugin::new(
+            self.levels.world_state.clone(),
+        )));
         if self.scripts.register_api().is_ok() {
             self.scripts
                 .load_script(&format!("{}/player.lua", CONTENT_SCRIPTS_DIR))
@@ -582,6 +618,11 @@ impl GameApp {
             self.scripts
                 .load_script(&format!("{}/enemy.lua", CONTENT_SCRIPTS_DIR))
                 .ok();
+            // Lua-native plugins: hot-reloadable, no Rust recompilation.
+            // Any .lua file returning { name, start, update, on_event } under
+            // Content/Scripts/plugins is loaded and ticked automatically.
+            let _ = std::fs::create_dir_all(CONTENT_PLUGINS_DIR);
+            let _ = self.scripts.load_plugins(CONTENT_PLUGINS_DIR);
         }
 
         self.stop_project_watchers();
@@ -1311,9 +1352,21 @@ impl ApplicationHandler for GameApp {
                 if let Some(rx) = &self.script_watcher {
                     let mut pending_errors: Vec<String> = Vec::new();
                     while let Ok(path) = rx.try_recv() {
-                        match self.scripts.reload_script(&path) {
-                            Ok(_)  => tracing::info!("[Hot] Script reloaded: {}", path),
-                            Err(e) => pending_errors.push(format!("[Hot] Script error {}: {}", path, e)),
+                        // Plugins live under Content/Scripts/plugins — hot-reload
+                        // them through the plugin host so a changed file re-runs
+                        // start() cleanly (no stale event handlers or timers).
+                        let norm_path = path.replace('\\', "/");
+                        let is_plugin = norm_path.contains("/plugins/");
+                        match self.scripts.reload_plugin(&path) {
+                            Ok(true) => tracing::info!("[Hot] Plugin reloaded: {}", path),
+                            _ if is_plugin => {
+                                // A plugin file changed but wasn't loaded before.
+                                let _ = self.scripts.load_plugin(&path);
+                            }
+                            _ => match self.scripts.reload_script(&path) {
+                                Ok(_) => tracing::info!("[Hot] Script reloaded: {}", path),
+                                Err(e) => pending_errors.push(format!("[Hot] Script error {}: {}", path, e)),
+                            },
                         }
                     }
                     for e in pending_errors {
@@ -1407,6 +1460,7 @@ impl ApplicationHandler for GameApp {
 
                 if self.nav_rebuild_requested {
                     self.nav_grid.rebuild_from_heights(&self.terrain_world);
+                    self.navmesh = navmesh::NavMesh::from_terrain(&self.nav_grid, &self.terrain_world);
                     self.nav_rebuild_requested = false;
                 }
 
@@ -1466,13 +1520,23 @@ impl ApplicationHandler for GameApp {
                             dt,
                             self.audio.as_mut(),
                             &self.nav_grid,
+                            &self.navmesh,
                             &mut self.ai_registry,
                             &mut self.terrain_world,
+                            &mut self.assets.meshes,
+                            &mut self.env.weather,
+                            &mut self.particles,
+                            &mut self.levels,
+                            &mut self.boids,
                             screen_w,
                             screen_h,
                             camera_fov,
                         );
                         self.scripts.drain_destroys(&mut self.world);
+                        self.demo_plugin.tick();
+                        let _ = self.scripts.tick_timers(dt);
+                        let _ = self.scripts.tick_plugins(dt);
+                        self.scripts.tick_cinematics(dt);
                         if let Some((pos, target)) = self.scripts.consume_camera_request() {
                             self.input_state.camera.position = glam::Vec3::from_array(pos);
                             self.input_state.camera.target = glam::Vec3::from_array(target);
@@ -1578,7 +1642,9 @@ impl ApplicationHandler for GameApp {
                     // Ragdoll: post-physics bone constraint solving.
                     ragdoll_system(&mut self.world, dt);
 
-                    ai_system(&mut self.world, &mut self.ai_registry, &self.nav_grid, dt, sim_time);
+                    ai_system(&mut self.world, &mut self.ai_registry, &self.nav_grid, Some(&self.navmesh), dt, sim_time);
+
+                    boids::boids_system(&mut self.world, &mut self.boids, dt);
 
                     animation_system(&mut self.world, dt, &self.jobs);
                     // Skeletal animation blending: reads BT "ai_state" from blackboard,
@@ -1980,6 +2046,7 @@ impl ApplicationHandler for GameApp {
                         ) {
                             Ok(()) => {
         self.nav_grid.rebuild_from_heights(&self.terrain_world);
+                                        self.navmesh = navmesh::NavMesh::from_terrain(&self.nav_grid, &self.terrain_world);
                                 self.selected_renderable = None;
                                 content_dirty_after_render = true;
                                 self.error_log.push(format!(

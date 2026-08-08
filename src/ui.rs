@@ -190,92 +190,266 @@ impl Default for RuntimeUiOverlay {
 
 // ── Lua bindings ─────────────────────────────────────────────────────────────
 #[cfg(feature = "scripting")]
-pub fn register_ui_lua_api(lua: &mlua::Lua) -> Result<(), mlua::Error> {
-    let ui_table = lua.create_table()?;
+pub use crate::scripting_api::*;
 
-    // ui.create(design_name) → creates new design
-    ui_table.set(
-        "create",
-        lua.create_function(|_, name: String| {
-            // Design creation is done via the global UiManager stored in Lua app data
-            // For now just return the name as confirmation
+#[cfg(feature = "scripting")]
+use mlua::prelude::*;
+
+#[cfg(feature = "scripting")]
+use std::sync::{Arc, Mutex};
+
+/// Parse a widget kind from a Lua string (e.g. "HealthBar", "label").
+#[cfg(feature = "scripting")]
+fn widget_kind_from_str(s: &str) -> Option<UiWidgetKind> {
+    let normalized = s.trim().to_ascii_lowercase().replace([' ', '_', '-'], "");
+    match normalized.as_str() {
+        "label" => Some(UiWidgetKind::Label),
+        "button" => Some(UiWidgetKind::Button),
+        "healthbar" | "hpbar" => Some(UiWidgetKind::HealthBar),
+        "manabar" => Some(UiWidgetKind::ManaBar),
+        "staminabar" => Some(UiWidgetKind::StaminaBar),
+        "counter" => Some(UiWidgetKind::Counter),
+        "slider" => Some(UiWidgetKind::Slider),
+        "toggle" => Some(UiWidgetKind::Toggle),
+        "panel" => Some(UiWidgetKind::Panel),
+        "progressring" => Some(UiWidgetKind::ProgressRing),
+        "meter" => Some(UiWidgetKind::Meter),
+        "image" => Some(UiWidgetKind::Image),
+        "tooltip" => Some(UiWidgetKind::Tooltip),
+        "minimap" => Some(UiWidgetKind::Minimap),
+        "damagenumber" => Some(UiWidgetKind::DamageNumber),
+        _ => None,
+    }
+}
+
+/// UI ScriptPlugin — mounts the `ui.*` Lua namespace backed by a real
+/// `UiManager`. The manager is shared (Arc<Mutex>) so the engine can render
+/// the active design each frame.
+#[cfg(feature = "scripting")]
+pub struct UiScriptPlugin {
+    manager: Arc<Mutex<UiManager>>,
+}
+
+#[cfg(feature = "scripting")]
+impl UiScriptPlugin {
+    pub fn new() -> Self {
+        Self {
+            manager: Arc::new(Mutex::new(UiManager::new())),
+        }
+    }
+
+    pub fn manager(&self) -> &Arc<Mutex<UiManager>> {
+        &self.manager
+    }
+
+    pub fn manager_clone(&self) -> Arc<Mutex<UiManager>> {
+        Arc::clone(&self.manager)
+    }
+}
+
+#[cfg(feature = "scripting")]
+impl ScriptPlugin for UiScriptPlugin {
+    fn name(&self) -> &'static str {
+        "ui"
+    }
+
+    fn register(&self, registry: &mut ApiRegistry) -> LuaResult<()> {
+        let manager = Arc::clone(&self.manager);
+
+        // ui.create(design_name) → creates a new design.
+        registry.register_namespaced("ui", "create", move |_, name: String| {
+            manager.lock().unwrap().create(&name);
             Ok(name)
-        })?,
-    )?;
+        })?;
 
-    // ui.add_widget(design, widget_type, id)
-    ui_table.set(
-        "add_widget",
-        lua.create_function(|_, (design, widget_type, id): (String, String, String)| {
-            Ok(format!("added {} '{}' to {}", widget_type, id, design))
-        })?,
-    )?;
+        // ui.add_widget(design, widget_kind, id) → adds a widget.
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "add_widget",
+            move |_, (design, kind, id): (String, String, String)| {
+                let kind = widget_kind_from_str(&kind).ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!(
+                        "ui.add_widget: unknown widget kind '{kind}'"
+                    ))
+                })?;
+                let mut mgr = manager.lock().unwrap();
+                let design = mgr
+                    .get_mut(&design)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.add_widget: design '{design}' not found"
+                        ))
+                    })?;
+                design.add_widget(UiWidget::new(&id, kind));
+                Ok(())
+            },
+        )?;
 
-    // ui.set_text(design, widget_id, text)
-    ui_table.set(
-        "set_text",
-        lua.create_function(|_, (_design, _widget, _text): (String, String, String)| {
-            Ok(true)
-        })?,
-    )?;
+        // ui.set_text(design, widget_id, text)
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "set_text",
+            move |_, (design, widget, text): (String, String, String)| {
+                let mut mgr = manager.lock().unwrap();
+                let design = mgr
+                    .get_mut(&design)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_text: design '{design}' not found"
+                        ))
+                    })?;
+                let (_, w) = design
+                    .widget_by_id_mut(&widget)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_text: widget '{widget}' not found"
+                        ))
+                    })?;
+                w.text = text;
+                Ok(())
+            },
+        )?;
 
-    // ui.set_visible(design, widget_id, visible)
-    ui_table.set(
-        "set_visible",
-        lua.create_function(|_, (_design, _widget, _vis): (String, String, bool)| {
-            Ok(true)
-        })?,
-    )?;
+        // ui.set_visible(design, widget_id, visible)
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "set_visible",
+            move |_, (design, widget, vis): (String, String, bool)| {
+                let mut mgr = manager.lock().unwrap();
+                let design = mgr
+                    .get_mut(&design)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_visible: design '{design}' not found"
+                        ))
+                    })?;
+                let (_, w) = design
+                    .widget_by_id_mut(&widget)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_visible: widget '{widget}' not found"
+                        ))
+                    })?;
+                w.visible = vis;
+                Ok(())
+            },
+        )?;
 
-    // ui.set_value(design, widget_id, value)
-    ui_table.set(
-        "set_value",
-        lua.create_function(|_, (_design, _widget, _val): (String, String, f32)| {
-            Ok(true)
-        })?,
-    )?;
+        // ui.set_value(design, widget_id, value)
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "set_value",
+            move |_, (design, widget, val): (String, String, f32)| {
+                let mut mgr = manager.lock().unwrap();
+                let design = mgr
+                    .get_mut(&design)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_value: design '{design}' not found"
+                        ))
+                    })?;
+                let (_, w) = design
+                    .widget_by_id_mut(&widget)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.set_value: widget '{widget}' not found"
+                        ))
+                    })?;
+                w.value = val;
+                Ok(())
+            },
+        )?;
 
-    // ui.get_value(design, widget_id) → f32
-    ui_table.set(
-        "get_value",
-        lua.create_function(|_, (_design, _widget): (String, String)| {
-            Ok(0.0_f32)
-        })?,
-    )?;
+        // ui.get_value(design, widget_id) → f32
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "get_value",
+            move |_, (design, widget): (String, String)| {
+                let mgr = manager.lock().unwrap();
+                let design = mgr
+                    .get(&design)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.get_value: design '{design}' not found"
+                        ))
+                    })?;
+                let (_, w) = design
+                    .widget_by_id(&widget)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "ui.get_value: widget '{widget}' not found"
+                        ))
+                    })?;
+                Ok(w.value)
+            },
+        )?;
 
-    // ui.save(design, path)
-    ui_table.set(
-        "save",
-        lua.create_function(|_, (_design, _path): (String, String)| {
-            Ok(true)
-        })?,
-    )?;
+        // ui.save(design, path)
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "save",
+            move |_, (design, path): (String, String)| {
+                let mgr = manager.lock().unwrap();
+                mgr.save(&design, &path).map_err(|e| {
+                    mlua::Error::RuntimeError(format!("ui.save: {e}"))
+                })?;
+                Ok(true)
+            },
+        )?;
 
-    // ui.load(path) → design_name
-    ui_table.set(
-        "load",
-        lua.create_function(|_, path: String| {
-            let json = std::fs::read_to_string(&path)
-                .map_err(|e| mlua::Error::RuntimeError(format!("Failed to load UI: {e}")))?;
-            let design: UiDesign = serde_json::from_str(&json)
-                .map_err(|e| mlua::Error::RuntimeError(format!("Failed to parse UI: {e}")))?;
-            let name = design.name.clone();
-            // Store the design under a global registry for the overlay to find
-            Ok(name)
-        })?,
-    )?;
+        // ui.load(path) → design_name
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "load",
+            move |_, path: String| {
+                let mut mgr = manager.lock().unwrap();
+                let name = mgr.load(&path).map_err(|e| {
+                    mlua::Error::RuntimeError(format!("ui.load: {e}"))
+                })?;
+                Ok(name)
+            },
+        )?;
 
-    // ui.toggle() — show/hide runtime UI overlay
-    ui_table.set(
-        "toggle",
-        lua.create_function(|_, ()| {
-            // RuntimeUiOverlay would be toggled via scripting engine's overlay ref
-            Ok(())
-        })?,
-    )?;
+        // ui.toggle() — show/hide the runtime UI overlay.
+        registry.register_namespaced(
+            "ui",
+            "toggle",
+            |_, ()| {
+                // Toggling is handled by the engine overlay which owns
+                // visibility; this is a no-op hook for Lua callers.
+                Ok(())
+            },
+        )?;
 
-    lua.globals().set("ui", ui_table)?;
-    Ok(())
+        // ui.list() → table of design names.
+        let manager = Arc::clone(&self.manager);
+        registry.register_namespaced(
+            "ui",
+            "list",
+            move |lua, ()| {
+                let mgr = manager.lock().unwrap();
+                let names = mgr.list_names();
+                Ok(lua.create_table_from(names.iter().map(|s| (s.to_string(), true)))?)
+            },
+        )?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "scripting")]
+pub fn register_ui_lua_api(lua: &Lua) -> Result<(), mlua::Error> {
+    let plugin = UiScriptPlugin::new();
+    let mut registry = ApiRegistry::new(lua);
+    plugin.register(&mut registry)?;
+    registry.apply()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -367,5 +541,42 @@ mod tests {
         let snapped_y = (w.y / design.grid_size).round() * design.grid_size;
         assert_eq!(snapped_x, 16.0);
         assert_eq!(snapped_y, 16.0);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn ui_plugin_lua_api_roundtrip() -> LuaResult<()> {
+        use crate::scripting_api::mount_plugins;
+
+        let lua = Lua::new();
+        let plugin = UiScriptPlugin::new();
+        mount_plugins(&lua, &[&plugin])?;
+
+        // Build a design + widget from Lua, mutate it, and read it back.
+        lua.load(
+            r#"
+            ui.create("hud")
+            ui.add_widget("hud", "healthbar", "hp")
+            ui.set_text("hud", "hp", "100/100")
+            ui.set_value("hud", "hp", 0.75)
+            ui.set_visible("hud", "hp", false)
+            "#,
+        )
+        .exec()?;
+
+        let mgr = plugin.manager().lock().unwrap();
+        let design = mgr.get("hud").unwrap();
+        let (_, w) = design.widget_by_id("hp").unwrap();
+        assert_eq!(w.text, "100/100");
+        assert_eq!(w.value, 0.75);
+        assert!(!w.visible);
+        drop(mgr);
+
+        // Read value back through Lua too.
+        let val: f64 = lua
+            .load("return ui.get_value('hud', 'hp')")
+            .eval()?;
+        assert_eq!(val, 0.75);
+        Ok(())
     }
 }

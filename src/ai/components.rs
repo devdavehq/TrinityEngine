@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::ai::behavior_tree::BehaviorTree;
 use crate::ai::blackboard::Blackboard;
 use crate::navigation::NavGrid;
+use crate::navmesh::NavMesh;
 use hecs::World;
 
 // ── AiAgent — ECS component attached to every AI-controlled entity ──────────
@@ -81,6 +82,7 @@ pub fn ai_system(
     world: &mut World,
     registry: &mut AiRegistry,
     nav_grid: &NavGrid,
+    navmesh: Option<&NavMesh>,
     dt: f32,
     time_s: f32,
 ) {
@@ -136,6 +138,7 @@ pub fn ai_system(
             dt,
             time_s,
             nav_grid,
+            navmesh,
             blackboard: &mut blackboard,
         };
 

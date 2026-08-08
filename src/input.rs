@@ -125,4 +125,83 @@ impl InputState {
             _ => false,
         }
     }
+
+    /// Left-stick X axis in [-1, 1] after applying the deadzone.
+    pub fn gamepad_left_x(&self) -> f32 {
+        if !self.gamepad_enabled {
+            return 0.0;
+        }
+        if self.left_x.abs() < self.deadzone { 0.0 } else { self.left_x }
+    }
+
+    /// Left-stick Y axis in [-1, 1] after applying the deadzone.
+    pub fn gamepad_left_y(&self) -> f32 {
+        if !self.gamepad_enabled {
+            return 0.0;
+        }
+        if self.left_y.abs() < self.deadzone { 0.0 } else { self.left_y }
+    }
+
+    /// Whether the South (A) button is currently held.
+    pub fn gamepad_south_pressed(&self) -> bool {
+        self.gamepad_enabled && self.south_pressed
+    }
+
+    /// Numeric magnitude of the left-stick (0..1); 0 when inside the deadzone.
+    pub fn gamepad_left_magnitude(&self) -> f32 {
+        let x = self.gamepad_left_x();
+        let y = self.gamepad_left_y();
+        (x * x + y * y).sqrt().clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gamepad_left_x_applies_deadzone() {
+        let mut input = InputState::new();
+        input.deadzone = 0.2;
+        input.gamepad_enabled = true;
+        input.left_x = 0.1;
+        assert_eq!(input.gamepad_left_x(), 0.0);
+        input.left_x = 0.5;
+        assert_eq!(input.gamepad_left_x(), 0.5);
+        input.left_x = -0.7;
+        assert_eq!(input.gamepad_left_x(), -0.7);
+    }
+
+    #[test]
+    fn gamepad_disabled_returns_zero() {
+        let mut input = InputState::new();
+        input.gamepad_enabled = false;
+        input.left_x = 0.9;
+        input.south_pressed = true;
+        assert_eq!(input.gamepad_left_x(), 0.0);
+        assert_eq!(input.gamepad_left_y(), 0.0);
+        assert!(!input.gamepad_south_pressed());
+        assert_eq!(input.gamepad_left_magnitude(), 0.0);
+    }
+
+    #[test]
+    fn gamepad_south_held() {
+        let mut input = InputState::new();
+        input.gamepad_enabled = true;
+        input.south_pressed = true;
+        assert!(input.gamepad_south_pressed());
+        input.south_pressed = false;
+        assert!(!input.gamepad_south_pressed());
+    }
+
+    #[test]
+    fn gamepad_left_magnitude_combines_axes() {
+        let mut input = InputState::new();
+        input.deadzone = 0.2;
+        input.gamepad_enabled = true;
+        input.left_x = 0.3;
+        input.left_y = 0.4;
+        let mag = input.gamepad_left_magnitude();
+        assert!((mag - 0.5).abs() < 1e-3);
+    }
 }

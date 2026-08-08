@@ -37,6 +37,7 @@ Triengine is a Rust-based real-time game engine/editor focused on quality visual
 - `docs/GETTING_STARTED_GAME_CREATOR.md`
 - `docs/MATERIAL_TEXTURE_WORKFLOW.md`
 - `docs/RENDER_AND_LIGHTING_GUIDE.md`
+- `docs/SCRIPTING.md` (Lua scripting API, sandbox, and plugin authoring)
 
 ## Performance Notes
 

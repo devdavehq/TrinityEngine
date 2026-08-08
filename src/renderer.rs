@@ -790,6 +790,10 @@ pub struct Renderer {
     _shadow_fallback_texture: wgpu::Texture,
     _shadow_fallback_view: wgpu::TextureView,
     _shadow_fallback_sampler: wgpu::Sampler,
+    /// Real CSM shadow system — renders 3 cascades and feeds the PBR shader.
+    pub shadow_system: shadow::ShadowSystem,
+    /// 256-byte GpuShadowData uniform (3 cascade light matrices + settings) for shader.wgsl.
+    shadow_uniform_buf: wgpu::Buffer,
     pub features:  RenderFeatures,
     pub adapter_info: wgpu::AdapterInfo,
     pub sky_renderer: sky::SkyRenderer,
@@ -1210,6 +1214,18 @@ impl Renderer {
             ..Default::default()
         });
 
+        // ── Real CSM shadow system ──────────────────────────────────────────
+        // Created BEFORE the global bind group so the bind group can reference
+        // the real cascade textures + comparison sampler instead of fallbacks.
+        let shadow_system = shadow::ShadowSystem::new(&device, features.shadow_resolution.max(256));
+        // 256-byte GpuShadowData uniform for the PBR shader (binding 7).
+        let shadow_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Uniform Data"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Global bind group — camera uniform goes here.
         // IBL textures would be bound here too; we use fallbacks for now.
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1229,12 +1245,12 @@ impl Renderer {
                 // BRDF LUT (fallback white — lighting will look wrong but won't crash)
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&def_white.0)  },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&linear_sampler)  },
-                // Shadow fallbacks so shader bindings are valid even before full shadow system hookup.
-                wgpu::BindGroupEntry { binding: 7, resource: shadow_fallback_uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
-                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
-                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&shadow_fallback_view) },
-                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow_fallback_sampler) },
+                // Shadow cascades — real CSM data (light matrices + 3 depth maps).
+                wgpu::BindGroupEntry { binding: 7, resource: shadow_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(shadow_system.cascade_view(0)) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(shadow_system.cascade_view(1)) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(shadow_system.cascade_view(2)) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow_system.sampler) },
                 // Multi-light uniform (binding 12) — populated each frame in draw_world().
                 wgpu::BindGroupEntry { binding: 12, resource: light_uniform_buf.as_entire_binding() },
                 // Weather uniform (binding 13) — snow_coverage, updated per frame.
@@ -2142,6 +2158,8 @@ impl Renderer {
             _shadow_fallback_texture: shadow_fallback_texture,
             _shadow_fallback_view: shadow_fallback_view,
             _shadow_fallback_sampler: shadow_fallback_sampler,
+            shadow_system,
+            shadow_uniform_buf,
             features,
             adapter_info,
             sky_renderer,
@@ -2463,6 +2481,200 @@ impl Renderer {
             &wgpu::CommandEncoderDescriptor { label: Some("Frame Encoder") }
         );
 
+        // ── Collect render candidates (CPU-side, before any render pass) ──────
+        // This must happen here so the shadow passes below can reuse the same
+        // instanced model matrices as the main colour pass.
+        let candidates: Vec<DrawCandidate> = world
+            .query::<(hecs::Entity, &Position, &Renderable)>()
+            .iter()
+            .filter(|(entity, _pos, _renderable)| {
+                world.get::<&BlendedPose>(*entity).is_err()
+            })
+            .map(|(entity, pos, renderable)| DrawCandidate {
+                entity,
+                pos: *pos,
+                renderable: *renderable,
+            })
+            .collect();
+        stats.total = candidates.len();
+
+        // Collect skinned entities separately (drawn with the skinning pipeline).
+        let skinned_candidates: Vec<(hecs::Entity, Position, Renderable)> = world
+            .query::<(hecs::Entity, &Position, &Renderable)>()
+            .iter()
+            .filter(|(entity, _pos, _renderable)| {
+                world.get::<&BlendedPose>(*entity).is_ok()
+            })
+            .map(|(entity, pos, renderable)| (entity, *pos, *renderable))
+            .collect();
+        stats.total += skinned_candidates.len();
+
+        let visible: Vec<DrawCandidate> = if self.features.culling_enabled {
+            let cam_pos = camera.position();
+            let vp = camera.view_projection_matrix();
+            let cull_dist2 = self.features.culling_distance * self.features.culling_distance;
+            let frustum_enabled = self.features.frustum_culling_enabled;
+            jobs.install(|| {
+                candidates
+                    .into_par_iter()
+                    .filter(|c| {
+                        let dx = c.pos.x - cam_pos.x;
+                        let dy = c.pos.y - cam_pos.y;
+                        let dz = c.pos.z - cam_pos.z;
+                        let dist2 = dx * dx + dy * dy + dz * dz;
+                        let dist_ok = dist2 <= cull_dist2;
+                        let frustum_ok = if frustum_enabled {
+                            Renderer::inside_frustum(
+                                vp,
+                                glam::Vec3::new(c.pos.x, c.pos.y, c.pos.z),
+                                c.renderable.scale[0]
+                                    .max(c.renderable.scale[1])
+                                    .max(c.renderable.scale[2]),
+                            )
+                        } else {
+                            true
+                        };
+                        dist_ok && frustum_ok
+                    })
+                    .collect()
+            })
+        } else {
+            candidates
+        };
+        stats.visible = visible.len();
+
+        // ── GPU Instanced Drawing via InstancingManager ────────────────────
+        // Group visible entities by (mesh_id, material_id). Each unique
+        // pair gets one batch, rendered with a single instanced draw call.
+        instancing.begin_frame();
+        let mut material_map: HashMap<u32, hecs::Entity> = HashMap::new();
+        let cam_pos = camera.position();
+
+        for cand in &visible {
+            let entity = cand.entity;
+            let pos = cand.pos;
+            let renderable = cand.renderable;
+            let rotation = world
+                .get::<&Rotation>(entity)
+                .map(|r| *r)
+                .unwrap_or(Rotation { pitch: 0.0, yaw: 0.0, roll: 0.0 });
+
+            // Build model matrix from TRS — the GPU applies this per instance.
+            let t = glam::Mat4::from_translation(glam::Vec3::new(pos.x, pos.y, pos.z));
+            let ry = glam::Mat4::from_rotation_y(rotation.yaw);
+            let rp = glam::Mat4::from_rotation_x(rotation.pitch);
+            let rr = glam::Mat4::from_rotation_z(rotation.roll);
+            let s = glam::Mat4::from_scale(glam::Vec3::new(
+                renderable.scale[0], renderable.scale[1], renderable.scale[2],
+            ));
+            let model = t * ry * rp * rr * s;
+
+            // Derive material_id from the entity's MaterialTexture.
+            // Entities without a material texture share material_id=0.
+            let material_id = if let Ok(tex) = world.get::<&MaterialTexture>(entity) {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tex.path.hash(&mut hasher);
+                (hasher.finish() & 0x7FFFFFFF) as u32
+            } else { 0 };
+
+            // Store first entity for each material (for bind group creation).
+            material_map.entry(material_id).or_insert(entity);
+
+            instancing.add_instance(
+                renderable.mesh.id,
+                material_id,
+                InstanceData {
+                    model: model.to_cols_array_2d(),
+                    color_metallic: [
+                        renderable.color[0],
+                        renderable.color[1],
+                        renderable.color[2],
+                        renderable.metallic,
+                    ],
+                    roughness_ao_pad: [
+                        renderable.roughness,
+                        renderable.ao,
+                        0.0, 0.0,
+                    ],
+                },
+            );
+        }
+        instancing.upload_buffers(&self.device, &self.queue);
+
+        // ── CSM shadow passes ───────────────────────────────────────────────
+        // Renders visible geometry into 3 cascade depth maps before the main
+        // pass. Runs only when shadows are enabled (tier + runtime toggle).
+        if self.features.shadows_enabled {
+            let sun_dir = glam::Vec3::from_array(light_dir_arr);
+            self.shadow_system.update_light_matrices(
+                &self.queue,
+                sun_dir,
+                cam_pos,
+                camera.forward(),
+            );
+
+            // Upload the 256-byte GpuShadowData the PBR shader reads (binding 7).
+            let mut light_matrices = [[0.0_f32; 4]; 12];
+            for (i, cascade) in self.shadow_system.cascades.iter().enumerate() {
+                for (r, row) in cascade.light_matrix.to_cols_array_2d().iter().enumerate() {
+                    light_matrices[i * 4 + r] = *row;
+                }
+            }
+            let shadow_data = GpuShadowData {
+                light_matrices,
+                cascade_dists: [
+                    self.shadow_system.cascades[0].far_dist,
+                    self.shadow_system.cascades[1].far_dist,
+                    self.shadow_system.cascades[2].far_dist,
+                    0.0,
+                ],
+                shadow_bias:        0.005,
+                normal_offset_bias: 0.02,
+                pcf_radius:         if self.features.pcf_enabled { 2.0 } else { 0.0 },
+                shadow_enabled:     1.0,
+                shadow_map_size:    self.features.shadow_resolution as f32,
+                _pad:               [0.0; 7],
+            };
+            self.queue.write_buffer(
+                &self.shadow_uniform_buf, 0,
+                bytemuck::bytes_of(&shadow_data),
+            );
+
+            for cascade_index in 0..shadow::CASCADE_COUNT {
+                let mut spass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Shadow Pass"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: self.shadow_system.cascade_view(cascade_index),
+                        depth_ops: Some(wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                spass.set_pipeline(&self.shadow_system.pipeline);
+                spass.set_bind_group(0, self.shadow_system.cascade_bind_group(cascade_index), &[]);
+                for batch in instancing.batches() {
+                    if batch.instances.is_empty() { continue; }
+                    let Some(rep_entity) = material_map.get(&batch.material_id) else { continue };
+                    let Ok(rep_renderable) = world.get::<&Renderable>(*rep_entity) else { continue };
+                    let Some(mesh) = meshes.get(&rep_renderable.mesh) else { continue };
+                    if mesh.vertices.is_empty() { continue; }
+                    let vertex_bytes = bytemuck::cast_slice(&mesh.vertices);
+                    if vertex_bytes.len() > self.vertex_buffer.size() as usize { continue; }
+                    self.queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
+                    let instance_buffer = batch.buffer.as_ref()
+                        .expect("InstanceBatch buffer should be Some after upload_buffers()");
+                    spass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    spass.set_vertex_buffer(1, instance_buffer.slice(..));
+                    spass.draw(0..mesh.vertices.len() as u32, 0..batch.instances.len() as u32);
+                }
+            }
+        }
+
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Pass"),
@@ -2518,124 +2730,10 @@ impl Renderer {
             // Bind group 0 = global (camera, IBL). Set once per frame.
             pass.set_bind_group(0, &self.bind_group, &[]);
 
-            let candidates: Vec<DrawCandidate> = world
-                .query::<(hecs::Entity, &Position, &Renderable)>()
-                .iter()
-                .filter(|(entity, _pos, _renderable)| {
-                    world.get::<&BlendedPose>(*entity).is_err()
-                })
-                .map(|(entity, pos, renderable)| DrawCandidate {
-                    entity,
-                    pos: *pos,
-                    renderable: *renderable,
-                })
-                .collect();
-            stats.total = candidates.len();
-
-            // Collect skinned entities separately (drawn with the skinning pipeline).
-            let skinned_candidates: Vec<(hecs::Entity, Position, Renderable)> = world
-                .query::<(hecs::Entity, &Position, &Renderable)>()
-                .iter()
-                .filter(|(entity, _pos, _renderable)| {
-                    world.get::<&BlendedPose>(*entity).is_ok()
-                })
-                .map(|(entity, pos, renderable)| (entity, *pos, *renderable))
-                .collect();
-            stats.total += skinned_candidates.len();
-
-            let visible: Vec<DrawCandidate> = if self.features.culling_enabled {
-                let cam_pos = camera.position();
-                let vp = camera.view_projection_matrix();
-                let cull_dist2 = self.features.culling_distance * self.features.culling_distance;
-                let frustum_enabled = self.features.frustum_culling_enabled;
-                jobs.install(|| {
-                    candidates
-                        .into_par_iter()
-                        .filter(|c| {
-                            let dx = c.pos.x - cam_pos.x;
-                            let dy = c.pos.y - cam_pos.y;
-                            let dz = c.pos.z - cam_pos.z;
-                            let dist2 = dx * dx + dy * dy + dz * dz;
-                            let dist_ok = dist2 <= cull_dist2;
-                            let frustum_ok = if frustum_enabled {
-                                Renderer::inside_frustum(
-                                    vp,
-                                    glam::Vec3::new(c.pos.x, c.pos.y, c.pos.z),
-                                    c.renderable.scale[0]
-                                        .max(c.renderable.scale[1])
-                                        .max(c.renderable.scale[2]),
-                                )
-                            } else {
-                                true
-                            };
-                            dist_ok && frustum_ok
-                        })
-                        .collect()
-                })
-            } else {
-                candidates
-            };
-            stats.visible = visible.len();
-
             // ── GPU Instanced Drawing via InstancingManager ────────────────
-            // Group visible entities by (mesh_id, material_id). Each unique
-            // pair gets one batch, rendered with a single instanced draw call.
-            instancing.begin_frame();
-            let mut material_map: HashMap<u32, hecs::Entity> = HashMap::new();
-            let cam_pos = camera.position();
-
-            for cand in &visible {
-                let entity = cand.entity;
-                let pos = cand.pos;
-                let renderable = cand.renderable;
-                let rotation = world
-                    .get::<&Rotation>(entity)
-                    .map(|r| *r)
-                    .unwrap_or(Rotation { pitch: 0.0, yaw: 0.0, roll: 0.0 });
-
-                // Build model matrix from TRS — the GPU applies this per instance.
-                let t = glam::Mat4::from_translation(glam::Vec3::new(pos.x, pos.y, pos.z));
-                let ry = glam::Mat4::from_rotation_y(rotation.yaw);
-                let rp = glam::Mat4::from_rotation_x(rotation.pitch);
-                let rr = glam::Mat4::from_rotation_z(rotation.roll);
-                let s = glam::Mat4::from_scale(glam::Vec3::new(
-                    renderable.scale[0], renderable.scale[1], renderable.scale[2],
-                ));
-                let model = t * ry * rp * rr * s;
-
-                // Derive material_id from the entity's MaterialTexture.
-                // Entities without a material texture share material_id=0.
-                let material_id = if let Ok(tex) = world.get::<&MaterialTexture>(entity) {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    tex.path.hash(&mut hasher);
-                    (hasher.finish() & 0x7FFFFFFF) as u32
-                } else { 0 };
-
-                // Store first entity for each material (for bind group creation).
-                material_map.entry(material_id).or_insert(entity);
-
-                instancing.add_instance(
-                    renderable.mesh.id,
-                    material_id,
-                    InstanceData {
-                        model: model.to_cols_array_2d(),
-                        color_metallic: [
-                            renderable.color[0],
-                            renderable.color[1],
-                            renderable.color[2],
-                            renderable.metallic,
-                        ],
-                        roughness_ao_pad: [
-                            renderable.roughness,
-                            renderable.ao,
-                            0.0, 0.0,
-                        ],
-                    },
-                );
-            }
-            instancing.upload_buffers(&self.device, &self.queue);
-
+            // Instances were grouped + uploaded BEFORE this pass (so the CSM
+            // shadow passes could reuse the same model matrices). Here we only
+            // iterate the batches and issue the instanced draw calls.
             for batch in instancing.batches() {
                 let instances = &batch.instances;
                 if instances.is_empty() { continue; }
@@ -4110,11 +4208,11 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
-                    wgpu::BindGroupEntry { binding: 7, resource: self._shadow_fallback_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self._shadow_fallback_sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: self.shadow_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(0)) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(1)) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(2)) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.shadow_system.sampler) },
                     wgpu::BindGroupEntry { binding: 12, resource: self.light_uniform_buf.as_entire_binding() },
                 ],
             })
@@ -4134,11 +4232,11 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&ibl_maps.prefilter_sampler)  },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&ibl_maps.brdf_lut_view)  },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&ibl_maps.brdf_lut_sampler)  },
-                    wgpu::BindGroupEntry { binding: 7, resource: self._shadow_fallback_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&self._shadow_fallback_view) },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self._shadow_fallback_sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: self.shadow_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(0)) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(1)) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(2)) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.shadow_system.sampler) },
                     wgpu::BindGroupEntry { binding: 12, resource: self.light_uniform_buf.as_entire_binding() },
                 ],
             })

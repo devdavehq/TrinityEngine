@@ -158,6 +158,14 @@ impl Camera3D {
 pub trait Camera {
     fn view_projection_matrix(&self) -> glam::Mat4;
     fn position(&self) -> glam::Vec3;
+    /// Camera forward direction in world space (where the camera is looking).
+    /// Derived from the view-projection matrix: unprojects the view-space
+    /// forward axis (0,0,-1) and subtracts the camera origin.
+    fn forward(&self) -> glam::Vec3 {
+        let vp = self.view_projection_matrix();
+        let far_center = (vp.inverse() * glam::Vec4::new(0.0, 0.0, -1.0, 1.0)).truncate();
+        (far_center - self.position()).normalize()
+    }
 }
 
 impl Camera for Camera2D {
