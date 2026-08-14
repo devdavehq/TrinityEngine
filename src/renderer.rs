@@ -11,6 +11,7 @@
 
 pub mod fire;
 pub mod ibl;
+pub mod light_baker;
 pub mod light_probes;
 pub mod lightning_bolt;
 pub mod lava;
@@ -28,7 +29,7 @@ use winit::window::Window;
 use crate::assets::{AssetStore, Mesh};
 use crate::camera::Camera;
 use crate::animation::blending::BlendedPose;
-use crate::components::{MaterialTexture, PointLight, Position, Renderable, Rotation};
+use crate::components::{Decal, MaterialTexture, PointLight, Position, Renderable, Rotation};
 use crate::jobs::JobSystem;
 use crate::render::instancing::{InstanceData, InstancingManager};
 use hecs::World;
@@ -164,6 +165,13 @@ pub struct DrawStats {
 /// until meshes use dedicated GPU buffers.
 const MAX_VERTICES_PER_DRAW: usize = 262_144;
 
+// ── Real-time voxel GI (Voxel Cone Tracing) ─────────────────────────────────
+// Camera-aligned 128³ clipmap, voxel size 0.25 world units → ~32-unit cube
+// around the camera. 8 mip levels (log2(128) + 1).
+const VOXEL_GI_DIM: u32 = 128;
+const VOXEL_GI_SIZE: f32 = 0.25;
+const VOXEL_GI_MIPS: u32 = 8;
+
 // ── GpuUniforms ──────────────────────────────────────────────────────────────
 // Mirrors the Uniforms struct in shader.wgsl exactly.
 // repr(C) + Pod + Zeroable: required for bytemuck::bytes_of().
@@ -298,7 +306,9 @@ struct GpuLightData {
     spot_angle_cos: f32,
     shadow_index:  i32,
     _pad:          f32,
-    _pad2:         [f32; 2],
+    _align_pad:    [f32; 2],
+    direction:     [f32; 3],
+    _dir_pad:      f32,
 }
 
 // ── GpuLightUniforms ───────────────────────────────────────────────────────
@@ -367,6 +377,7 @@ pub struct RenderFeatures {
     pub culling_enabled:    bool,
     pub culling_distance:   f32,
     pub frustum_culling_enabled: bool,
+    pub occlusion_culling_enabled: bool,
     pub bloom_enabled: bool,
     pub bloom_strength: f32,
     pub ssao_enabled: bool,
@@ -451,6 +462,7 @@ impl Default for RenderFeatures {
             culling_enabled:    true,
             culling_distance:   120.0,
             frustum_culling_enabled: true,
+            occlusion_culling_enabled: true,
             bloom_enabled: false,
             bloom_strength: 0.2,
             ssao_enabled: false,
@@ -538,6 +550,7 @@ impl RenderFeatures {
             culling_enabled:    true,
             culling_distance:   80.0,
             frustum_culling_enabled: true,
+            occlusion_culling_enabled: true,
             bloom_enabled: false,
             bloom_strength: 0.1,
             ssao_enabled: false,
@@ -627,6 +640,7 @@ impl RenderFeatures {
             culling_enabled: true,
             culling_distance: 220.0,
             frustum_culling_enabled: true,
+            occlusion_culling_enabled: true,
             bloom_enabled: true,
             bloom_strength: 0.25,
             ssao_enabled: true,
@@ -729,6 +743,8 @@ pub struct Renderer {
     pub device:    wgpu::Device,
     pub queue:     wgpu::Queue,
     config:        wgpu::SurfaceConfiguration,
+    /// Current present sync (VSync) state, togglable at runtime.
+    vsync:         bool,
     pipeline:      wgpu::RenderPipeline,
     // Vertex buffer: pre-allocated for 1024 vertices.
     // Overwritten per entity each draw call.
@@ -750,9 +766,20 @@ pub struct Renderer {
     post2_bgl:     wgpu::BindGroupLayout,
     post_copy_pipeline: wgpu::RenderPipeline,
     bloom_extract_pipeline: wgpu::RenderPipeline,
+    bloom_downsample_pipeline: wgpu::RenderPipeline,
     bloom_blur_h_pipeline: wgpu::RenderPipeline,
     bloom_blur_v_pipeline: wgpu::RenderPipeline,
     bloom_composite_pipeline: wgpu::RenderPipeline,
+    /// Pyramid bloom working set: two extra half/quarter-resolution targets so
+    /// we can build a real multi-level pyramid (extract → downsample → blur → upsample-add).
+    bloom_c_texture: wgpu::Texture,
+    bloom_c_view:    wgpu::TextureView,
+    bloom_d_texture: wgpu::Texture,
+    bloom_d_view:    wgpu::TextureView,
+    bloom_e_texture: wgpu::Texture,
+    bloom_e_view:    wgpu::TextureView,
+    bloom_f_texture: wgpu::Texture,
+    bloom_f_view:    wgpu::TextureView,
     /// ── Tone mapping ────────────────────────────────────────────────────────
     /// Full-res temp texture: bloom composite writes here, tonemap reads from here.
     tonemap_temp:       wgpu::Texture,
@@ -768,6 +795,69 @@ pub struct Renderer {
     /// Used by the SSR pass to reconstruct reflection vectors.
     normals_texture:  wgpu::Texture,
     normals_view:     wgpu::TextureView,
+    /// ── Deferred G-buffer targets ──────────────────────────────────────────
+    /// The opaque geometry pass writes material properties here (shader.wgsl
+    /// fs_main). The deferred lighting pass (deferred.wgsl) reads them, plus
+    /// the depth buffer, and resolves lighting into scene_view + normals_view.
+    gb_albedo_texture:   wgpu::Texture,
+    gb_albedo_view:      wgpu::TextureView,
+    gb_normals_texture:  wgpu::Texture,
+    gb_normals_view:     wgpu::TextureView,
+    gb_material_texture: wgpu::Texture,
+    gb_material_view:    wgpu::TextureView,
+    gb_extras_texture:   wgpu::Texture,
+    gb_extras_view:      wgpu::TextureView,
+    /// Separate sky colour target: the sky pass renders here, and the deferred
+    /// lighting pass composites it wherever the depth buffer is empty.
+    sky_color_texture: wgpu::Texture,
+    sky_color_view:    wgpu::TextureView,
+    /// Deferred lighting pipeline + bind group layout + inverse-VP uniform.
+    deferred_pipeline:   wgpu::RenderPipeline,
+    deferred_bgl:        wgpu::BindGroupLayout,
+    deferred_uniform_buf: wgpu::Buffer,
+    /// ── GTAO ambient occlusion ──────────────────────────────────────────────
+    /// Half-res occlusion mask produced by the GTAO compute pass and sampled by
+    /// the deferred lighting pass (deferred.wgsl binding 8 in group 1).
+    ao_texture:         wgpu::Texture,
+    ao_view:            wgpu::TextureView,
+    gtao_bgl:           wgpu::BindGroupLayout,
+    gtao_pipeline:      wgpu::ComputePipeline,
+    gtao_uniform_buf:   wgpu::Buffer,
+    /// ── Froxel volumetric fog ────────────────────────────────────────────────
+    /// Frustum-aligned 3D grid where a compute pass injects sun scattering.
+    /// The deferred pass raymarches it along the view ray for cheap, volumetric
+    /// fog and light shafts. Grid is [64, 36, 32] — a low-res but fast proxy.
+    froxel_texture:      wgpu::Texture,
+    froxel_view:         wgpu::TextureView,
+    froxel_bgl:          wgpu::BindGroupLayout,
+    froxel_pipeline:     wgpu::ComputePipeline,
+    froxel_uniform_buf:  wgpu::Buffer,
+    /// ── Real-time voxel GI (Voxel Cone Tracing) ──────────────────────────
+    /// Camera-aligned 128³ grid. The injection pass (voxel_gi.wgsl) stamps the
+    /// previous frame's lit scene radiance onto the visible surface shell, the
+    /// mip pass (voxel_gi_mip.wgsl) builds a summed pyramid, and the deferred
+    /// pass cone-traces it for indirect diffuse + specular — the real-time GI
+    /// half of the baked-probe hybrid.
+    voxel_texture:          wgpu::Texture,
+    voxel_view:             wgpu::TextureView,
+    voxel_level0_view:      wgpu::TextureView,
+    voxel_sampler:          wgpu::Sampler,
+    voxel_bgl:              wgpu::BindGroupLayout,
+    voxel_pipeline:         wgpu::ComputePipeline,
+    voxel_uniform_buf:      wgpu::Buffer,
+    voxel_inject_bg:        wgpu::BindGroup,
+    voxel_mip_bgl:          wgpu::BindGroupLayout,
+    voxel_mip_pipeline:     wgpu::ComputePipeline,
+    voxel_mip_uniform_buf:  wgpu::Buffer,
+    /// One bind group per mip level (L = 1..7): read view at L-1 + write view
+    /// at L. Reused every frame, so only the uniform buffer changes.
+    voxel_mip_bgs:          Vec<wgpu::BindGroup>,
+    /// ── Deferred decals ────────────────────────────────────────────────────
+    /// Unit-cube projector volumes painted into gb_albedo after the G-buffer
+    /// pass (alpha blended). decal_uniform_buf holds per-draw matrices.
+    decal_bgl:           wgpu::BindGroupLayout,
+    decal_pipeline:      wgpu::RenderPipeline,
+    decal_uniform_buf:   wgpu::Buffer,
     /// ── Screen-Space Reflections ────────────────────────────────────────────
     /// Composite texture: SSR reads scene_view + normals_view + depth_view,
     /// writes blended reflection result here.  Bloom then reads from this
@@ -815,6 +905,12 @@ pub struct Renderer {
     light_uniform_buf: wgpu::Buffer,
     /// ── Weather uniform buffer (group 0, binding 13) ──────────────────────
     weather_uniform_buf: wgpu::Buffer,
+    /// Baked SH light probes produced by the "Bake Lighting" editor action.
+    pub light_probes: crate::renderer::light_probes::LightProbeGrid,
+    /// ── Baked probe GPU data ────────────────────────────────────────────
+    /// Binding 14: probe count scalar. Binding 15: per-probe SH coefficients.
+    probe_control_buf: wgpu::Buffer,
+    probe_data_buf: wgpu::Buffer,
     /// Snow coverage value (0 = none, 1 = full) — set from WeatherState.
     snow_coverage: f32,
     /// ── Default material extras buffer (group 1, binding 6) ───────────────
@@ -894,6 +990,8 @@ pub struct Renderer {
     joint_uniform_buf: wgpu::Buffer,
     /// Bind group for the skinning buffer (group 2).
     skinning_bg:  wgpu::BindGroup,
+    /// Software occlusion culler: rejects meshes hidden behind Occluders.
+    pub occlusion_culler: crate::render::occlusion::OcclusionCuller,
 }
 
 impl Renderer {
@@ -1019,12 +1117,32 @@ impl Renderer {
         let (scene_color, scene_view) = make_scene_color_texture(&device, &config);
         let (bloom_a, bloom_a_view) = make_bloom_texture(&device, &config, "Bloom A");
         let (bloom_b, bloom_b_view) = make_bloom_texture(&device, &config, "Bloom B");
+        // Pyramid bloom mid/low levels: quarter res (C) and eighth res (D).
+        let (bloom_c, bloom_c_view) = make_bloom_texture_at(&device, (config.width / 4).max(1), (config.height / 4).max(1), "Bloom C (quarter)");
+        let (bloom_d, bloom_d_view) = make_bloom_texture_at(&device, (config.width / 8).max(1), (config.height / 8).max(1), "Bloom D (eighth)");
+        let (bloom_e, bloom_e_view) = make_bloom_texture_at(&device, (config.width / 4).max(1), (config.height / 4).max(1), "Bloom E (quarter ping-pong)");
+        let (bloom_f, bloom_f_view) = make_bloom_texture_at(&device, (config.width / 8).max(1), (config.height / 8).max(1), "Bloom F (eighth ping-pong)");
 
         // ── Normals GBuffer texture (MRT target 1) ────────────────────────────
         // Rgba16Float gives enough precision for world-space normals without
         // quantisation artefacts.  Written by the geometry + sky passes,
         // read by the SSR pass to reconstruct reflection vectors.
         let (normals_texture, normals_view) = make_normals_texture(&device, &config);
+
+        // ── Deferred G-buffer targets ──────────────────────────────────────
+        // Written by the opaque geometry pass (shader.wgsl fs_main), read by
+        // the fullscreen deferred lighting pass (deferred.wgsl).
+        let (gb_albedo_texture,   gb_albedo_view)   = make_gbuffer_texture(&device, &config, "GBuffer Albedo+Metallic");
+        let (gb_normals_texture,  gb_normals_view)  = make_gbuffer_texture(&device, &config, "GBuffer Normal+Roughness");
+        let (gb_material_texture, gb_material_view) = make_gbuffer_texture(&device, &config, "GBuffer Emissive+AO");
+        let (gb_extras_texture,   gb_extras_view)   = make_gbuffer_texture(&device, &config, "GBuffer Extras");
+
+        // ── Sky colour target ──────────────────────────────────────────────
+        // The sky pass renders here (linear Rgba16Float) separately from the
+        // G-buffer; the deferred lighting pass composites it for pixels with
+        // no geometry. Rgba16Float (not sRGB) so the deferred pass samples it
+        // without an extra sRGB decode.
+        let (sky_color_texture, sky_color_view) = make_gbuffer_texture(&device, &config, "Sky Color");
 
         // ── SSR composite texture ──────────────────────────────────────────
         // Full-res: SSR pass reads scene_view + normals_view + depth_view,
@@ -1149,7 +1267,7 @@ impl Renderer {
             usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let default_weather = GpuWeatherData {
+let default_weather = GpuWeatherData {
             snow_coverage: 0.0,
             _pad: [0.0; 3],
         };
@@ -1157,6 +1275,26 @@ impl Renderer {
             &weather_uniform_buf, 0,
             bytemuck::bytes_of(&default_weather),
         );
+
+        // ── Baked probe buffers (bindings 14/15) ──────────────────────────
+        // Binding 14: count scalar (u32 + pad to 16B).
+        // Binding 15: per-probe data — 10 × vec4 per probe (pos+radius, 9 SH).
+        const MAX_PROBES: usize = 32;
+        const PROBE_STRIDE: usize = 10; // vec4s per probe
+        let probe_control_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Probe Control"),
+            size:               16,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let probe_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Probe Data"),
+            size:               (PROBE_STRIDE * MAX_PROBES * 16) as u64,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&probe_control_buf, 0, &[0u8; 16]);
+        queue.write_buffer(&probe_data_buf, 0, &vec![0u8; PROBE_STRIDE * MAX_PROBES * 16]);
 
         // ── Bind group layouts & pipeline ─────────────────────────────────
         let (global_bgl, material_bgl) = pipeline::create_bind_group_layouts(&device);
@@ -1255,6 +1393,9 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 12, resource: light_uniform_buf.as_entire_binding() },
                 // Weather uniform (binding 13) — snow_coverage, updated per frame.
                 wgpu::BindGroupEntry { binding: 13, resource: weather_uniform_buf.as_entire_binding() },
+                // Baked light probe data (bindings 14/15) — SH irradiance.
+                wgpu::BindGroupEntry { binding: 14, resource: probe_control_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: probe_data_buf.as_entire_binding() },
             ],
         });
 
@@ -1271,6 +1412,223 @@ impl Renderer {
             &material_bgl,
             &shader,
         );
+
+        // ── Deferred lighting pass ─────────────────────────────────────────
+        // Fullscreen pass that reads the G-buffer + depth + sky colour and
+        // resolves the PBR lighting into scene colour + normals (for SSR).
+        let deferred_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Deferred Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/deferred.wgsl").into()),
+        });
+        let deferred_bgl = pipeline::create_deferred_bgl(&device);
+        let deferred_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Deferred Uniforms"),
+            // mat4 (64) + vec4 (16) + voxel_origin vec4 (16) + voxel_dims vec4 (16) = 112 bytes.
+            size: 112,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let deferred_pipeline = pipeline::create_deferred_pipeline(
+            &device,
+            surf_fmt,
+            &global_bgl,
+            &deferred_bgl,
+            &deferred_shader,
+        );
+
+        // ── GTAO ambient occlusion ─────────────────────────────────────────
+        // Half-res occlusion mask. The compute pass reads the depth buffer +
+        // world normals G-buffer and writes the AO mask, which the deferred
+        // pass samples (deferred.wgsl binding 8, group 1).
+        let ao_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("GTAO AO Texture"),
+            size: wgpu::Extent3d {
+                width: (config.width.max(2) / 2).max(1),
+                height: (config.height.max(2) / 2).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let ao_view = ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let gtao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("GTAO Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/gtao.wgsl").into()),
+        });
+        let gtao_bgl = pipeline::create_gtao_bgl(&device);
+        let gtao_pipeline = pipeline::create_gtao_pipeline(&device, &gtao_bgl, &gtao_shader);
+        let gtao_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GTAO Uniforms"),
+            // 2 × mat4 (128) + 3 × vec4 (48) = 176 bytes.
+            size: 176,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ── Froxel volumetric grid ──────────────────────────────────────────
+        let froxel_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Froxel Grid"),
+            size: wgpu::Extent3d {
+                width:  64,
+                height: 36,
+                depth_or_array_layers: 32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let froxel_view = froxel_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let froxel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Froxel Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/froxel.wgsl").into()),
+        });
+        let froxel_bgl = pipeline::create_froxel_bgl(&device);
+        let froxel_pipeline = pipeline::create_froxel_pipeline(&device, &froxel_bgl, &froxel_shader);
+        let froxel_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Froxel Uniforms"),
+            // 2 × mat4 (128) + 4 × vec4 (64) = 192 bytes.
+            size: 192,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ── Real-time voxel GI ──────────────────────────────────────────────
+        // Camera-aligned 128³ clipmap of Rgba16Float with a summed mip pyramid.
+        // Storage-binding for injection (level 0) + mip writes, texture-binding
+        // so the deferred pass can cone-trace the whole pyramid.
+        let voxel_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Voxel GI Grid"),
+            size: wgpu::Extent3d {
+                width:  VOXEL_GI_DIM,
+                height: VOXEL_GI_DIM,
+                depth_or_array_layers: VOXEL_GI_DIM,
+            },
+            mip_level_count: VOXEL_GI_MIPS,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let voxel_view = voxel_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Voxel GI Full View"),
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let voxel_level0_view = voxel_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Voxel GI Level 0 (storage)"),
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let voxel_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Voxel GI Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let voxel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Voxel GI Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/voxel_gi.wgsl").into()),
+        });
+        let voxel_bgl = pipeline::create_voxel_gi_bgl(&device);
+        let voxel_pipeline = pipeline::create_voxel_gi_pipeline(&device, &voxel_bgl, &voxel_shader);
+        let voxel_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Voxel GI Uniforms"),
+            // 2 × mat4 (128) + 5 × vec4 (80) = 208 bytes.
+            size: 208,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Injection bind group is static (only the uniform contents change).
+        let voxel_inject_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Voxel GI Inject BG"),
+            layout: &voxel_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: voxel_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&post_sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&voxel_level0_view),
+                },
+            ],
+        });
+        let voxel_mip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Voxel GI Mip Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/voxel_gi_mip.wgsl").into()),
+        });
+        let voxel_mip_bgl = pipeline::create_voxel_gi_mip_bgl(&device);
+        let voxel_mip_pipeline = pipeline::create_voxel_gi_mip_pipeline(
+            &device, &voxel_mip_bgl, &voxel_mip_shader,
+        );
+        let voxel_mip_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Voxel GI Mip Uniforms"),
+            // 2 × vec4 = 32 bytes.
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // One static bind group per mip level (read L-1 → write L).
+        let mut voxel_mip_bgs = Vec::with_capacity(VOXEL_GI_MIPS as usize - 1);
+        for level in 1..VOXEL_GI_MIPS {
+            let src = voxel_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("Voxel GI Mip Read"),
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                base_mip_level: level - 1,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let dst = voxel_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("Voxel GI Mip Write"),
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            voxel_mip_bgs.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Voxel GI Mip BG"),
+                layout: &voxel_mip_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: voxel_mip_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst) },
+                ],
+            }));
+        }
+
+        // ── Deferred decal pass ─────────────────────────────────────────────
+        let decal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Decal Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("renderer/decal.wgsl").into()),
+        });
+        let decal_bgl = pipeline::create_decal_bgl(&device);
+        let decal_pipeline = pipeline::create_decal_pipeline(
+            &device, &global_bgl, &decal_bgl, &decal_shader, wgpu::TextureFormat::Rgba16Float,
+        );
+        let decal_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Decal Uniforms"),
+            // 4 × mat4 (256) + 1 × vec4 (16) = 272 bytes.
+            size: 272,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Post Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("renderer/postprocess.wgsl").into()),
@@ -1319,6 +1677,7 @@ impl Renderer {
         });
         let post_copy_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_copy");
         let bloom_extract_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_bloom_extract");
+        let bloom_downsample_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_downsample");
         let bloom_blur_h_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_blur_h");
         let bloom_blur_v_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_blur_v");
         let bloom_composite_pipeline =
@@ -2107,6 +2466,7 @@ impl Renderer {
             device,
             queue,
             config,
+            vsync:          true,
             pipeline:     render_pipeline,
             vertex_buffer,
             instance_buffer,
@@ -2121,11 +2481,20 @@ impl Renderer {
             bloom_a_view,
             bloom_b,
             bloom_b_view,
+            bloom_c_texture: bloom_c,
+            bloom_c_view,
+            bloom_d_texture: bloom_d,
+            bloom_d_view,
+            bloom_e_texture: bloom_e,
+            bloom_e_view,
+            bloom_f_texture: bloom_f,
+            bloom_f_view,
             post_sampler,
             post_bgl,
             post2_bgl,
             post_copy_pipeline,
             bloom_extract_pipeline,
+            bloom_downsample_pipeline,
             bloom_blur_h_pipeline,
             bloom_blur_v_pipeline,
             bloom_composite_pipeline,
@@ -2138,6 +2507,44 @@ impl Renderer {
             wind_strength: 0.1,
             normals_texture,
             normals_view,
+            gb_albedo_texture,
+            gb_albedo_view,
+            gb_normals_texture,
+            gb_normals_view,
+            gb_material_texture,
+            gb_material_view,
+            gb_extras_texture,
+            gb_extras_view,
+            sky_color_texture,
+            sky_color_view,
+            deferred_pipeline,
+            deferred_bgl,
+            deferred_uniform_buf,
+            ao_texture,
+            ao_view,
+            gtao_bgl,
+            gtao_pipeline,
+            gtao_uniform_buf,
+            froxel_texture,
+            froxel_view,
+            froxel_bgl,
+            froxel_pipeline,
+            froxel_uniform_buf,
+            voxel_texture,
+            voxel_view,
+            voxel_level0_view,
+            voxel_sampler,
+            voxel_bgl,
+            voxel_pipeline,
+            voxel_uniform_buf,
+            voxel_inject_bg,
+            voxel_mip_bgl,
+            voxel_mip_pipeline,
+            voxel_mip_uniform_buf,
+            voxel_mip_bgs,
+            decal_bgl,
+            decal_pipeline,
+            decal_uniform_buf,
             ssr_composite_texture,
             ssr_composite_view,
             water_refraction_texture,
@@ -2206,6 +2613,9 @@ impl Renderer {
             taa_frame_index: 0,
             light_uniform_buf,
             weather_uniform_buf,
+            light_probes: crate::renderer::light_probes::LightProbeGrid::new(),
+            probe_control_buf,
+            probe_data_buf,
             snow_coverage: 0.0,
             default_material_extras_buf,
             sky_params: crate::environment::sky::SkyParams::default(),
@@ -2220,7 +2630,29 @@ impl Renderer {
             skinning_bg,
             lightning_bolt_renderer,
             lightning_state: crate::environment::lightning::LightningState::default(),
+            occlusion_culler: crate::render::occlusion::OcclusionCuller::default(),
         }
+    }
+
+    // set_vsync() — toggle present sync at runtime (platform polish).
+    // Reconfigures the surface with a new present mode; no texture rebuild needed.
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.vsync = enabled;
+        self.config.present_mode = if enabled {
+            wgpu::PresentMode::Fifo
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        self.surface.configure(&self.device, &self.config);
+        tracing::info!(
+            "[Renderer] VSync {}",
+            if enabled { "ON" } else { "OFF" }
+        );
+    }
+
+    /// Current present sync state.
+    pub fn vsync_enabled(&self) -> bool {
+        self.vsync
     }
 
     // resize() — call when the window is resized.
@@ -2243,12 +2675,39 @@ impl Renderer {
         let (bb, bbv) = make_bloom_texture(&self.device, &self.config, "Bloom B");
         self.bloom_b = bb;
         self.bloom_b_view = bbv;
+        let (bc, bcv) = make_bloom_texture_at(&self.device, (self.config.width / 4).max(1), (self.config.height / 4).max(1), "Bloom C (quarter)");
+        self.bloom_c_texture = bc;
+        self.bloom_c_view = bcv;
+        let (bd, bdv) = make_bloom_texture_at(&self.device, (self.config.width / 8).max(1), (self.config.height / 8).max(1), "Bloom D (eighth)");
+        self.bloom_d_texture = bd;
+        self.bloom_d_view = bdv;
+        let (be, bev) = make_bloom_texture_at(&self.device, (self.config.width / 4).max(1), (self.config.height / 4).max(1), "Bloom E (quarter ping-pong)");
+        self.bloom_e_texture = be;
+        self.bloom_e_view = bev;
+        let (bf, bfv) = make_bloom_texture_at(&self.device, (self.config.width / 8).max(1), (self.config.height / 8).max(1), "Bloom F (eighth ping-pong)");
+        self.bloom_f_texture = bf;
+        self.bloom_f_view = bfv;
         let (tt, ttv) = make_scene_color_texture(&self.device, &self.config);
         self.tonemap_temp = tt;
         self.tonemap_temp_view = ttv;
         let (nt, nv) = make_normals_texture(&self.device, &self.config);
         self.normals_texture = nt;
         self.normals_view = nv;
+        let (ga, gav) = make_gbuffer_texture(&self.device, &self.config, "GBuffer Albedo+Metallic");
+        self.gb_albedo_texture = ga;
+        self.gb_albedo_view = gav;
+        let (gn, gnv) = make_gbuffer_texture(&self.device, &self.config, "GBuffer Normal+Roughness");
+        self.gb_normals_texture = gn;
+        self.gb_normals_view = gnv;
+        let (gm, gmv) = make_gbuffer_texture(&self.device, &self.config, "GBuffer Emissive+AO");
+        self.gb_material_texture = gm;
+        self.gb_material_view = gmv;
+        let (gx, gxv) = make_gbuffer_texture(&self.device, &self.config, "GBuffer Extras");
+        self.gb_extras_texture = gx;
+        self.gb_extras_view = gxv;
+        let (sc, scv) = make_gbuffer_texture(&self.device, &self.config, "Sky Color");
+        self.sky_color_texture = sc;
+        self.sky_color_view = scv;
         let (sr, srv) = make_scene_color_texture(&self.device, &self.config);
         self.ssr_composite_texture = sr;
         self.ssr_composite_view = srv;
@@ -2267,10 +2726,71 @@ impl Renderer {
         let (pt, ptv) = make_scene_color_texture(&self.device, &self.config);
         self.postprocess_temp_texture = pt;
         self.postprocess_temp_view = ptv;
+        // Recreate the half-res AO mask at the new size.
+        let at = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("GTAO AO Texture"),
+            size: wgpu::Extent3d {
+                width: (new_size.width.max(2) / 2).max(1),
+                height: (new_size.height.max(2) / 2).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        self.ao_texture = at;
+        let aov = self.ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ao_view = aov;
     }
 
     // draw_world() — renders every entity with a Position + Renderable component.
     // Called once per frame from main.rs.
+    /// CPU light bake: ray-casts the scene and fills `self.light_probes` with
+    /// SH irradiance. Runs in the editor when the "Bake Lighting" button is
+    /// clicked; the game only loads the saved result.
+    pub fn bake_lighting(
+        &mut self,
+        world:  &World,
+        meshes: &AssetStore<Mesh>,
+    ) -> Result<u64, String> {
+        use crate::renderer::light_baker::{bake_probe_grid, collect_scene, BakeSettings};
+        let settings = BakeSettings {
+            sun_dir: glam::Vec3::new(0.3, -0.72, -0.2).normalize(),
+            sun_color: glam::Vec3::new(1.0, 0.95, 0.85),
+            sun_intensity: 3.0,
+            sky_color: self.sky_renderer.average_sky_color_estimate(),
+            samples: 512,
+        };
+        let scene = collect_scene(world, meshes);
+        let result = bake_probe_grid(&mut self.light_probes, &scene, &settings)?;
+        // Persist beside the scene the editor has open.
+        let probe_path = std::path::Path::new("Content/lighting/").join("probes.json");
+        if let Some(dir) = probe_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = crate::renderer::light_baker::save_probes(&probe_path, &self.light_probes) {
+            log::warn!("[Lighting] could not save probes to {}: {}", probe_path.display(), e);
+        } else {
+            log::info!("[Lighting] probes saved to {}", probe_path.display());
+        }
+        Ok(result)
+    }
+
+    /// Load baked probe data saved by the "Bake Lighting" action (if present).
+    /// Called whenever a scene is built so previously-baked indirect light
+    /// survives scene reloads. Missing file is fine — it just means nothing
+    /// has been baked for this level yet.
+    pub fn load_probes(&mut self) -> Result<(), String> {
+        let path = std::path::Path::new("Content/lighting").join("probes.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        crate::renderer::light_baker::load_probes(&path, &mut self.light_probes)
+    }
+
     pub fn draw_world(
         &mut self,
         world:  &World,
@@ -2374,6 +2894,39 @@ impl Renderer {
             bytemuck::bytes_of(&uniforms),
         );
 
+        // ── Upload deferred lighting uniform ────────────────────────────────
+        // Inverse of the (jittered) view-projection matrix so the deferred pass
+        // can reconstruct world positions from the depth buffer exactly as the
+        // geometry was rasterised. Plus the render target size and the voxel-GI
+        // grid placement (origin, voxel size, dimensions) for cone tracing.
+        {
+            let inv_vp = vp_jittered.inverse();
+            let cols = inv_vp.to_cols_array();
+            let mut deferred_data = [0.0f32; 28];
+            deferred_data[0..16].copy_from_slice(&cols);
+            deferred_data[16] = self.config.width as f32;
+            deferred_data[17] = self.config.height as f32;
+            deferred_data[18] = 0.0;
+            deferred_data[19] = 0.0;
+            // Voxel-GI grid: origin snapped to voxel boundaries so world-space
+            // surfaces stay in the same voxels between frames (less crawling),
+            // w = voxel size.
+            let grid_world = VOXEL_GI_DIM as f32 * VOXEL_GI_SIZE;
+            let snapped = |v: f32| (v - grid_world * 0.5).floor() / VOXEL_GI_SIZE * VOXEL_GI_SIZE;
+            deferred_data[20] = snapped(cam_pos.x);
+            deferred_data[21] = snapped(cam_pos.y);
+            deferred_data[22] = snapped(cam_pos.z);
+            deferred_data[23] = VOXEL_GI_SIZE;
+            deferred_data[24] = VOXEL_GI_DIM as f32;
+            deferred_data[25] = VOXEL_GI_DIM as f32;
+            deferred_data[26] = VOXEL_GI_DIM as f32;
+            deferred_data[27] = 0.0;
+            self.queue.write_buffer(
+                &self.deferred_uniform_buf, 0,
+                bytemuck::bytes_of(&deferred_data),
+            );
+        }
+
         // ── Upload weather uniform (binding 13) ────────────────────────────
         let weather_data = GpuWeatherData {
             snow_coverage: self.snow_coverage,
@@ -2383,6 +2936,121 @@ impl Renderer {
             &self.weather_uniform_buf, 0,
             bytemuck::bytes_of(&weather_data),
         );
+
+        // ── Upload GTAO uniforms (when SSAO is enabled) ────────────────────
+        if self.features.ssao_enabled {
+            let mut data = [0.0f32; 44];
+            data[0..16].copy_from_slice(&vp.to_cols_array());
+            let inv = vp.inverse();
+            data[16..32].copy_from_slice(&inv.to_cols_array());
+            // Occlusion radius scales a little with distance so close-up AO
+            // doesn't disappear and distant AO doesn't smear.
+            let ao_radius = (cam_pos - glam::Vec3::ZERO).length().max(2.0).min(40.0) * 0.08 + 1.2;
+            data[32] = cam_pos.x;
+            data[33] = cam_pos.y;
+            data[34] = cam_pos.z;
+            data[35] = ao_radius;
+            data[36] = self.config.width as f32;
+            data[37] = self.config.height as f32;
+            data[38] = 1.0 / self.config.width as f32;
+            data[39] = 1.0 / self.config.height as f32;
+            data[40] = 0.85; // strength (occlusion depth)
+            data[41] = self.features.ssao_strength.max(0.05); // intensity
+            data[42] = 0.0;
+            data[43] = self.elapsed_time;
+            self.queue.write_buffer(
+                &self.gtao_uniform_buf, 0,
+                bytemuck::cast_slice(&data),
+            );
+        }
+
+        // ── Upload froxel volumetric uniforms (when volumetric fog is on) ──
+        if self.features.volumetric_fog_enabled {
+            let inv = vp.inverse();
+            let mut fdata = [0.0f32; 48];
+            fdata[0..16].copy_from_slice(&inv.to_cols_array());
+            fdata[16] = cam_pos.x;
+            fdata[17] = cam_pos.y;
+            fdata[18] = cam_pos.z;
+            fdata[20] = -light_dir_arr[0];
+            fdata[21] = -light_dir_arr[1];
+            fdata[22] = -light_dir_arr[2];
+            fdata[24] = light_color_arr[0];
+            fdata[25] = light_color_arr[1];
+            fdata[26] = light_color_arr[2];
+            fdata[28] = self.features.fog_density;
+            fdata[29] = 0.1;       // near
+            fdata[30] = 200.0;     // far
+            fdata[31] = self.elapsed_time;
+            fdata[32] = 64.0;      // grid.x
+            fdata[33] = 36.0;      // grid.y
+            fdata[34] = 32.0;      // grid.z
+            fdata[35] = 1.0;       // sun intensity scale
+            self.queue.write_buffer(
+                &self.froxel_uniform_buf, 0,
+                bytemuck::cast_slice(&fdata),
+            );
+        }
+
+        // ── Upload voxel-GI injection uniforms (when RTGI is enabled) ──────
+        if self.features.voxel_gi_enabled {
+            let grid_world = VOXEL_GI_DIM as f32 * VOXEL_GI_SIZE;
+            // Snap the grid origin to voxel boundaries for frame-to-frame
+            // stability of the injected surface shell.
+            let snapped = |v: f32| (v - grid_world * 0.5).floor() / VOXEL_GI_SIZE * VOXEL_GI_SIZE;
+            let origin = [
+                snapped(cam_pos.x),
+                snapped(cam_pos.y),
+                snapped(cam_pos.z),
+            ];
+            let mut vdata = [0.0f32; 52];
+            vdata[0..16].copy_from_slice(&vp_jittered.to_cols_array());
+            let inv_vp = vp_jittered.inverse();
+            vdata[16..32].copy_from_slice(&inv_vp.to_cols_array());
+            vdata[32] = cam_pos.x;
+            vdata[33] = cam_pos.y;
+            vdata[34] = cam_pos.z;
+            vdata[36] = VOXEL_GI_SIZE;
+            vdata[40] = origin[0];
+            vdata[41] = origin[1];
+            vdata[42] = origin[2];
+            vdata[44] = VOXEL_GI_DIM as f32;
+            vdata[45] = VOXEL_GI_DIM as f32;
+            vdata[46] = VOXEL_GI_DIM as f32;
+            vdata[48] = self.config.width as f32;
+            vdata[49] = self.config.height as f32;
+            self.queue.write_buffer(
+                &self.voxel_uniform_buf, 0,
+                bytemuck::cast_slice(&vdata),
+            );
+        }
+
+        // ── Upload baked light probes (bindings 14/15) ─────────────────────
+        // Probe layout (10 × vec4 per probe = 160 bytes):
+        //   0: position.xyz + radius
+        //   1..9: 9 SH coefficients (rgb, w unused)
+        const MAX_PROBES: usize = 32;
+        const PROBE_STRIDE_VEC4: usize = 10;
+        let probes = &self.light_probes.probes;
+        let count = probes.len().min(32);
+        self.queue.write_buffer(
+            &self.probe_control_buf, 0,
+            &bytemuck::cast_slice(&[count as u32, 0u32, 0u32, 0u32]),
+        );
+        let mut probe_bytes = vec![0u8; PROBE_STRIDE_VEC4 * MAX_PROBES * 16];
+        for (i, probe) in probes.iter().take(count).enumerate() {
+            let base = i * PROBE_STRIDE_VEC4 * 16;
+            probe_bytes[base..base + 12].copy_from_slice(&bytemuck::cast_slice(&[
+                probe.position.x, probe.position.y, probe.position.z,
+            ]));
+            probe_bytes[base + 12..base + 16].copy_from_slice(&bytemuck::cast_slice(&[probe.radius]));
+            for (k, coeff) in probe.irradiance.coeffs.iter().enumerate() {
+                let off = base + 16 + k * 16;
+                probe_bytes[off..off + 12]
+                    .copy_from_slice(&bytemuck::cast_slice(&[coeff[0], coeff[1], coeff[2]]));
+            }
+        }
+        self.queue.write_buffer(&self.probe_data_buf, 0, &probe_bytes);
 
         // ── Build multi-light array ────────────────────────────────────────────
         // Populates the LightUniforms buffer with the directional sun light
@@ -2402,12 +3070,26 @@ impl Renderer {
             spot_angle_cos: 0.0,
             shadow_index:  if self.features.shadows_enabled { 0 } else { -1 },
             _pad:          0.0,
-            _pad2:         [0.0; 2],
+            _align_pad:    [0.0; 2],
+            direction:     light_dir_arr,
+            _dir_pad:      0.0,
         };
 
         // Add all PointLight entities (point + spot + additional directional).
-        for (pos, pl) in world.query::<(&Position, &PointLight)>().iter() {
+        for (pos, pl, rot) in world.query::<(&Position, &PointLight, Option<&Rotation>)>().iter() {
             if light_count >= 16 { break; }
+            // Spot lights point along the entity's forward direction (same
+            // rotation convention as the renderer's model matrix: Y*X*Z).
+            let dir = match rot {
+                Some(r) => {
+                    let m = glam::Mat4::from_rotation_y(r.yaw)
+                        * glam::Mat4::from_rotation_x(r.pitch)
+                        * glam::Mat4::from_rotation_z(r.roll);
+                    let fwd = m.transform_vector3(glam::Vec3::new(0.0, 0.0, -1.0));
+                    fwd.normalize_or_zero()
+                }
+                None => glam::Vec3::new(0.0, 0.0, -1.0),
+            };
             gpu_lights[light_count as usize] = GpuLightData {
                 position:      [pos.x, pos.y, pos.z],
                 _pos_pad:      0.0,
@@ -2419,7 +3101,9 @@ impl Renderer {
                 spot_angle_cos: pl.spot_angle.to_radians().cos(),
                 shadow_index:  if pl.shadow_casting { 0 } else { -1 },
                 _pad:          0.0,
-                _pad2:         [0.0; 2],
+                _align_pad:    [0.0; 2],
+                direction:     [dir.x, dir.y, dir.z],
+                _dir_pad:      0.0,
             };
             light_count += 1;
         }
@@ -2459,6 +3143,12 @@ impl Renderer {
             self.storm_darken,
             self.lightning_intensity,
         );
+        // Capture the average sky colour for the light baker.
+        self.sky_renderer.last_sky_color = [
+            self.sky_params.zenith_color.x * 0.5 + self.sky_params.horizon_color.x * 0.5,
+            self.sky_params.zenith_color.y * 0.5 + self.sky_params.horizon_color.y * 0.5,
+            self.sky_params.zenith_color.z * 0.5 + self.sky_params.horizon_color.z * 0.5,
+        ];
         // Store current VP as previous for next frame's temporal reprojection.
         self.prev_view_proj = vp;
         self.elapsed_time += 1.0 / 60.0; // Approximate; real delta would come from main.rs.
@@ -2514,6 +3204,25 @@ impl Renderer {
             let vp = camera.view_projection_matrix();
             let cull_dist2 = self.features.culling_distance * self.features.culling_distance;
             let frustum_enabled = self.features.frustum_culling_enabled;
+            let occlusion_enabled = self.features.occlusion_culling_enabled;
+
+            // Build the software occlusion grid from Occluder entities before
+            // any visibility testing, so hidden meshes are rejected cheaply.
+            if occlusion_enabled {
+                self.occlusion_culler.begin_frame();
+                let mut occluders: Vec<(glam::Vec3, f32)> = world
+                    .query::<(&Position, &crate::components::Occluder)>()
+                    .iter()
+                    .map(|(pos, occ)| (glam::Vec3::new(pos.x, pos.y, pos.z), occ.radius.max(0.5)))
+                    .collect();
+                // Cap submissions so a scene full of occluders can't stall the
+                // frame; 256 large occluders cover any practical street.
+                occluders.truncate(256);
+                for (center, radius) in occluders {
+                    self.occlusion_culler.submit_occluder(vp, center, radius, cam_pos);
+                }
+            }
+
             jobs.install(|| {
                 candidates
                     .into_par_iter()
@@ -2534,7 +3243,22 @@ impl Renderer {
                         } else {
                             true
                         };
-                        dist_ok && frustum_ok
+                        // Occlusion: skip meshes fully hidden behind Occluders.
+                        let occ_ok = if occlusion_enabled {
+                            let radius = c.renderable.scale[0]
+                                .max(c.renderable.scale[1])
+                                .max(c.renderable.scale[2])
+                                .max(0.25);
+                            !self.occlusion_culler.is_occluded(
+                                vp,
+                                glam::Vec3::new(c.pos.x, c.pos.y, c.pos.z),
+                                radius,
+                                cam_pos,
+                            )
+                        } else {
+                            true
+                        };
+                        dist_ok && frustum_ok && occ_ok
                     })
                     .collect()
             })
@@ -2581,9 +3305,24 @@ impl Renderer {
             // Store first entity for each material (for bind group creation).
             material_map.entry(material_id).or_insert(entity);
 
+            // Per-instance LOD band (0 = full detail). Band is keyed on real
+            // world distance so every instance in this draw shares a vertex
+            // buffer that's simplified enough for *its* distance, without
+            // degrading nearby instances because of a distant one.
+            let dx = pos.x - cam_pos.x;
+            let dy = pos.y - cam_pos.y;
+            let dz = pos.z - cam_pos.z;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            let lod_band = if dist > self.features.mesh_lod_threshold_4 { 4u8 }
+                else if dist > self.features.mesh_lod_threshold_3 { 3u8 }
+                else if dist > self.features.mesh_lod_threshold_2 { 2u8 }
+                else if dist > self.features.mesh_lod_threshold_1 { 1u8 }
+                else { 0u8 };
+
             instancing.add_instance(
                 renderable.mesh.id,
                 material_id,
+                lod_band,
                 InstanceData {
                     model: model.to_cols_array_2d(),
                     color_metallic: [
@@ -2675,27 +3414,24 @@ impl Renderer {
             }
         }
 
+        // ── Sky pass ────────────────────────────────────────────────────────
+        // Fullscreen triangle: renders sky colour + cloud data into separate
+        // targets (sky_color_view + cloud_history_current_view). Geometry is
+        // NOT drawn here, so the sky no longer shares the depth buffer with it;
+        // the deferred lighting pass composites the sky wherever no geometry
+        // wrote depth.
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Main Pass"),
+                label: Some("Sky Pass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view:           &self.scene_view,
+                        view:           &self.sky_color_view,
                         resolve_target: None,
                         depth_slice:    None,
                         ops: wgpu::Operations {
                             load:  wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.05, g: 0.05, b: 0.08, a: 1.0,
                             }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view:           &self.normals_view,
-                        resolve_target: None,
-                        depth_slice:    None,
-                        ops: wgpu::Operations {
-                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     }),
@@ -2709,10 +3445,11 @@ impl Renderer {
                         },
                     }),
                 ],
+                // Sky pipeline expects a depth attachment; clears to 1.0 so the
+                // sky triangle (drawn at depth 1.0) passes the depth test.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        // 1.0 = max depth (everything starts as "lit / in front").
                         load:  wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
@@ -2721,10 +3458,70 @@ impl Renderer {
                 ..Default::default()
             });
 
-            // ── Sky rendering (before geometry) ──────────────────────────────
-            // Draw a fullscreen triangle at depth = 1.0 (far plane).
-            // Geometry drawn afterwards overwrites sky pixels via depth test.
+            // Draw a fullscreen triangle (no vertex buffer).
             self.sky_renderer.render(&mut pass);
+        }
+
+        // ── G-buffer pass ──────────────────────────────────────────────────
+        // Renders opaque geometry into the four G-buffer targets + depth.
+        // fs_main (shader.wgsl) writes material properties, not final colour.
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("G-Buffer Pass"),
+                color_attachments: &[
+                    // albedo (rgb) + metallic (a)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.gb_albedo_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // world normal (encoded rgb) + roughness (a)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.gb_normals_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // emissive (rgb) + ambient occlusion (a)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.gb_material_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // material extras (subsurface, clearcoat, clearcoat_roughness, anisotropy)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.gb_extras_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // 1.0 = max depth — empty-depth pixels are "sky" for the
+                        // deferred lighting pass.
+                        load:  wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
 
             pass.set_pipeline(&self.pipeline);
             // Bind group 0 = global (camera, IBL). Set once per frame.
@@ -2744,23 +3541,11 @@ impl Renderer {
                 let Ok(rep_renderable) = world.get::<&Renderable>(*rep_entity) else { continue };
                 let Some(mesh) = meshes.get(&rep_renderable.mesh) else { continue };
 
-                // Pick the highest LOD level across all instances in this batch.
-                let max_lod_distance = instances.iter().enumerate().map(|(_i, _inst)| {
-                    // Approximate distance from the model matrix translation column.
-                    let tx = batch.instances[0].model[3][0] as f64;
-                    let ty = batch.instances[0].model[3][1] as f64;
-                    let tz = batch.instances[0].model[3][2] as f64;
-                    let dx = tx - cam_pos.x as f64;
-                    let dy = ty - cam_pos.y as f64;
-                    let dz = tz - cam_pos.z as f64;
-                    ((dx * dx + dy * dy + dz * dz).sqrt() / 0.25) as f32
-                }).fold(0.0f32, f32::max);
-
-                let lod_band = if max_lod_distance > self.features.mesh_lod_threshold_4 { 4u8 }
-                    else if max_lod_distance > self.features.mesh_lod_threshold_3 { 3u8 }
-                    else if max_lod_distance > self.features.mesh_lod_threshold_2 { 2u8 }
-                    else if max_lod_distance > self.features.mesh_lod_threshold_1 { 1u8 }
-                    else { 0u8 };
+                // Pick the LOD level from the batch's band. Because batches are now split
+                // per LOD band at add_instance() time, every instance in this batch
+                // is at the same distance bucket — the vertex buffer is simplified
+                // to fit the far end of that bucket without hurting nearer meshes.
+                let lod_band = batch.lod_band;
                 let lod_ratio = match lod_band {
                     0 => 1.0, 1 => 0.78, 2 => 0.56, 3 => 0.34, _ => 0.20,
                 };
@@ -2951,7 +3736,218 @@ impl Renderer {
                     stats.drawn += 1;
                 }
             }
-        } // main pass is dropped here — commands are finalised
+        } // G-buffer pass is dropped here — commands are finalised
+
+        // ── Deferred decal pass ─────────────────────────────────────────────
+        // Paints decal albedo into gb_albedo with alpha blending, reading the
+        // depth buffer to stamp only where the surface crosses each projector
+        // box. Runs after the G-buffer so decals can tint the final material.
+        {
+            // Collect decal entities (position + rotation + decal component).
+            let mut decals: Vec<(glam::Vec3, glam::Quat, crate::components::Decal)> = Vec::new();
+            for (pos, dec, rot) in world.query::<(&Position, &Decal, Option<&Rotation>)>().iter() {
+                let p = glam::Vec3::new(pos.x, pos.y, pos.z);
+                let q = rot
+                    .map(|r| glam::Quat::from_euler(
+                        glam::EulerRot::YXZ,
+                        r.yaw,
+                        r.pitch,
+                        r.roll + dec.roll_deg.to_radians(),
+                    ))
+                    .unwrap_or_else(|| glam::Quat::IDENTITY);
+                decals.push((p, q, *dec));
+            }
+
+            if !decals.is_empty() {
+                let decal_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Decal BG"),
+                    layout: &self.decal_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.decal_uniform_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                    ],
+                });
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Decal Pass"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view:           &self.gb_albedo_view,
+                            resolve_target: None,
+                            depth_slice:    None,
+                            ops: wgpu::Operations {
+                                load:  wgpu::LoadOp::Load, // blend over the G-buffer
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.decal_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_bind_group(1, &decal_bg, &[]);
+                for (pos, rot, d) in &decals {
+                    let model = glam::Mat4::from_scale_rotation_translation(
+                        glam::Vec3::from_array(d.size),
+                        *rot,
+                        *pos,
+                    );
+                    let inv = model.inverse();
+                    let view_proj = self.view_proj;
+                    let inv_vp = view_proj.inverse();
+                    let mut data = [0.0f32; 68]; // 4 mat4 (64) + 1 vec4 (4)
+                    data[0..16].copy_from_slice(&model.to_cols_array());
+                    data[16..32].copy_from_slice(&inv.to_cols_array());
+                    data[32..48].copy_from_slice(&view_proj.to_cols_array());
+                    data[48..64].copy_from_slice(&inv_vp.to_cols_array());
+                    data[64] = d.opacity.clamp(0.0, 1.0);
+                    self.queue.write_buffer(
+                        &self.decal_uniform_buf, 0,
+                        bytemuck::cast_slice(&data),
+                    );
+                    pass.draw(0..24, 0..1);
+                }
+            }
+        }
+
+        // ── Deferred lighting pass ─────────────────────────────────────────
+        // Fullscreen triangle: reads the G-buffer + depth + sky colour, resolves
+        // the full PBR lighting, and writes scene colour (scene_view) + world
+        // normals (normals_view) for downstream passes (water, SSR, bloom).
+        //
+        // GTAO runs first as a compute pass over the depth + normals G-buffer,
+        // writing a half-res AO mask that the deferred pass samples.
+        if self.features.ssao_enabled {
+            let ao_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("GTAO BG"),
+                layout: &self.gtao_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.gtao_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.gb_normals_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.ao_view) },
+                ],
+            });
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("GTAO Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.gtao_pipeline);
+            cpass.set_bind_group(0, &ao_bg, &[]);
+            let wg_x = (self.config.width.max(2) / 2).div_ceil(8).max(1);
+            let wg_y = (self.config.height.max(2) / 2).div_ceil(8).max(1);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        // ── Froxel volumetric injection ─────────────────────────────────────
+        // Fills the 3D froxel grid with sun scattering before the deferred pass
+        // raymarches it. Runs whenever volumetric fog is enabled.
+        if self.features.volumetric_fog_enabled {
+            let froxel_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Froxel BG"),
+                layout: &self.froxel_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.froxel_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.froxel_view) },
+                ],
+            });
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Froxel Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.froxel_pipeline);
+            cpass.set_bind_group(0, &froxel_bg, &[]);
+            cpass.dispatch_workgroups(64u32.div_ceil(8), 36u32.div_ceil(8), 32u32.div_ceil(8));
+        }
+        // ── Voxel GI: injection ──────────────────────────────────────────────
+        // Voxelizes the visible scene by stamping the previous frame's lit
+        // scene colour (scene_view, untouched since last frame) into the
+        // camera-aligned voxel grid. Must run AFTER geometry but BEFORE the
+        // deferred pass (which cone-traces the freshly built grid).
+        if self.features.voxel_gi_enabled {
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Voxel GI Inject Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.voxel_pipeline);
+                cpass.set_bind_group(0, &self.voxel_inject_bg, &[]);
+                let wgs = VOXEL_GI_DIM.div_ceil(4).max(1);
+                cpass.dispatch_workgroups(wgs, wgs, wgs);
+            }
+            // ── Voxel GI: mip pyramid ──────────────────────────────────────
+            for level in 1..VOXEL_GI_MIPS {
+                let dim = VOXEL_GI_DIM >> level;
+                let mut mdata = [0.0f32; 8];
+                mdata[0] = dim as f32;
+                mdata[1] = dim as f32;
+                mdata[2] = dim as f32;
+                self.queue.write_buffer(
+                    &self.voxel_mip_uniform_buf, 0,
+                    bytemuck::cast_slice(&mdata),
+                );
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Voxel GI Mip Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.voxel_mip_pipeline);
+                cpass.set_bind_group(0, &self.voxel_mip_bgs[level as usize - 1], &[]);
+                let wgs = dim.div_ceil(4).max(1);
+                cpass.dispatch_workgroups(wgs, wgs, wgs);
+            }
+        }
+        {
+            let deferred_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Deferred Lighting BG"),
+                layout: &self.deferred_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.gb_albedo_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gb_normals_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.gb_material_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.gb_extras_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.sky_color_view) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: self.deferred_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&self.ao_view) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self.froxel_view) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&self.voxel_view) },
+                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::Sampler(&self.voxel_sampler) },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Deferred Lighting Pass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.scene_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05, g: 0.05, b: 0.08, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view:           &self.normals_view,
+                        resolve_target: None,
+                        depth_slice:    None,
+                        ops: wgpu::Operations {
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.deferred_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &deferred_bg, &[]);
+            pass.draw(0..3, 0..1);
+        } // deferred lighting pass is dropped here
 
         // ── Copy cloud history current → sky history texture ────────────────
         // The sky pass wrote cloud color+alpha to cloud_history_current (MRT target 2).
@@ -3734,8 +4730,64 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
             ],
         });
+        // Pyramid-level bind groups.
+        let bloom_c_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Bloom C BG"),
+            layout: &self.post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_c_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
+        let bloom_d_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Bloom D BG"),
+            layout: &self.post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_d_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
+        let bloom_e_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Bloom E BG"),
+            layout: &self.post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_e_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
+        let bloom_f_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Bloom F BG"),
+            layout: &self.post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_f_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
+        // Upsample-add bind groups (t_bloom group 1 = the smaller level).
+        let composite_d_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Composite D BG"),
+            layout: &self.post2_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_d_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
+        let composite_e_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Post Composite E BG"),
+            layout: &self.post2_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.bloom_e_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+            ],
+        });
 
-        // 1) Extract bright parts.
+        // ── Pyramid bloom ────────────────────────────────────────────────────
+        // Build a real multi-level pyramid: extract bright pixels at half res,
+        // then downsample through quarter and eighth levels (each downsample is
+        // a box filter that softens the glow), blur the two lowest levels with
+        // the H/V Gaussian pair, then upsample-add each level back into the one
+        // above, and finally composite into the scene.
+        // 1) Extract bright parts → bloom_a (half).
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Bloom Extract"),
@@ -3755,10 +4807,144 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        // 2) Blur horizontally into bloom_b.
+        // 2) Downsample half → quarter (bloom_c), then quarter → eighth (bloom_d).
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Bloom Blur H"),
+                label: Some("Bloom Downsample 1/2"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_c_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_downsample_pipeline);
+            pass.set_bind_group(0, &bloom_a_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Downsample 1/4"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_d_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_downsample_pipeline);
+            pass.set_bind_group(0, &bloom_c_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 3) Blur the quarter level (bloom_c → bloom_e → bloom_c).
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Quarter Blur H"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_e_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_blur_h_pipeline);
+            pass.set_bind_group(0, &bloom_c_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Quarter Blur V"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_c_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_blur_v_pipeline);
+            pass.set_bind_group(0, &bloom_e_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 4) Blur the eighth level (bloom_d → bloom_f → bloom_d).
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Eighth Blur H"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_f_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_blur_h_pipeline);
+            pass.set_bind_group(0, &bloom_d_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Eighth Blur V"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_d_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_blur_v_pipeline);
+            pass.set_bind_group(0, &bloom_f_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 5) Upsample-add: eighth into quarter (bloom_c += bloom_d), then quarter
+        //    into half (bloom_a += bloom_e). Then blur the half level into bloom_b.
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Upsample-Add 1/4"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_e_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_composite_pipeline);
+            pass.set_bind_group(0, &bloom_c_bg, &[]);
+            pass.set_bind_group(1, &composite_d_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Upsample-Add 1/2"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.bloom_b_view,
                     resolve_target: None,
@@ -3770,15 +4956,17 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.bloom_blur_h_pipeline);
+            pass.set_pipeline(&self.bloom_composite_pipeline);
             pass.set_bind_group(0, &bloom_a_bg, &[]);
+            pass.set_bind_group(1, &composite_e_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
-        // 3) Blur vertically back into bloom_a, then copy to bloom_b final.
+        // 6) Final blur of the combined half-res bloom into bloom_a, then
+        //    copy to bloom_b so the composite step reads a stable result.
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Bloom Blur V"),
+                label: Some("Bloom Final Blur H"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.bloom_a_view,
                     resolve_target: None,
@@ -3790,12 +4978,30 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.bloom_blur_v_pipeline);
+            pass.set_pipeline(&self.bloom_blur_h_pipeline);
             pass.set_bind_group(0, &bloom_b_bg, &[]);
             pass.draw(0..3, 0..1);
         }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bloom Final Blur V"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom_b_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.bloom_blur_v_pipeline);
+            pass.set_bind_group(0, &bloom_a_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
 
-        // 4) Bloom composite → tonemap_temp (full-res), then tonemap → swapchain.
+        // 7) Bloom composite → tonemap_temp (full-res), then tonemap → swapchain.
         //    If bloom is off, we copy scene_view directly to tonemap_temp.
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4340,6 +5546,32 @@ fn make_normals_texture(
     (texture, view)
 }
 
+// make_gbuffer_texture() creates a full-res Rgba16Float render target for the
+// deferred G-buffer. Written by the opaque geometry pass, read by the deferred
+// lighting pass.
+fn make_gbuffer_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    label:  &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
 // make_velocity_texture() creates a full-res Rg16Float texture for per-pixel motion vectors.
 // Placeholder until the geometry pass writes actual motion vectors from previous-frame MVP.
 fn make_velocity_texture(
@@ -4393,17 +5625,27 @@ fn make_bloom_texture(
     config: &wgpu::SurfaceConfiguration,
     label: &str,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    make_bloom_texture_at(device, (config.width / 2).max(1), (config.height / 2).max(1), label)
+}
+
+/// Bloom pyramid texture at an explicit resolution (half / quarter / …).
+fn make_bloom_texture_at(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: (config.width / 2).max(1),
-            height: (config.height / 2).max(1),
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: config.format,
+        format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -4656,6 +5898,38 @@ fn make_1x1_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every WGSL shader embedded with include_str! must parse AND fully validate
+    /// as valid WGSL. naga's frontend parses the source into a module, then the
+    /// Validator runs layout/type/usage checks — the same validation wgpu performs
+    /// at pipeline creation — so a typo here fails `cargo test` instead of crashing
+    /// at startup on the user's machine.
+    #[test]
+    fn embedded_shaders_parse_as_valid_wgsl() {
+        use naga::front::wgsl::parse_str;
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let shaders = [
+            ("shader.wgsl", include_str!("renderer/shader.wgsl")),
+            ("deferred.wgsl", include_str!("renderer/deferred.wgsl")),
+            ("postprocess.wgsl", include_str!("renderer/postprocess.wgsl")),
+            ("sky.wgsl", include_str!("renderer/sky.wgsl")),
+            ("water.wgsl", include_str!("renderer/water.wgsl")),
+            ("shadow.wgsl", include_str!("renderer/shadow.wgsl")),
+            ("particle.wgsl", include_str!("renderer/particle.wgsl")),
+            ("fire.wgsl", include_str!("renderer/fire.wgsl")),
+            ("lava.wgsl", include_str!("renderer/lava.wgsl")),
+        ];
+        for (name, src) in shaders {
+            let module = match parse_str(src) {
+                Ok(m) => m,
+                Err(e) => panic!("{} failed WGSL parse:\n{:?}", name, e),
+            };
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+            if let Err(e) = validator.validate(&module) {
+                panic!("{} failed WGSL validation:\n{:?}", name, e);
+            }
+        }
+    }
 
     fn make_test_vertex(position: [f32; 3], normal: [f32; 3]) -> crate::assets::mesh::Vertex {
         crate::assets::mesh::Vertex::new(position, normal, [1.0, 1.0, 1.0])

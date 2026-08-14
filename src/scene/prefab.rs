@@ -85,35 +85,29 @@ impl PrefabRegistry {
     }
 
     /// Scan a directory for .prefab files and load them all.
+    /// Enumerates through the VFS so prefabs ship inside a packed game.pak too.
     pub fn load_from_directory(&mut self, dir: impl AsRef<Path>) {
-        let dir = dir.as_ref();
-        if !dir.is_dir() {
+        let dir = dir.as_ref().to_string_lossy().to_string();
+        if !crate::vfs::exists(&dir) {
             return;
         }
-        self.visit(dir);
+        let mut files: Vec<String> = crate::vfs::walk_dir(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rel| rel.ends_with(".prefab"))
+            .map(|rel| format!("{}/{}", dir.trim_end_matches('/'), rel))
+            .collect();
+        files.sort();
+        for path_str in files {
+            if let Err(e) = self.load_file(Path::new(&path_str)) {
+                tracing::error!("[Prefab] Failed to load {}: {}", path_str, e);
+            }
+        }
         tracing::info!(
             "[Prefabs] Loaded {} prefabs from {:?}",
             self.by_path.len(),
             dir
         );
-    }
-
-    fn visit(&mut self, dir: &Path) {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                self.visit(&path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) == Some("prefab") {
-                if let Err(e) = self.load_file(&path) {
-                    tracing::error!("[Prefab] Failed to load {}: {}", path.display(), e);
-                }
-            }
-        }
     }
 
     /// Load a single .prefab file.

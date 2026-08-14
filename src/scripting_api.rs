@@ -126,19 +126,43 @@ impl<'a> ApiRegistry<'a> {
 
     /// Mount all registered entries onto the Lua globals.
     /// Call once after every plugin has been registered.
+    ///
+    /// BUG FIX: previously each namespaced entry re-fetched the namespace
+    /// table from globals via `globals.get::<Option<LuaTable>>`. That failed
+    /// hard with a type error whenever the namespace name collided with an
+    /// existing global that is *not* a table (e.g. a flat function named
+    /// "save" plus a `save.*` namespace) — one bad collision aborted the whole
+    /// mount, silently dropping every later API. It also treated the global
+    /// as the source of truth per entry instead of once per namespace.
+    ///
+    /// Now we resolve each namespace once (reusing an existing table, or
+    /// creating a fresh one when the current value is missing or not a table)
+    /// and keep it in a local cache so all entries for the same namespace
+    /// merge into one table.
     pub fn apply(&self) -> LuaResult<()> {
         let globals = self.lua.globals();
+        let mut namespaces: std::collections::HashMap<&'static str, LuaTable> =
+            std::collections::HashMap::new();
         for entry in &self.entries {
             if entry.namespace.is_empty() {
                 globals.set(entry.name, entry.function.clone())?;
-            } else {
-                let ns: LuaTable = match globals.get::<Option<LuaTable>>(entry.namespace)? {
-                    Some(ns) => ns,
-                    None => self.lua.create_table()?,
-                };
-                ns.set(entry.name, entry.function.clone())?;
-                globals.set(entry.namespace, ns)?;
+                continue;
             }
+            let ns = match namespaces.get(entry.namespace) {
+                Some(ns) => ns.clone(),
+                None => {
+                    let table = match globals.get::<mlua::Value>(entry.namespace)? {
+                        mlua::Value::Table(t) => t,
+                        // Missing, or a non-table global shadows this namespace —
+                        // replace it with a real table instead of erroring out.
+                        _ => self.lua.create_table()?,
+                    };
+                    namespaces.insert(entry.namespace, table.clone());
+                    table
+                }
+            };
+            ns.set(entry.name, entry.function.clone())?;
+            globals.set(entry.namespace, ns)?;
         }
         Ok(())
     }
@@ -221,6 +245,42 @@ mod tests {
         let t: LuaTable = globals.get("test")?;
         let hello: LuaFunction = t.get("hello")?;
         assert_eq!(hello.call::<String>(())?, "world");
+        Ok(())
+    }
+
+    #[test]
+    fn shared_namespace_merges_across_repeated_apply() -> LuaResult<()> {
+        let lua = Lua::new();
+        let mut registry = ApiRegistry::new(&lua);
+        registry.register_namespaced("merge", "one", |_, _: ()| Ok(1i32))?;
+        registry.register_namespaced("merge", "two", |_, _: ()| Ok(2i32))?;
+        registry.apply()?;
+        // Second pass — a plugin reloaded later must ADD to the same table,
+        // not clobber the entries from the first pass.
+        registry.apply()?;
+        let globals = lua.globals();
+        let t: LuaTable = globals.get("merge")?;
+        let one: LuaFunction = t.get("one")?;
+        let two: LuaFunction = t.get("two")?;
+        assert_eq!(one.call::<i32>(())?, 1);
+        assert_eq!(two.call::<i32>(())?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn non_table_global_shadowing_namespace_is_overwritten() -> LuaResult<()> {
+        let lua = Lua::new();
+        let globals = lua.globals();
+        // A flat function shadows the namespace name — the old apply() failed
+        // here with a type error; now it must replace it with a table.
+        let stub = lua.create_function(|_, _: ()| Ok("shadow"))?;
+        globals.set("shadowed", stub)?;
+        let mut registry = ApiRegistry::new(&lua);
+        registry.register_namespaced("shadowed", "real", |_, _: ()| Ok(42i32))?;
+        registry.apply()?;
+        let t: LuaTable = globals.get("shadowed")?;
+        let real: LuaFunction = t.get("real")?;
+        assert_eq!(real.call::<i32>(())?, 42);
         Ok(())
     }
 }

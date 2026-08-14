@@ -155,6 +155,7 @@ impl SubSceneManager {
                                     color,
                                     intensity,
                                     range,
+                                    spot_angle: 45.0,
                                 });
                             }
                         }
@@ -228,8 +229,12 @@ impl SubSceneManager {
                     color: l.color,
                     intensity: l.intensity,
                     range: l.range,
-                    light_type: 1.0,
-                    spot_angle: 45.0,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0,
+                    },
+                    spot_angle: l.spot_angle,
                     shadow_casting: false,
                 });
                 let ent = world.spawn((
@@ -265,8 +270,12 @@ impl SubSceneManager {
                     color: l.color,
                     intensity: l.intensity,
                     range: l.range,
-                    light_type: 1.0,
-                    spot_angle: 45.0,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0,
+                    },
+                    spot_angle: l.spot_angle,
                     shadow_casting: false,
                 });
                 let ent = world.spawn((
@@ -468,6 +477,7 @@ impl SubSceneManager {
                                     color,
                                     intensity,
                                     range,
+                                    spot_angle: 45.0,
                                 });
                             }
                         }
@@ -532,8 +542,12 @@ impl SubSceneManager {
                     color: l.color,
                     intensity: l.intensity,
                     range: l.range,
-                    light_type: 1.0,
-                    spot_angle: 45.0,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0,
+                    },
+                    spot_angle: l.spot_angle,
                     shadow_casting: false,
                 });
                 let ent = world.spawn((
@@ -569,8 +583,12 @@ impl SubSceneManager {
                     color: l.color,
                     intensity: l.intensity,
                     range: l.range,
-                    light_type: 1.0,
-                    spot_angle: 45.0,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0,
+                    },
+                    spot_angle: l.spot_angle,
                     shadow_casting: false,
                 });
                 let ent = world.spawn((

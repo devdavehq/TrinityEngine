@@ -1,0 +1,67 @@
+# main.scene — Data-Driven Scene Definition
+# Format: [entity] blocks with key = value pairs.
+# Lines starting with # are comments.
+# The engine reloads this file when it detects a change.
+#
+# Supported fields:
+#   name      = string               Entity name
+#   mesh      = path                 Mesh file (.obj, .gltf, .glb)
+#   position  = x y z                World position
+#   rotation  = pitch yaw roll       Euler rotation in degrees
+#   scale     = x y z  OR  s         Uniform or non-uniform scale
+#   material  = name                 Material from Content/Materials/*.material
+#   color     = r g b                Base color override
+#   metallic  = f                    Metallic value (0-1)
+#   roughness = f                    Roughness value (0-1)
+#   ao        = f                    Ambient occlusion (0-1)
+#   rigidbody = mass                 Physics body (0 = static, >0 = dynamic)
+#   light     = type r g b int range Point light source
+#   script    = path                 Lua script to attach
+
+[entity]
+name     = player
+mesh     = meshes/cube.obj
+position = 0.0  1.0  0.0
+material = polished_chrome
+rigidbody = 1.0
+script   = scripts/player.lua
+
+[entity]
+name     = enemy
+mesh     = meshes/cube.obj
+position = 3.0  1.0  0.0
+rotation = 0.0  45.0  0.0
+material = rusty_metal
+rigidbody = 1.5
+script   = scripts/enemy.lua
+
+[entity]
+name     = floor
+mesh     = meshes/cube.obj
+position = 0.0  -0.5  0.0
+scale    = 10.0  0.2  10.0
+material = concrete
+rigidbody = 0
+
+[entity]
+name     = shiny_sphere
+mesh     = meshes/cube.obj
+position = -3.0  1.0  0.0
+color    = 1.0  0.7  0.2
+metallic  = 1.0
+roughness = 0.05
+
+[entity]
+name     = warm_light
+mesh     = meshes/cube.obj
+position = 0.0  3.0  0.0
+scale    = 0.2  0.2  0.2
+light    = point 1.0 0.9 0.8 2.0 15.0
+
+[entity]
+name     = wooden_crate
+mesh     = meshes/cube.obj
+position = 2.0  0.5  2.0
+rotation = 0.0  30.0  0.0
+material = dark_wood
+rigidbody = 2.0

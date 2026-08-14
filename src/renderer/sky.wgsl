@@ -42,6 +42,7 @@ struct SkyUniforms {
     camera_pos_time:  vec4<f32>,   // xyz = camera position, w = total elapsed time
     screen_fog:       vec4<f32>,   // x = screen width, y = screen height, z = fog_density, w = unused
     fog_color:        vec4<f32>,   // rgb = fog color, w = unused
+    prev_view_proj:   mat4x4<f32>, // previous frame view-projection (cloud temporal reprojection)
 }
 
 @group(0) @binding(0) var<uniform> sky: SkyUniforms;
@@ -160,7 +161,9 @@ fn sun_disc(ray_dir: vec3<f32>) -> vec3<f32> {
     let cos_angle = dot(ray_dir, sun_dir);
     let radius_cos = cos(sky.sky_stars.z * 3.14159265 / 180.0);
     let halo_cos = cos(sky.sky_stars.z * 3.14159265 / 180.0 * sky.sky_stars.w);
-    let disc = smoothstep(radius_cos, radius_cos + 0.001, cos_angle);
+    // Edge of the disc sits just *inside* `radius_cos` so the whole disc
+    // reaches full brightness at the sun's center (cos_angle == 1.0).
+    let disc = smoothstep(radius_cos + 0.0003, radius_cos, cos_angle);
     let glow = pow(clamp((cos_angle - halo_cos) / (1.0 - halo_cos), 0.0, 1.0), 2.0);
     let sun_rgb = sky.sky_sun_color.rgb * sky.sky_sun_color.w;
     return sun_rgb * (disc + glow * 0.4);
@@ -339,8 +342,13 @@ fn cloud_layer(ray_dir: vec3<f32>) -> vec4<f32> {
 // Temporal reprojection for clouds: reprojects the previous frame's cloud
 // result using the previous VP matrix, then blends with the current frame
 // based on motion magnitude. This eliminates cloud flicker at low step counts.
+struct SkyOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) cloud: vec4<f32>,
+}
+
 @fragment
-fn fs_sky(in: SkyVertOut) -> (@location(0) vec4<f32>, @location(1) vec4<f32>, @location(2) vec4<f32>) {
+fn fs_sky(in: SkyVertOut) -> SkyOutput {
     let ndc = vec4<f32>(in.uv * 2.0 - 1.0, 1.0, 1.0);
     let world_pos_h = sky.inv_view_proj * ndc;
     let ray_dir = normalize(world_pos_h.xyz / world_pos_h.w);
@@ -376,5 +384,8 @@ fn fs_sky(in: SkyVertOut) -> (@location(0) vec4<f32>, @location(1) vec4<f32>, @l
     color = mix(color, blended_color, blended_alpha);
 
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(100.0));
-    return (vec4<f32>(color, 1.0), vec4<f32>(ray_dir * 0.5 + vec3<f32>(0.5), 1.0), vec4<f32>(blended_color, blended_alpha));
+    return SkyOutput(
+        vec4<f32>(color, 1.0),
+        vec4<f32>(blended_color, blended_alpha),
+    );
 }

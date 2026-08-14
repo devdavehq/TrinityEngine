@@ -2,12 +2,19 @@ use crate::camera::Camera2D;
 use crate::components::{Position, Velocity};
 use hecs::World;
 
+#[cfg(all(feature = "scripting", feature = "audio"))]
 use crate::components::Script;
+#[cfg(all(feature = "scripting", feature = "audio"))]
 use crate::input::InputState;
+#[cfg(feature = "scripting")]
 use crate::scripting::ScriptEngine;
+#[cfg(feature = "audio")]
 use crate::audio::AudioSystem;
+#[cfg(all(feature = "scripting", feature = "audio"))]
 use crate::ai::AiRegistry;
+#[cfg(all(feature = "scripting", feature = "audio"))]
 use crate::navigation::NavGrid;
+#[cfg(all(feature = "scripting", feature = "audio"))]
 use crate::terrain::TerrainWorld;
 use crate::core::systems::SystemScheduler;
 
@@ -48,6 +55,7 @@ impl Default for EngineSystems {
 // Why pass ScriptEngine by reference?
 // ScriptEngine owns the Lua runtime. We borrow it to call scripts.
 // We don't want the system to own it — main.rs should own it.
+#[cfg(all(feature = "scripting", feature = "audio"))]
 pub fn scripting_system(
     world: &mut World,
     scripts: &mut ScriptEngine,
@@ -56,12 +64,14 @@ pub fn scripting_system(
     camera_target: [f32; 3],
     dt: f32,
     mut audio: Option<&mut AudioSystem>,
+    mut net: Option<&mut crate::net::NetworkManager>,
     nav_grid: &NavGrid,
     navmesh: &crate::navmesh::NavMesh,
     ai_registry: &mut AiRegistry,
     terrain_world: &mut TerrainWorld,
     meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
     weather: &mut crate::environment::weather::WeatherState,
+    prefabs: &crate::scene::PrefabRegistry,
     particles: &mut crate::particles::ParticleSystem,
     levels: &mut crate::engine_subsystems::LevelState,
     boids: &mut crate::boids::BoidRegistry,
@@ -83,6 +93,7 @@ pub fn scripting_system(
     // Provide NavGrid and AiRegistry pointers for bt/nav Lua APIs.
     scripts.set_external_refs(nav_grid, ai_registry, terrain_world, meshes, weather, navmesh);
     scripts.set_particles(particles);
+    scripts.set_prefabs(prefabs);
     scripts.set_levels(levels);
     scripts.set_boids(boids);
     for (entity, path) in script_entities {
@@ -99,6 +110,7 @@ pub fn scripting_system(
             &path,
             dt,
             audio.as_deref_mut(),
+            net.as_deref_mut(),
             screen_w,
             screen_h,
             camera_fov,

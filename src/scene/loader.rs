@@ -21,6 +21,8 @@
 //   metallic  = f                Override metallic (if no material)
 //   roughness = f                Override roughness (if no material)
 //   ao        = f                Override ambient occlusion
+//   health    = current max      Health component (tracks damage/destruction)
+//   alive     = 0|1              Set 0 to skip spawning (used by save/load)
 // ─────────────────────────────────────────────────────────────────────────
 
 // EntityDesc holds everything needed to spawn one entity.
@@ -43,6 +45,12 @@ pub struct EntityDesc {
     /// Optional prefab file path. When set, default values come from the prefab
     /// and scene fields override only what's specified.
     pub prefab:    Option<String>,
+    /// Optional health (current, max). When set the entity spawns a Health
+    /// component so damage/destruction and save/load can track it.
+    pub health:    Option<(i32, i32)>,
+    /// Whether the entity should be spawned at all. `alive = 0` is used by the
+    /// save/load path to keep a killed NPC/collectible from respawning.
+    pub alive:     bool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +59,19 @@ pub struct LightDesc {
     pub color:      [f32; 3],
     pub intensity:  f32,
     pub range:      f32,
+    pub spot_angle: f32,            // spot cone angle in degrees (spot lights only)
+}
+
+impl Default for LightDesc {
+    fn default() -> Self {
+        Self {
+            light_type: "point".to_string(),
+            color:      [1.0, 1.0, 1.0],
+            intensity:  1.0,
+            range:      10.0,
+            spot_angle: 45.0,
+        }
+    }
 }
 
 impl Default for EntityDesc {
@@ -70,6 +91,8 @@ impl Default for EntityDesc {
             light:     None,
             script:    None,
             prefab:    None,
+            health:    None,
+            alive:     true,
         }
     }
 }
@@ -155,9 +178,24 @@ pub fn parse_scene(path: &str) -> Result<Vec<EntityDesc>, String> {
                 let mass: f32 = value.parse().unwrap_or(1.0);
                 desc.rigidbody = Some(mass);
             }
+            "health" => {
+                // "current max" → (current, max). Single value = current == max.
+                let v = parse_floats(value);
+                if v.len() >= 2 {
+                    desc.health = Some((v[0] as i32, v[1] as i32));
+                } else if v.len() == 1 {
+                    let h = v[0] as i32;
+                    desc.health = Some((h, h));
+                }
+            }
+            "alive" => {
+                // "alive = 1" (default); "alive = 0" → don't spawn.
+                desc.alive = value != "0";
+            }
             "light" => {
                 // "point 1.0 0.9 0.8 2.0 15.0"
-                // type r g b intensity range
+                // "spot 1.0 0.9 0.8 2.0 15.0 30.0"  (7th token = cone angle, degrees)
+                // type r g b intensity range [spot_angle]
                 let tokens: Vec<&str> = value.split_whitespace().collect();
                 if tokens.len() >= 6 {
                     desc.light = Some(LightDesc {
@@ -169,6 +207,10 @@ pub fn parse_scene(path: &str) -> Result<Vec<EntityDesc>, String> {
                         ],
                         intensity: tokens[4].parse().unwrap_or(1.0),
                         range:     tokens[5].parse().unwrap_or(10.0),
+                        spot_angle: tokens.get(6)
+                            .and_then(|t| t.parse::<f32>().ok())
+                            .map(|a| a.clamp(5.0, 170.0))
+                            .unwrap_or(45.0),
                     });
                 }
             }
@@ -193,4 +235,60 @@ fn parse_floats(s: &str) -> Vec<f32> {
     s.split_whitespace()
         .map(|tok| tok.parse::<f32>().unwrap_or(0.0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_str(contents: &str) -> Vec<EntityDesc> {
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .replace("::", "_");
+        let path = std::env::temp_dir().join(format!("trinity_{}_{}.scene", std::process::id(), name));
+        std::fs::write(&path, contents).expect("write temp scene");
+        let result = parse_scene(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        result.unwrap_or_else(|e| panic!("parse failed: {}", e))
+    }
+
+    #[test]
+    fn parses_spot_light_cone_angle() {
+        let entities = parse_str(
+            "# scene\n\
+             [entity]\n\
+             name = spotlight\n\
+             light = spot 1.0 0.9 0.8 2.0 15.0 30.0\n",
+        );
+        assert_eq!(entities.len(), 1);
+        let light = entities[0].light.as_ref().expect("light parsed");
+        assert_eq!(light.light_type, "spot");
+        assert_eq!(light.spot_angle, 30.0);
+    }
+
+    #[test]
+    fn defaults_cone_angle_when_missing() {
+        let entities = parse_str(
+            "# scene\n\
+             [entity]\n\
+             name = pointlight\n\
+             light = point 1.0 1.0 1.0 1.0 10.0\n",
+        );
+        let light = entities[0].light.as_ref().expect("light parsed");
+        assert_eq!(light.light_type, "point");
+        assert_eq!(light.spot_angle, 45.0);
+    }
+
+    #[test]
+    fn clamps_cone_angle_to_valid_range() {
+        let entities = parse_str(
+            "# scene\n\
+             [entity]\n\
+             name = wide\n\
+             light = spot 1.0 1.0 1.0 1.0 10.0 999.0\n",
+        );
+        let light = entities[0].light.as_ref().expect("light parsed");
+        assert_eq!(light.spot_angle, 170.0);
+    }
 }

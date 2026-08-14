@@ -34,6 +34,7 @@ pub fn render_content_browser_panel(
     show_foliage_editor: &mut bool,
     error_log: &mut Vec<String>,
     ctx: &egui::Context,
+    bake_requested: &mut bool,
 ) {
     let mut grid_mode = ui
         .data_mut(|d| d.get_temp::<bool>("content_browser_grid_mode".into()))
@@ -53,6 +54,10 @@ pub fn render_content_browser_panel(
                         .small()
                         .color(egui::Color32::from_rgb(144, 154, 170)),
                 );
+                if ui.button(egui::RichText::new("Bake Lighting").small()).clicked() {
+                    *bake_requested = true;
+                    error_log.push("[Lighting] Bake requested".to_string());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut grid_mode, false, "List");
                     ui.selectable_value(&mut grid_mode, true, "Grid");

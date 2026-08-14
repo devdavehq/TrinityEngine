@@ -5,6 +5,7 @@ use hecs::World;
 pub mod skeletal;
 pub mod blending;
 pub mod anim_graph;
+pub mod ik;
 
 #[derive(Clone, Copy, Debug)]
 pub enum AnimState {

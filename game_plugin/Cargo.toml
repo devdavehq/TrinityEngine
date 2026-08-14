@@ -1,0 +1,13 @@
+[package]
+name = "game_plugin"
+version = "0.1.0"
+edition = "2024"
+
+# A cdylib is mandatory: the engine maps this .dll in with libloading and can
+# unload/reload it at runtime while the engine process stays alive.
+[lib]
+name = "game_plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+game_api = { path = "../game_api" }

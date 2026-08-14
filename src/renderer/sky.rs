@@ -87,6 +87,9 @@ pub struct SkyRenderer {
     cloud_history_tex: wgpu::Texture,
     cloud_history_view: wgpu::TextureView,
     cloud_history_sampler: wgpu::Sampler,
+    /// Average sky colour estimate (set during update_uniforms) — used by the
+    /// CPU light baker as the ambient colour for open-sky probe rays.
+    pub last_sky_color: [f32; 3],
 }
 
 impl SkyRenderer {
@@ -99,7 +102,7 @@ impl SkyRenderer {
     pub fn new(
         device: &wgpu::Device,
         _window: &Arc<Window>,
-        format: wgpu::TextureFormat,
+        _format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) -> Self {
@@ -228,11 +231,9 @@ impl SkyRenderer {
                 entry_point: Some("fs_sky"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
+                    // Sky colour rendered linear into a dedicated Rgba16Float
+                    // target; the deferred lighting pass samples it with no
+                    // sRGB decode and composites it over empty-depth pixels.
                     Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba16Float,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -270,7 +271,14 @@ impl SkyRenderer {
             cloud_history_tex,
             cloud_history_view,
             cloud_history_sampler,
+            last_sky_color: [0.3, 0.5, 0.8],
         }
+    }
+
+    /// Best-known average sky colour. The CPU light baker falls back to this
+    /// for open-sky probe rays before the first frame's sky update runs.
+    pub fn average_sky_color_estimate(&self) -> glam::Vec3 {
+        glam::Vec3::from(self.last_sky_color)
     }
 
     /// Update sky uniform data. Call once per frame before rendering.

@@ -20,11 +20,11 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(0) var t_src: texture_2d<f32>;
 @group(0) @binding(1) var s_src: sampler;
 
-// ── Tone mapping + colour grading uniforms ────────────────────────────────
+// â”€â”€ Tone mapping + colour grading uniforms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Loaded via group(1) binding 0 on the tonemap pipeline.
 // Contains all the parameters for the ACES tone mapper and colour adjustments.
 struct TonemapUniforms {
-    exposure:    f32,  // Exposure compensation — multiplies HDR luminance.
+    exposure:    f32,  // Exposure compensation â€” multiplies HDR luminance.
     temperature: f32,  // Colour temperature shift: -1 = cool/blue, +1 = warm/orange.
     saturation:  f32,  // Global saturation multiplier: 0 = greyscale, 1 = normal, >1 = vivid.
     contrast:    f32,  // Contrast adjustment: 0 = flat, 1 = normal, >1 = punchy.
@@ -49,6 +49,22 @@ fn fs_bloom_extract(in: VsOut) -> @location(0) vec4<f32> {
     // smooth so bright emissive surfaces bloom naturally.
     let k = smoothstep(0.4, 1.2, luma);
     return vec4<f32>(c * k, 1.0);
+}
+
+// Pyramid bloom stage: downsample by 2 using a 4-tap bilinear box filter
+// (one sample per source quadrant). This is the standard way to build a
+// bloom pyramid — it filters high frequencies before each blur so the glow
+// spreads softly without aliasing.
+@fragment
+fn fs_downsample(in: VsOut) -> @location(0) vec4<f32> {
+    let tex_size = vec2<f32>(textureDimensions(t_src, 0));
+    let src_pixel = 1.0 / tex_size;
+    var c = vec3<f32>(0.0);
+    c += textureSample(t_src, s_src, in.uv + vec2<f32>( src_pixel.x,  src_pixel.y)).rgb;
+    c += textureSample(t_src, s_src, in.uv + vec2<f32>(-src_pixel.x,  src_pixel.y)).rgb;
+    c += textureSample(t_src, s_src, in.uv + vec2<f32>( src_pixel.x, -src_pixel.y)).rgb;
+    c += textureSample(t_src, s_src, in.uv + vec2<f32>(-src_pixel.x, -src_pixel.y)).rgb;
+    return vec4<f32>(c * 0.25, 1.0);
 }
 
 @fragment
@@ -85,13 +101,13 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(base + bloom, 1.0);
 }
 
-// ── Tone mapping + colour grading pass ────────────────────────────────────
+// â”€â”€ Tone mapping + colour grading pass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Applied as the FINAL post-process step, after bloom composite.
 // Reads the full-resolution scene (with bloom) and outputs to the swapchain.
 //
 // WHY ACES INSTEAD OF REINHARD?
 // Reinhard maps all HDR values into [0,1] but desaturates bright colours.
-// ACES (Academy Color Encoding System) is the film industry standard —
+// ACES (Academy Color Encoding System) is the film industry standard â€”
 // it preserves colour saturation in bright highlights and gives a cinematic
 // roll-off that looks natural. RDR2, Cyberpunk, and virtually every AAA
 // game uses ACES or a variant.
@@ -99,7 +115,7 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 // ACES fitted curve (Stephen Hill's approximation).
 // Input: linear HDR value. Output: LDR value in [0,1].
 fn aces_film(x: vec3<f32>) -> vec3<f32> {
-    // Curve coefficients — these map the ACES response curve into a
+    // Curve coefficients â€” these map the ACES response curve into a
     // simple rational function that runs entirely on the GPU.
     let a = x * (x * 2.51 + vec3<f32>(0.03));
     let b = x * (x * 2.43 + vec3<f32>(0.59)) + vec3<f32>(0.14);
@@ -107,7 +123,7 @@ fn aces_film(x: vec3<f32>) -> vec3<f32> {
 }
 
 // Colour temperature shift.
-// Shifts the white balance by adding a blue↔orange tint.
+// Shifts the white balance by adding a blueâ†”orange tint.
 // Negative values cool the image (blue hour / overcast).
 // Positive values warm it (golden hour / interior lighting).
 fn apply_temperature(color: vec3<f32>, temp: f32) -> vec3<f32> {
@@ -130,7 +146,7 @@ fn apply_contrast(color: vec3<f32>, con: f32) -> vec3<f32> {
     return (color - midpoint) * con + midpoint;
 }
 
-// Vibrance — selective saturation.
+// Vibrance â€” selective saturation.
 // Boosts less-saturated colours more than already-saturated ones,
 // preventing skin tones from going neon while making muted colours pop.
 fn apply_vibrance(color: vec3<f32>, vib: f32) -> vec3<f32> {
@@ -145,7 +161,7 @@ fn apply_vibrance(color: vec3<f32>, vib: f32) -> vec3<f32> {
     return color + sat_color * boost;
 }
 
-// Simple film grain from UV + time — adds subtle texture and masks
+// Simple film grain from UV + time â€” adds subtle texture and masks
 // colour banding in smooth gradients.
 fn hash21(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
@@ -157,41 +173,41 @@ fn hash21(p: vec2<f32>) -> f32 {
 fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
     var color = textureSample(t_src, s_src, in.uv).rgb;
 
-    // 1) Exposure — scale HDR brightness before tone mapping.
+    // 1) Exposure â€” scale HDR brightness before tone mapping.
     color *= exp(tonemap.exposure);
 
-    // 2) Temperature — subtle colour temperature shift.
+    // 2) Temperature â€” subtle colour temperature shift.
     color = apply_temperature(color, tonemap.temperature);
 
-    // 3) ACES tone mapping — HDR → LDR with cinematic roll-off.
+    // 3) ACES tone mapping â€” HDR â†’ LDR with cinematic roll-off.
     color = aces_film(color);
 
-    // 4) Contrast — applied after tone mapping in LDR space.
+    // 4) Contrast â€” applied after tone mapping in LDR space.
     let contrast_val = mix(1.0, 1.0 + tonemap.contrast, step(0.001, abs(tonemap.contrast)));
     color = apply_contrast(color, contrast_val);
 
-    // 5) Saturation — global saturation.
+    // 5) Saturation â€” global saturation.
     let sat_val = 1.0 + tonemap.saturation;
     color = apply_saturation(color, sat_val);
 
-    // 6) Vibrance — selective saturation for already-muted colours.
+    // 6) Vibrance â€” selective saturation for already-muted colours.
     color = apply_vibrance(color, tonemap.vibrance * 0.5);
 
-    // 7) Film grain — subtle dithering to mask banding.
+    // 7) Film grain â€” subtle dithering to mask banding.
     if (tonemap.grain > 0.001) {
         let grain_noise = hash21(in.uv * 1000.0) * 2.0 - 1.0;
         color += grain_noise * tonemap.grain * 0.03;
     }
 
-    // 8) Gamma correction — linear → sRGB for display.
+    // 8) Gamma correction â€” linear â†’ sRGB for display.
     color = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
     return vec4<f32>(color, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Heat Distortion (fire / lava shimmer)
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Screen-space UV distortion driven by a distortion texture rendered during
 // the transparent pass.  Fire and lava entities write their screen-space UV
 // and intensity into this texture; this pass warps the scene behind them.
@@ -203,7 +219,7 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
 @group(1) @binding(1) var s_distortion: sampler;
 
 struct HeatDistortionUniforms {
-    strength:   f32,   // overall distortion magnitude (0.002–0.01 typical)
+    strength:   f32,   // overall distortion magnitude (0.002â€“0.01 typical)
     time:       f32,   // elapsed time for animated noise
     noise_scale: f32,  // frequency of the distortion noise
     _pad:       f32,
@@ -231,9 +247,9 @@ fn fs_heat_distortion(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(t_src, s_src, in.uv + offset);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Screen-Space Reflections (SSR)
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Hierarchical-Z ray marching in screen space.
 // For each pixel:
 //   1. Reconstruct view-space position from depth buffer.
@@ -242,7 +258,7 @@ fn fs_heat_distortion(in: VsOut) -> @location(0) vec4<f32> {
 //   4. On hit, sample scene colour at the hit UV and blend via Fresnel.
 //   5. Fade reflections near screen edges to prevent hard borders.
 //
-// ── Bindings ────────────────────────────────────────────────────────────────
+// â”€â”€ Bindings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Group(0) reuse: t_src = scene colour, s_src = sampler.
 // Group(1) SSR:
 @group(1) @binding(0) var t_normals:   texture_2d<f32>;
@@ -278,12 +294,12 @@ fn ssr_project_to_uv(pos: vec3<f32>) -> vec2<f32> {
 fn fs_ssr(in: VsOut) -> @location(0) vec4<f32> {
     let scene_color = textureSample(t_src, s_src, in.uv).rgb;
     let normal_encoded = textureSample(t_normals, s_ssr, in.uv).rgb;
-    let depth = textureSampleDepth(t_depth, s_ssr, in.uv);
+    let depth = textureSample(t_depth, s_ssr, in.uv);
 
-    // Decode normals from [0,1] → [-1,1].
+    // Decode normals from [0,1] â†’ [-1,1].
     let N = normalize(normal_encoded * 2.0 - vec3<f32>(1.0));
 
-    // Sky pixels (depth ≈ 1.0) skip SSR.
+    // Sky pixels (depth â‰ˆ 1.0) skip SSR.
     if (depth >= 0.9999) {
         return vec4<f32>(scene_color, 1.0);
     }
@@ -300,7 +316,7 @@ fn fs_ssr(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(scene_color, 1.0);
     }
 
-    // ── Hi-Z screen-space ray marching ────────────────────────────────────
+    // â”€â”€ Hi-Z screen-space ray marching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let step_size = ssr.max_distance / f32(ssr.max_steps);
     var ray_pos = view_pos;
     var hit_uv = vec2<f32>(0.0);
@@ -312,19 +328,19 @@ fn fs_ssr(in: VsOut) -> @location(0) vec4<f32> {
         // Project ray position to screen UV via VP matrix.
         let ray_uv = ssr_project_to_uv(ray_pos);
 
-        // Out of screen → stop.
+        // Out of screen â†’ stop.
         if (ray_uv.x < 0.0 || ray_uv.x > 1.0 || ray_uv.y < 0.0 || ray_uv.y > 1.0) {
             break;
         }
 
         // Sample depth buffer at the ray's screen position.
-        let sample_depth = textureSampleDepth(t_depth, s_ssr, ray_uv);
+        let sample_depth = textureSample(t_depth, s_ssr, ray_uv);
 
         // Reconstruct the surface's view-space position at this UV.
         let sample_view = ssr_reconstruct_view_pos(ray_uv, sample_depth);
 
         // Ray z is more negative (further from camera) as it marches forward.
-        // If ray is behind the surface (ray_z > surface_z) but within thickness → hit.
+        // If ray is behind the surface (ray_z > surface_z) but within thickness â†’ hit.
         let depth_diff = ray_pos.z - sample_view.z;
 
         if (depth_diff > 0.0 && depth_diff < ssr.thickness) {
@@ -338,7 +354,7 @@ fn fs_ssr(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(scene_color, 1.0);
     }
 
-    // ── Blend reflection ──────────────────────────────────────────────────
+    // â”€â”€ Blend reflection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let reflection = textureSample(t_src, s_src, hit_uv).rgb;
 
     // Fresnel: more reflection at grazing angles.
@@ -355,15 +371,15 @@ fn fs_ssr(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(final_color, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Temporal Anti-Aliasing (TAA)
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Exponential moving average with motion-based history rejection.
 // Reprojects the previous frame using per-pixel velocity, clamps the
-// history sample to a 3×3 colour bounding box of the current frame
+// history sample to a 3Ã—3 colour bounding box of the current frame
 // to prevent ghosting, and blends based on pixel motion.
 //
-// ── Bindings ────────────────────────────────────────────────────────────────
+// â”€â”€ Bindings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Group(0) reuse: t_src = current scene colour, s_src = sampler.
 // Group(1) TAA:
 struct TaaUniforms {
@@ -391,7 +407,7 @@ fn fs_taa(in: VsOut) -> @location(0) vec4<f32> {
     // Sample history at the reprojected position.
     let history = textureSample(t_history, s_hist, history_uv);
 
-    // ── 3×3 colour bounding box (current frame neighbourhood) ────────────
+    // â”€â”€ 3Ã—3 colour bounding box (current frame neighbourhood) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let tex_size = vec2<f32>(textureDimensions(t_src, 0));
     let px = vec2<f32>(1.0 / tex_size.x, 1.0 / tex_size.y);
 
@@ -418,13 +434,13 @@ fn fs_taa(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(result, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Per-Object Motion Blur
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Reads per-pixel velocity and scatters along the motion vector with
-// linear weighting. Very distant objects (depth ≈ far plane) skip blur.
+// linear weighting. Very distant objects (depth â‰ˆ far plane) skip blur.
 //
-// ── Bindings ────────────────────────────────────────────────────────────────
+// â”€â”€ Bindings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Group(0) reuse: t_src = scene colour, s_src = sampler.
 // Group(1) Motion Blur:
 struct MotionBlurUniforms {
@@ -440,7 +456,7 @@ struct MotionBlurUniforms {
 @fragment
 fn fs_motion_blur(in: VsOut) -> @location(0) vec4<f32> {
     let velocity = textureSample(t_mb_velocity, s_mb, in.uv).rg;
-    let depth = textureSampleDepth(t_mb_depth, s_mb, in.uv);
+    let depth = textureSample(t_mb_depth, s_mb, in.uv);
 
     // Skip blur for very distant objects (sky / far plane).
     if (depth > 0.99) {
@@ -472,14 +488,14 @@ fn fs_motion_blur(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(color / total_weight, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Depth of Field (Circle of Confusion)
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Computes a per-pixel circle of confusion from the depth buffer, then
 // samples a 13-tap Poisson disc kernel weighted by CoC radius.
 // Pixels closer than the focal plane (foreground) blur toward background.
 //
-// ── Bindings ────────────────────────────────────────────────────────────────
+// â”€â”€ Bindings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Group(0) reuse: t_src = scene colour, s_src = sampler.
 // Group(1) DOF:
 struct DofUniforms {
@@ -511,7 +527,7 @@ const DOF_TAPS: array<vec2<f32>, 13> = array<vec2<f32>, 13>(
 
 @fragment
 fn fs_dof(in: VsOut) -> @location(0) vec4<f32> {
-    let depth = textureSampleDepth(t_dof_depth, s_dof, in.uv);
+    let depth = textureSample(t_dof_depth, s_dof, in.uv);
 
     // Circle of confusion.
     let coc = abs(depth - dof.focus_distance) * dof.aperture
@@ -542,9 +558,9 @@ fn fs_dof(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(color / total_weight, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Bilateral Blur (edge-preserving blur for SSR denoising)
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Separable Gaussian blur weighted by depth and normal similarity.
 // Smooths reflections within surfaces but preserves edges at depth/normal
 // discontinuities. Essential for clean SSR without excessive ray march steps.
@@ -570,7 +586,7 @@ fn fs_bilateral_h(in: VsOut) -> @location(0) vec4<f32> {
     let px = vec2<f32>(1.0 / tex_size.x, 0.0);
 
     let center_color = textureSample(t_src, s_src, in.uv).rgb;
-    let center_depth = textureSampleDepth(t_bilateral_depth, s_bilateral, in.uv);
+    let center_depth = textureSample(t_bilateral_depth, s_bilateral, in.uv);
     let center_norm  = textureSample(t_bilateral_normals, s_bilateral, in.uv).rgb;
 
     var total_color = center_color;
@@ -585,7 +601,7 @@ fn fs_bilateral_h(in: VsOut) -> @location(0) vec4<f32> {
         let sample_uv = in.uv + offset;
 
         let sample_color = textureSample(t_src, s_src, sample_uv).rgb;
-        let sample_depth = textureSampleDepth(t_bilateral_depth, s_bilateral, sample_uv);
+        let sample_depth = textureSample(t_bilateral_depth, s_bilateral, sample_uv);
         let sample_norm  = textureSample(t_bilateral_normals, s_bilateral, sample_uv).rgb;
 
         // Spatial weight: Gaussian falloff with distance.
@@ -613,7 +629,7 @@ fn fs_bilateral_v(in: VsOut) -> @location(0) vec4<f32> {
     let px = vec2<f32>(0.0, 1.0 / tex_size.y);
 
     let center_color = textureSample(t_src, s_src, in.uv).rgb;
-    let center_depth = textureSampleDepth(t_bilateral_depth, s_bilateral, in.uv);
+    let center_depth = textureSample(t_bilateral_depth, s_bilateral, in.uv);
     let center_norm  = textureSample(t_bilateral_normals, s_bilateral, in.uv).rgb;
 
     var total_color = center_color;
@@ -628,7 +644,7 @@ fn fs_bilateral_v(in: VsOut) -> @location(0) vec4<f32> {
         let sample_uv = in.uv + offset;
 
         let sample_color = textureSample(t_src, s_src, sample_uv).rgb;
-        let sample_depth = textureSampleDepth(t_bilateral_depth, s_bilateral, sample_uv);
+        let sample_depth = textureSample(t_bilateral_depth, s_bilateral, sample_uv);
         let sample_norm  = textureSample(t_bilateral_normals, s_bilateral, sample_uv).rgb;
 
         let spatial_w = exp(-0.5 * f32(i * i) / (bilateral.blur_radius * bilateral.blur_radius * 0.25));
@@ -645,14 +661,14 @@ fn fs_bilateral_v(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(total_color / total_weight, 1.0);
 }
 
-// ── Screen-space god rays ────────────────────────────────────────────────
+// â”€â”€ Screen-space god rays â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Radial blur from the sun's projected screen position.
 // Depth-masked: rays are blocked by geometry (simulates shafts through
 // trees, buildings, and terrain).
 //
 // Algorithm:
 //   1. For each pixel, march toward the sun in screen space.
-//   2. At each sample, check depth — if sample is behind geometry, it's
+//   2. At each sample, check depth â€” if sample is behind geometry, it's
 //      occluded and doesn't contribute to rays.
 //   3. Accumulate scene colour weighted by density and decay.
 //   4. Add the result to the scene (additive blend).
@@ -685,7 +701,7 @@ fn fs_god_rays(in: VsOut) -> @location(0) vec4<f32> {
     let px = 1.0 / screen_size;
 
     // Current pixel depth (linear, from depth buffer).
-    let center_depth = textureSampleDepth(t_godray_depth, s_godray, in.uv);
+    let center_depth = textureSample(t_godray_depth, s_godray, in.uv);
 
     // Ray-march accumulation.
     var illumination_decay = 1.0;
@@ -706,10 +722,10 @@ fn fs_god_rays(in: VsOut) -> @location(0) vec4<f32> {
 
         // Depth test: only accumulate if the sample is in front of geometry
         // (i.e., the ray is not occluded at this point).
-        let sample_depth = textureSampleDepth(t_godray_depth, s_godray, sample_uv);
+        let sample_depth = textureSample(t_godray_depth, s_godray, sample_uv);
 
         // If the sample depth is farther than center_depth, this sample is
-        // "behind" the geometry from the camera's perspective — occluded.
+        // "behind" the geometry from the camera's perspective â€” occluded.
         // We allow a small bias to avoid self-occlusion at edges.
         let occlusion = step(center_depth * 0.998, sample_depth);
 
@@ -728,9 +744,9 @@ fn fs_god_rays(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(result, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Underwater Post-Processing
-// ═══════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Applied when the camera is below the waterline.
 // Effects:
 //   - Depth-based fog tint (darker blue-green with distance)
@@ -753,7 +769,7 @@ struct UnderwaterUniforms {
 @group(1) @binding(1) var s_uw:       sampler;
 @group(1) @binding(2) var<uniform> uw: UnderwaterUniforms;
 
-// Procedural caustic pattern — Voronoi-based for realistic light caustics.
+// Procedural caustic pattern â€” Voronoi-based for realistic light caustics.
 fn caustic_voronoi(uv: vec2<f32>, time: f32) -> f32 {
     let cell = floor(uv);
     let frac = fract(uv);
@@ -779,15 +795,15 @@ fn caustic_voronoi(uv: vec2<f32>, time: f32) -> f32 {
 @fragment
 fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
     var color = textureSample(t_src, s_src, in.uv).rgb;
-    let depth = textureSampleDepth(t_uw_depth, s_uw, in.uv);
+    let depth = textureSample(t_uw_depth, s_uw, in.uv);
 
-    // ── Depth-based fog tint ──────────────────────────────────────────────
+    // â”€â”€ Depth-based fog tint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Exponential fog: objects farther from camera fade into the tint color.
     let linear_depth = depth * uw.camera_params.w;
     let fog_factor = 1.0 - exp(-linear_depth * uw.tint.a);
     color = mix(color, uw.tint.rgb, clamp(fog_factor, 0.0, 0.85));
 
-    // ── Caustic light patterns ────────────────────────────────────────────
+    // â”€â”€ Caustic light patterns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Two layers of Voronoi caustics at different scales/speeds projected
     // onto the scene from above, giving realistic underwater light ripples.
     if (uw.caustics.x > 0.001) {
@@ -797,7 +813,7 @@ fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
         let caustic_1 = caustic_voronoi(uv_world + vec2<f32>(t * 0.1, t * 0.07), t * uw.caustics.z);
         let caustic_2 = caustic_voronoi(uv_world * 1.4 + vec2<f32>(-t * 0.08, t * 0.12), t * uw.caustics.z * 0.7);
         let caustic_combined = (caustic_1 + caustic_2) * 0.5;
-        // Sharp caustic lines — darken valleys, brighten peaks.
+        // Sharp caustic lines â€” darken valleys, brighten peaks.
         let caustic_mask = pow(1.0 - caustic_combined, 3.0) * uw.caustics.x;
         // Caustics fade with depth (less light at depth).
         let caustic_fade = exp(-linear_depth * 0.05);
@@ -805,7 +821,7 @@ fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
         color += caustic_color;
     }
 
-    // ── God rays from water surface ───────────────────────────────────────
+    // â”€â”€ God rays from water surface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Simple vertical gradient: brighter toward the surface.
     if (uw.caustics.w > 0.001) {
         let surface_fade = 1.0 - clamp(in.uv.y * 2.0, 0.0, 1.0);
@@ -813,7 +829,7 @@ fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
         color += vec3<f32>(0.2, 0.4, 0.5) * ray_contribution;
     }
 
-    // ── Chromatic aberration / distortion ─────────────────────────────────
+    // â”€â”€ Chromatic aberration / distortion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (uw.distortion.x > 0.001) {
         let t = uw.distortion.y;
         let strength = uw.distortion.x;
@@ -829,14 +845,14 @@ fn fs_underwater(in: VsOut) -> @location(0) vec4<f32> {
         color = mix(color, uw.tint.rgb, clamp(fog_factor, 0.0, 0.85));
     }
 
-    // ── Vignette ──────────────────────────────────────────────────────────
+    // â”€â”€ Vignette â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (uw.distortion.z > 0.001) {
         let vig_uv = in.uv * 2.0 - 1.0;
         let vig = 1.0 - dot(vig_uv, vig_uv) * uw.distortion.z * 0.5;
         color *= clamp(vig, 0.0, 1.0);
     }
 
-    // ── Bloom boost ───────────────────────────────────────────────────────
+    // â”€â”€ Bloom boost â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (uw.distortion.w > 0.001) {
         let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
         color += color * luma * uw.distortion.w * 0.3;

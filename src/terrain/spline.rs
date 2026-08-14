@@ -827,7 +827,7 @@ mod tests {
 
         // The spline runs along z=10 from x=0 to x=300
         // Cell at (col=5, row=1) => world (55, 15), distance ~5 from spline center at z=10
-        let on_path_idx = 1 * width + 5;
+        let on_path_idx = width + 5;
         let on_path_height = heights[on_path_idx];
         assert!(
             on_path_height < 9.9,
@@ -843,7 +843,7 @@ mod tests {
 
         // Check a point that should be unaffected (far from the path)
         // Cell at (col=0, row=31) => world (5, 315) which is far from spline
-        let off_path_idx = 31 * width + 0;
+        let off_path_idx = 31 * width;
         let off_path_height = heights[off_path_idx];
         assert!(
             (off_path_height - 10.0).abs() < 0.01,

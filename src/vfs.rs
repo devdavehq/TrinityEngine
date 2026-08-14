@@ -18,6 +18,9 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Packed-archive backend (.pak files).
+pub mod pak;
+
 /// Metadata about a filesystem entry returned by `read_dir`.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -352,6 +355,94 @@ pub fn global() -> &'static dyn Vfs {
     GLOBAL_VFS
         .get_or_init(|| Arc::new(OsFileSystem))
         .as_ref()
+}
+
+// ── PakFirstVfs (packed content with disk fallback) ───────────────────────────
+// For a shipped game: reads come from the .pak first; anything not packed
+// falls through to the real filesystem (useful while iterating). Dir listings
+// are merged so scenes/materials inside an archive still appear in the editor.
+
+/// Read-through overlay: `.pak` archive wins, real disk is the fallback.
+pub struct PakFirstVfs {
+    pak: Arc<pak::PakFile>,
+}
+
+impl PakFirstVfs {
+    pub fn new(pak: pak::PakFile) -> Self {
+        Self { pak: Arc::new(pak) }
+    }
+
+    pub fn pak(&self) -> &pak::PakFile {
+        &self.pak
+    }
+}
+
+impl Vfs for PakFirstVfs {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if self.pak.exists(path) {
+            self.pak.read(path)
+        } else {
+            OsFileSystem.read(path)
+        }
+    }
+
+    fn read_to_string(&self, path: &str) -> std::io::Result<String> {
+        if self.pak.exists(path) {
+            self.pak.read_to_string(path)
+        } else {
+            OsFileSystem.read_to_string(path)
+        }
+    }
+
+    // Writes always go to disk — paks are read-only by design.
+    fn write(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        OsFileSystem.write(path, data)
+    }
+
+    fn write_string(&self, path: &str, data: &str) -> std::io::Result<()> {
+        OsFileSystem.write_string(path, data)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.pak.exists(path) || OsFileSystem.exists(path)
+    }
+
+    fn read_dir(&self, path: &str) -> std::io::Result<Vec<DirEntry>> {
+        let pak_entries = self.pak.read_dir(path).unwrap_or_default();
+        let os_entries = OsFileSystem.read_dir(path).unwrap_or_default();
+        // Merge on entry name; pak entries win (they are authoritative).
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for e in pak_entries {
+            if seen.insert(e.name.clone()) {
+                merged.push(e);
+            }
+        }
+        for e in os_entries {
+            if seen.insert(e.name.clone()) {
+                merged.push(e);
+            }
+        }
+        merged.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(merged)
+    }
+
+    fn walk_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
+        let pak_files = self.pak.walk_dir(path).unwrap_or_default();
+        let os_files = OsFileSystem.walk_dir(path).unwrap_or_default();
+        let mut merged: Vec<String> = pak_files;
+        let mut seen: std::collections::HashSet<String> = merged.iter().cloned().collect();
+        for f in os_files {
+            if seen.insert(f.clone()) {
+                merged.push(f);
+            }
+        }
+        Ok(merged)
+    }
 }
 
 // ── Convenience free functions (use the global VFS) ──────────────────────────

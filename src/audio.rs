@@ -10,9 +10,9 @@
 //
 // Integration with the rest of the engine:
 //   - main.rs creates AudioSystem at startup
-//   - EventBus dispatches PlaySoundEvent, PlayMusicEvent, StopAudioEvent
-//   - AudioSystem polls the EventBus each frame and plays/stops sounds
-//   - Future: 3D positional audio via listener position + entity positions
+//   - main.rs syncs the 3D listener from the camera each frame and drives the
+//     weather ambient bed (`set_weather_ambience`) from the current condition
+//   - Lua scripts call the audio_* globals (sfx, music, ambient, 3D, pitch)
 //
 // ── Usage from Lua scripts ───────────────────────────────────────────────────
 //   audio_play_sfx("Content/Audio/door_open.wav")
@@ -76,11 +76,72 @@ pub struct SoundHandle {
     channel: Channel,
 }
 
+impl SoundHandle {
+    /// Rebuild a handle from a raw id (for cross-api reuse like Lua).
+    pub fn from_id(id: u64, channel: Channel) -> Self {
+        Self { id, channel }
+    }
+
+    /// Numeric id backing this handle.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 // ── Sound entry (internal) ───────────────────────────────────────────────────
+/// Internal playback state for a single playing sound.
+///
+/// Two flavors:
+///  - `Sink` — plain playback (no spatialization).
+///  - `Spatial` — wrapped in a rodio `SpatialSink`: emitter + left/right ear
+///    positions, giving true per-ear panning and distance falloff.
+enum Playback {
+    Regular(rodio::Sink),
+    Spatial {
+        sink: rodio::SpatialSink,
+        /// World position the emitter currently sits at (refreshed per frame).
+        position: [f32; 3],
+        /// Static position or move-with-entity.
+        min_distance: f32,
+        max_distance: f32,
+    },
+}
+
 struct SoundEntry {
     id: u64,
     channel: Channel,
-    sink: rodio::Sink,
+    /// Base per-sound volume multiplier before channel/master are applied.
+    base_volume: f32,
+    /// Playback speed / pitch multiplier (1.0 = natural speed).
+    speed: f32,
+    playback: Playback,
+}
+
+impl SoundEntry {
+    fn is_playing(&self) -> bool {
+        match &self.playback {
+            Playback::Regular(s) => !s.empty(),
+            Playback::Spatial { sink, .. } => !sink.empty(),
+        }
+    }
+    fn stop(&self) {
+        match &self.playback {
+            Playback::Regular(s) => s.stop(),
+            Playback::Spatial { sink, .. } => sink.stop(),
+        }
+    }
+    fn set_volume(&self, vol: f32) {
+        match &self.playback {
+            Playback::Regular(s) => s.set_volume(vol),
+            Playback::Spatial { sink, .. } => sink.set_volume(vol),
+        }
+    }
+    fn set_speed(&self, speed: f32) {
+        match &self.playback {
+            Playback::Regular(s) => s.set_speed(speed),
+            Playback::Spatial { sink, .. } => sink.set_speed(speed),
+        }
+    }
 }
 
 // ── AudioSystem ──────────────────────────────────────────────────────────────
@@ -109,6 +170,10 @@ pub struct AudioSystem {
     listener_up: [f32; 3],
     /// Spatial audio enabled flag.
     spatial_enabled: bool,
+    /// Tag of the currently active weather ambient bed (empty = none).
+    ambient_bed_tag: String,
+    /// Handle of the currently playing ambient bed loop (if any).
+    ambient_bed: Option<SoundHandle>,
 }
 
 impl AudioSystem {
@@ -138,6 +203,8 @@ impl AudioSystem {
             listener_forward: [0.0, 0.0, -1.0],
             listener_up: [0.0, 1.0, 0.0],
             spatial_enabled: true,
+            ambient_bed_tag: String::new(),
+            ambient_bed: None,
         })
     }
 
@@ -163,16 +230,130 @@ impl AudioSystem {
             sink.append(source);
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
-
-        self.sounds.insert(id, SoundEntry {
+        let id = self.alloc_id();
+        self.sounds.insert(
             id,
-            channel: Channel::Sfx,
-            sink,
-        });
+            SoundEntry {
+                id,
+                channel: Channel::Sfx,
+                base_volume: volume,
+                speed: 1.0,
+                playback: Playback::Regular(sink),
+            },
+        );
 
         Some(SoundHandle { id, channel: Channel::Sfx })
+    }
+
+    /// Play a sound effect at a world position, fully spatialized.
+    ///
+    /// Stereo pan + distance falloff are computed from the active listener
+    /// every frame (see `update()`). Use for footsteps, gunshots, pickups etc.
+    ///
+    /// - `path`: File path to an audio file.
+    /// - `pos`: World position of the emitter.
+    /// - `volume`: Base volume multiplier before attenuation.
+    /// - `looping`: Whether to loop.
+    /// - `min_distance` / `max_distance`: volume floor at min, cut-off at max.
+    pub fn play_at(
+        &mut self,
+        path: &str,
+        pos: [f32; 3],
+        volume: f32,
+        looping: bool,
+        min_distance: f32,
+        max_distance: f32,
+    ) -> Option<SoundHandle> {
+        if !self.spatial_enabled {
+            return self.play_sfx(path, volume, looping);
+        }
+        let sink =
+            rodio::SpatialSink::try_new(&self.stream_handle, pos, self.listener_position, self.listener_position)
+                .ok()?;
+        let effective_vol = self.volume.effective(Channel::Sfx) * volume;
+        sink.set_volume(effective_vol);
+
+        let source = Self::decode_file(path)?;
+        if looping {
+            sink.append(source.repeat_infinite());
+        } else {
+            sink.append(source);
+        }
+
+        let id = self.alloc_id();
+        self.sounds.insert(
+            id,
+            SoundEntry {
+                id,
+                channel: Channel::Sfx,
+                base_volume: volume,
+                speed: 1.0,
+                playback: Playback::Spatial {
+                    sink,
+                    position: pos,
+                    min_distance,
+                    max_distance,
+                },
+            },
+        );
+
+        Some(SoundHandle { id, channel: Channel::Sfx })
+    }
+
+    /// Move a live spatial sound's emitter to a new world position.
+    pub fn move_sound_to(&mut self, handle: &SoundHandle, pos: [f32; 3]) {
+        if let Some(entry) = self.sounds.get_mut(&handle.id) {
+            if let Playback::Spatial { sink, position, .. } = &mut entry.playback {
+                sink.set_emitter_position(pos);
+                *position = pos;
+            }
+        }
+    }
+
+    /// Set the playback speed / pitch of a live sound (1.0 = natural speed).
+    ///
+    /// Values above 1.0 pitch up and shorten the sound; below 1.0 pitch it
+    /// down. Works on regular, spatial and ambient sounds.
+    pub fn set_sound_pitch(&mut self, handle: &SoundHandle, pitch: f32) {
+        let pitch = pitch.max(0.05);
+        if let Some(entry) = self.sounds.get(&handle.id) {
+            if (entry.speed - pitch).abs() > 0.001 {
+                entry.set_speed(pitch);
+                if let Some(e) = self.sounds.get_mut(&handle.id) {
+                    e.speed = pitch;
+                }
+            }
+        }
+    }
+
+    /// Query the current pitch/speed of a live sound (1.0 if not found).
+    pub fn sound_pitch(&self, handle: &SoundHandle) -> f32 {
+        self.sounds.get(&handle.id).map(|e| e.speed).unwrap_or(1.0)
+    }
+
+    /// Set the per-sound base volume of a live sound before channel/master
+    /// attenuation is applied (0.0 = silent, 1.0 = full).
+    pub fn set_sound_volume(&mut self, handle: &SoundHandle, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        if let Some(entry) = self.sounds.get_mut(&handle.id) {
+            entry.base_volume = volume;
+        }
+        if let Some(entry) = self.sounds.get(&handle.id) {
+            self.apply_volume(entry);
+        }
+    }
+
+    /// Internal: re-apply channel/master attenuation + spatial falloff to a
+    /// single live sound entry after its base volume changed.
+    fn apply_volume(&self, entry: &SoundEntry) {
+        let vol = self.volume.effective(entry.channel) * entry.base_volume;
+        match &entry.playback {
+            Playback::Regular(s) => s.set_volume(vol),
+            Playback::Spatial { sink, position, min_distance, max_distance } => {
+                let atten = self.attenuation(*position, *min_distance, *max_distance);
+                sink.set_volume((vol * atten).max(0.001));
+            }
+        }
     }
 
     /// Play procedural thunder sound (layered rumble with crack and rumble layers).
@@ -195,12 +376,13 @@ impl AudioSystem {
         for path in &thunder_paths {
             if let Some(source) = Self::decode_file(path) {
                 sink.append(source);
-                let id = self.next_id;
-                self.next_id += 1;
+                let id = self.alloc_id();
                 self.sounds.insert(id, SoundEntry {
                     id,
                     channel: Channel::Sfx,
-                    sink,
+                    base_volume: volume,
+                    speed: 1.0,
+                    playback: Playback::Regular(sink),
                 });
                 return Some(SoundHandle { id, channel: Channel::Sfx });
             }
@@ -233,12 +415,13 @@ impl AudioSystem {
 
         sink.append(layered);
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.alloc_id();
         self.sounds.insert(id, SoundEntry {
             id,
             channel: Channel::Sfx,
-            sink,
+            base_volume: volume,
+            speed: 1.0,
+            playback: Playback::Regular(sink),
         });
 
         Some(SoundHandle { id, channel: Channel::Sfx })
@@ -271,18 +454,82 @@ impl AudioSystem {
             sink.append(source);
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.alloc_id();
 
         self.music_sink = Some(sink);
 
         Some(SoundHandle { id, channel: Channel::Music })
     }
 
+    /// Play an ambient sound on the `Ambient` volume channel.
+    ///
+    /// Ambient sounds are long looping beds (wind, rain, city hum). They sit on
+    /// their own volume knob (`volume.ambient`) so players can balance ambience
+    /// against SFX and music independently. Returns a handle usable with
+    /// `stop()` / `set_sound_pitch()` / `move_sound_to()`.
+    pub fn play_ambient(
+        &mut self,
+        path: &str,
+        volume: f32,
+    ) -> Option<SoundHandle> {
+        self.play_ambient_at(path, [0.0, 0.0, 0.0], volume, false)
+    }
+
+    /// Play an ambient sound at a world position (looping) on the Ambient
+    /// channel. When `spatial=true` the sound uses 3D attenuation (e.g. a
+    /// waterfall bed); otherwise it is a non-positional bed.
+    pub fn play_ambient_at(
+        &mut self,
+        path: &str,
+        pos: [f32; 3],
+        volume: f32,
+        spatial: bool,
+    ) -> Option<SoundHandle> {
+        let effective_vol = self.volume.effective(Channel::Ambient) * volume;
+        let source = Self::decode_file(path)?;
+
+        let id = self.alloc_id();
+        let playback = if spatial && self.spatial_enabled {
+            let sink = rodio::SpatialSink::try_new(
+                &self.stream_handle,
+                pos,
+                self.listener_position,
+                self.listener_position,
+            )
+            .ok()?;
+            sink.set_volume(effective_vol);
+            sink.append(source.repeat_infinite());
+            Playback::Spatial {
+                sink,
+                position: pos,
+                min_distance: 1.0,
+                max_distance: 60.0,
+            }
+        } else {
+            let sink = rodio::Sink::try_new(&self.stream_handle).ok()?;
+            sink.set_volume(effective_vol);
+            sink.append(source.repeat_infinite());
+            Playback::Regular(sink)
+        };
+
+        self.sounds.insert(
+            id,
+            SoundEntry {
+                id,
+                channel: Channel::Ambient,
+                base_volume: volume,
+                speed: 1.0,
+                playback,
+            },
+        );
+
+        Some(SoundHandle { id, channel: Channel::Ambient })
+    }
+
     /// Stop a specific sound by handle.
     pub fn stop(&mut self, handle: SoundHandle) {
         if let Some(entry) = self.sounds.remove(&handle.id) {
-            entry.sink.stop();
+            entry.stop();
         }
         if handle.channel == Channel::Music {
             if let Some(sink) = self.music_sink.take() {
@@ -302,7 +549,7 @@ impl AudioSystem {
             _ => {
                 self.sounds.retain(|_, entry| {
                     if entry.channel == channel {
-                        entry.sink.stop();
+                        entry.stop();
                         false
                     } else {
                         true
@@ -316,12 +563,47 @@ impl AudioSystem {
     pub fn stop_all(&mut self) {
         // Stop all SFX sounds.
         for (_, entry) in self.sounds.drain() {
-            entry.sink.stop();
+            entry.stop();
         }
         // Stop music.
         if let Some(sink) = self.music_sink.take() {
             sink.stop();
         }
+        self.ambient_bed = None;
+        self.ambient_bed_tag.clear();
+    }
+
+    /// Set the looping ambient bed for the current weather condition.
+    ///
+    /// `tag` is the `WeatherCondition::ambient_sound_tag()` string. The system
+    /// looks for `Content/Audio/{tag}.(ogg|wav|flac|mp3)` and, if it exists,
+    /// stops the previous bed and starts the new one on the Ambient channel in
+    /// a smooth loop. Passing a tag with no matching file keeps the current
+    /// bed (so a missing sound never kills other audio).
+    pub fn set_weather_ambience(&mut self, tag: &str, volume: f32) {
+        if tag == self.ambient_bed_tag {
+            return;
+        }
+        let Some(path) = Self::find_audio_file(tag) else {
+            return;
+        };
+        // Stop the old bed before swapping.
+        if let Some(old) = self.ambient_bed.take() {
+            self.stop(old);
+        }
+        if let Some(handle) = self.play_ambient(&path, volume.max(0.0).clamp(0.0, 1.0)) {
+            self.ambient_bed = Some(handle);
+            self.ambient_bed_tag = tag.to_string();
+        }
+    }
+
+    /// Stop the current weather ambient bed (keeps tag so it isn't restarted
+    /// until the weather actually changes).
+    pub fn stop_weather_ambience(&mut self) {
+        if let Some(old) = self.ambient_bed.take() {
+            self.stop(old);
+        }
+        self.ambient_bed_tag.clear();
     }
 
     /// Set the master volume. Affects all channels proportionally.
@@ -361,9 +643,65 @@ impl AudioSystem {
     }
 
     /// Update the audio system. Call once per frame.
-    /// Cleans up finished sounds.
+    /// Cleans up finished sounds and re-applies the live listener transform to
+    /// every spatialized sound so panning/distance track the camera.
     pub fn update(&mut self) {
-        self.sounds.retain(|_, entry| !entry.sink.empty());
+        self.refresh_listener_ears();
+        self.sounds.retain(|_, entry| entry.is_playing());
+    }
+
+    /// Re-apply the current listener transform to every spatial sound and
+    /// re-apply volume (so per-channel knobs affect live sounds immediately).
+    fn refresh_listener_ears(&mut self) {
+        let (left_ear, right_ear) = self.ear_positions();
+        for entry in self.sounds.values() {
+            if let Playback::Spatial { sink, position, min_distance, max_distance } = &entry.playback {
+                sink.set_emitter_position(*position);
+                sink.set_left_ear_position(left_ear);
+                sink.set_right_ear_position(right_ear);
+                let atten = self.attenuation(*position, *min_distance, *max_distance);
+                let vol = self.volume.effective(entry.channel) * entry.base_volume * atten;
+                sink.set_volume(vol.max(0.001));
+            } else if let Playback::Regular(sink) = &entry.playback {
+                sink.set_volume(self.volume.effective(entry.channel) * entry.base_volume);
+            }
+        }
+        // Music sink keeps following the music channel knob.
+        if let Some(sink) = &self.music_sink {
+            sink.set_volume(self.volume.effective(Channel::Music));
+        }
+    }
+
+    /// Listener "ears": one to the left, one to the right of the head, so the
+    /// per-ear distance deltas drive the stereo pan in rodio's Spatial source.
+    fn ear_positions(&self) -> ([f32; 3], [f32; 3]) {
+        let f = glam::Vec3::from(self.listener_forward).normalize_or(glam::Vec3::NEG_Z);
+        let up = glam::Vec3::from(self.listener_up).normalize_or(glam::Vec3::Y);
+        let right = f.cross(up).normalize_or(glam::Vec3::X);
+        const HEAD_RADIUS: f32 = 0.12;
+        let l = glam::Vec3::from(self.listener_position) - right * HEAD_RADIUS;
+        let r = glam::Vec3::from(self.listener_position) + right * HEAD_RADIUS;
+        (l.to_array(), r.to_array())
+    }
+
+    /// Distance falloff with per-sound min/max (matches `distance_attenuation`
+    /// but parameterized so every spatial sound has its own rolloff curve).
+    fn attenuation(&self, source_pos: [f32; 3], min_distance: f32, max_distance: f32) -> f32 {
+        if !self.spatial_enabled {
+            return 1.0;
+        }
+        let dx = source_pos[0] - self.listener_position[0];
+        let dy = source_pos[1] - self.listener_position[1];
+        let dz = source_pos[2] - self.listener_position[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= min_distance {
+            return 1.0;
+        }
+        if dist >= max_distance {
+            return 0.0;
+        }
+        let t = (dist - min_distance) / (max_distance - min_distance).max(1e-5);
+        1.0 - t * t
     }
 
     // ── 3D Spatial Audio ─────────────────────────────────────────────────────
@@ -434,16 +772,41 @@ impl AudioSystem {
 
     // ── Internal ────────────────────────────────────────────────────────────
 
-    /// Decode an audio file into a rodio Source.
-    fn decode_file(path: &str) -> Option<rodio::Decoder<std::io::BufReader<std::fs::File>>> {
-        let file = std::fs::File::open(path)
+    /// Allocate the next monotonically-increasing sound ID.
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// Resolve an audio file by "stem" name across the engine's audio data
+    /// directories and supported extensions. Returns the first path that
+    /// exists through the VFS (disk OR packed .pak).
+    fn find_audio_file(stem: &str) -> Option<String> {
+        let dirs = ["Content/Audio", "assets/audio", "audio"];
+        let exts = ["ogg", "wav", "flac", "mp3"];
+        for dir in dirs {
+            for ext in exts {
+                let path = format!("{}/{}.{}", dir, stem, ext);
+                if crate::vfs::exists(&path) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    /// Decode an audio file into a rodio Source. Reads through the VFS so
+    /// packed (`.pak`) builds serve their audio from the archive too.
+    fn decode_file(path: &str) -> Option<rodio::Decoder<std::io::Cursor<Vec<u8>>>> {
+        let bytes = crate::vfs::read(path)
             .map_err(|e| {
                 tracing::error!("[Audio] Cannot open {}: {}", path, e);
                 e
             })
             .ok()?;
 
-        rodio::Decoder::new(std::io::BufReader::new(file))
+        rodio::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(|e| {
                 tracing::error!("[Audio] Cannot decode {}: {}", path, e);
                 e

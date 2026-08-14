@@ -1,7 +1,15 @@
-// use winit::application::ApplicationHandler;
-// use winit::event::WindowEvent;
-// use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-// use winit::window::{Window, WindowId};
+//! TrinityEngine — game/engine crate.
+//!
+//! The binary (`Triengine`) is the editor+runtime. Pure-engine modules live
+//! here too so small tools (e.g. `src/bin/pack.rs`) can reuse them without
+//! pulling in the editor.
+
+/// Virtual file system (disk, memory, or packed .pak archives).
+pub mod vfs;
+
+/// Runtime hot reload for Rust game code (feature `hotreload`).
+#[cfg(feature = "hotreload")]
+pub mod hotreload;
 
 // pub struct EngineApp {
 //     window: Option<Window>,

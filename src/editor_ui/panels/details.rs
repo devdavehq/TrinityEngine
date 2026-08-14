@@ -120,12 +120,12 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         if ui.small_button("Expand All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script", "lighting"] {
                 set_section_open(ui, k, true);
             }
         }
         if ui.small_button("Collapse All").clicked() {
-            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script"] {
+            for k in ["render", "physics", "box_col", "obb_col", "hinge", "fixed", "spring", "rope", "material", "foliage", "terrain", "terrain_brush", "rotation", "sphere_col", "capsule_col", "char_ctrl", "health", "fire_surf", "fire_src", "water_surf", "water_body", "smart_foliage", "lava_surf", "weather", "wind", "point_light", "material_extras", "water_trig", "splash", "script", "lighting"] {
                 set_section_open(ui, k, false);
             }
         }
@@ -512,14 +512,13 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.label("Select a mesh entity.");
             return;
         };
+        let mut pending_apply: Option<(String, Result<(), String>)> = None;
         if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
             ui.label(RichText::new("Quick instances").small().strong());
             ui.horizontal_wrapped(|ui| {
                 for name in args.materials.instance_names() {
                     if ui.button(&name).clicked() {
-                        if let Err(e) = args.materials.apply_instance(&name, &mut rend) {
-                            args.error_log.push(format!("[Material] {}", e));
-                        }
+                        pending_apply = Some((name.clone(), args.materials.apply_instance(&name, &mut rend)));
                     }
                 }
             });
@@ -551,6 +550,13 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
                         &mt.metallic_roughness_path
                     }
                 ));
+            }
+        }
+        if let Some((name, res)) = pending_apply.take() {
+            if let Err(e) = res {
+                args.error_log.push(format!("[Material] {}", e));
+            } else if let Ok(extras) = args.materials.instance_extras(&name) {
+                let _ = args.world.insert(entity, (extras,));
             }
         }
     });
@@ -818,7 +824,7 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.add(egui::Slider::new(&mut cc.speed, 0.0..=30.0).text("Speed"));
             ui.add(egui::Slider::new(&mut cc.jump_force, 0.0..=30.0).text("Jump force"));
             ui.add(egui::Slider::new(&mut cc.ground_detect_dist, 0.01..=2.0).text("Ground detect dist"));
-            ui.add(egui::Slider::new(&mut cc.max_slope_angle, 0.0..=1.5708).text("Max slope angle (rad)"));
+            ui.add(egui::Slider::new(&mut cc.max_slope_angle, 0.0..=std::f32::consts::FRAC_PI_2).text("Max slope angle (rad)"));
             ui.add(egui::Slider::new(&mut cc.step_height, 0.0..=1.0).text("Step height"));
             ui.add(egui::Slider::new(&mut cc.skin_width, 0.001..=0.1).text("Skin width"));
             ui.add(egui::Slider::new(&mut cc.gravity_scale, 0.0..=3.0).text("Gravity scale"));
@@ -1207,6 +1213,35 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         }
     });
 
+    // ── Occluder ────────────────────────────────────────────────────
+    // Marks this entity as a large static volume that hides geometry behind
+    // it. Feeds the CPU occlusion culler so hidden meshes are never sent to
+    // the GPU. Radius is the occluding volume's radius in world units.
+    section_shell(ui, "occ", "Occluder", "occluder", false, |ui| {
+        let Some(entity) = args.selected_renderable.as_ref().copied() else {
+            ui.label("Nothing selected.");
+            return;
+        };
+        let mut remove_occ = false;
+        if let Ok(mut occ) = args.world.get::<&mut components::Occluder>(entity) {
+            ui.add(egui::Slider::new(&mut occ.radius, 0.5..=200.0).text("Occlusion radius"));
+            ui.label(
+                RichText::new("Large bodies (buildings, terrain walls) hide meshes behind them, \
+so far-away geometry inside the culled area is skipped.")
+                    .small()
+                    .color(Color32::from_rgb(141, 151, 165)),
+            );
+            if ui.button("Remove occluder").clicked() {
+                remove_occ = true;
+            }
+        } else if ui.button("Add occluder").clicked() {
+            let _ = args.world.insert(entity, (components::Occluder::default(),));
+        }
+        if remove_occ {
+            let _ = args.world.remove_one::<components::Occluder>(entity);
+        }
+    });
+
     // ── Script ──────────────────────────────────────────────────────
     section_shell(ui, "scr", "Script", "script", false, |ui| {
         let Some(entity) = args.selected_renderable.as_ref().copied() else {
@@ -1230,6 +1265,290 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
         }
         if remove_scr {
             let _ = args.world.remove_one::<components::Script>(entity);
+        }
+    });
+
+    // ── Lighting: baked light probes ──────────────────────────────────
+    // These little light-bulbs capture the "bounced" light of the scene.
+    // You place them, hit Bake Lighting, and the baked indirect light is
+    // saved next to the scene and re-loaded every time the level opens.
+    section_shell(ui, "LGT", "Light Probes (Baked GI)", "lighting", true, |ui| {
+        ui.label(
+            RichText::new("Bounced/indirect light. Place probes around rooms and \
+under trees, then press Bake Lighting.")
+                .small()
+                .color(Color32::from_rgb(141, 151, 165)),
+        );
+
+        let mut hidden = ui
+            .data_mut(|d| d.get_temp::<bool>("probes_hidden".into()))
+            .unwrap_or(false);
+        if ui.checkbox(&mut hidden, "Hide probes in viewport").changed() {
+            ui.data_mut(|d| d.insert_temp("probes_hidden".into(), hidden));
+            if hidden {
+                // Also drop the selection so no halo lingers after hiding.
+                ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Option::<usize>::None));
+            }
+        }
+        ui.label(
+            RichText::new("Hiding only stops them being drawn — they stay in the scene and still light it.")
+                .small()
+                .color(Color32::from_rgb(121, 131, 145)),
+        );
+
+        ui.horizontal(|ui| {
+            if ui.button("Add at Camera").clicked() {
+                let pos = args.camera.position();
+                args.renderer.light_probes.add_probe(pos, 12.0);
+                let idx = args.renderer.light_probes.probes.len() - 1;
+                ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Some(idx)));
+            }
+            if ui.button("Add at Selection").clicked() {
+                if let Some(e) = args.selected_renderable.as_ref().copied() {
+                    if let Ok(pos) = args.world.get::<&components::Position>(e) {
+                        args.renderer.light_probes
+                            .add_probe(glam::Vec3::new(pos.x, pos.y, pos.z), 12.0);
+                        let idx = args.renderer.light_probes.probes.len() - 1;
+                        ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Some(idx)));
+                    }
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui.button("Bake Lighting").clicked() {
+                *args.bake_requested = true;
+                args.error_log.push("[Lighting] Bake requested".to_string());
+            }
+            if ui.button("Clear All").clicked() {
+                args.renderer.light_probes.probes.clear();
+                args.renderer.light_probes.volumes.clear();
+                ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Option::<usize>::None));
+                ui.data_mut(|d| d.insert_temp("probe_group_set".into(), std::collections::HashSet::<usize>::new()));
+                ui.data_mut(|d| d.insert_temp("probes_hidden".into(), false));
+                args.error_log.push("[Lighting] Cleared all probes & volumes".to_string());
+            }
+        });
+
+        // ── Probe volumes (HFW-style box placement) ─────────────────────
+        ui.separator();
+        ui.label(
+            RichText::new("Probe Volumes")
+                .small()
+                .strong()
+                .color(Color32::from_rgb(168, 176, 188)),
+        );
+        ui.label(
+            RichText::new("Drop a box over a room — it fills itself with a probe grid.")
+                .small()
+                .color(Color32::from_rgb(121, 131, 145)),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Add Volume at Camera").clicked() {
+                let pos = args.camera.position();
+                let n = args.renderer.light_probes.add_volume(pos, glam::Vec3::splat(24.0), [3, 2, 3]);
+                args.error_log.push(format!("[Lighting] Added probe volume ({n} probes)"));
+            }
+            if ui.button("Repopulate All").clicked() {
+                let vols = args.renderer.light_probes.volumes.len();
+                for i in 0..vols {
+                    args.renderer.light_probes.repopulate_volume(i);
+                }
+                args.error_log.push("[Lighting] Repopulated volumes".to_string());
+            }
+        });
+        let mut remove_vol: Option<usize> = None;
+        let mut repop_vol: Option<usize> = None;
+        for v in 0..args.renderer.light_probes.volumes.len() {
+            let mut vol = args.renderer.light_probes.volumes[v];
+            egui::CollapsingHeader::new(format!("Volume {v}"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Center");
+                        ui.add(egui::DragValue::new(&mut vol.center.x).speed(0.1));
+                        ui.add(egui::DragValue::new(&mut vol.center.y).speed(0.1));
+                        ui.add(egui::DragValue::new(&mut vol.center.z).speed(0.1));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Size");
+                        ui.add(egui::DragValue::new(&mut vol.size.x).speed(0.1).range(1.0..=200.0));
+                        ui.add(egui::DragValue::new(&mut vol.size.y).speed(0.1).range(1.0..=200.0));
+                        ui.add(egui::DragValue::new(&mut vol.size.z).speed(0.1).range(1.0..=200.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Density");
+                        for (a, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.label(*axis);
+                            ui.add(egui::Slider::new(&mut vol.density[a], 1..=6));
+                        }
+                    });
+                    if ui.button("Apply / Repopulate this volume").clicked() {
+                        repop_vol = Some(v);
+                    }
+                    if ui.button("Remove volume").clicked() {
+                        remove_vol = Some(v);
+                    }
+                });
+            if v < args.renderer.light_probes.volumes.len() {
+                args.renderer.light_probes.volumes[v] = vol;
+            }
+        }
+        if let Some(v) = repop_vol {
+            args.renderer.light_probes.repopulate_volume(v);
+        }
+        if let Some(v) = remove_vol {
+            args.renderer.light_probes.remove_volume(v);
+            args.error_log.push("[Lighting] Removed volume".to_string());
+        }
+
+        ui.separator();
+
+        let probe_count = args.renderer.light_probes.probes.len();
+        ui.label(
+            RichText::new(format!("{} probe(s)", probe_count))
+                .small()
+                .strong()
+                .color(Color32::from_rgb(168, 176, 188)),
+        );
+
+        let mut selected = ui
+            .data_mut(|d| d.get_temp::<Option<usize>>("probe_selected_index".into()))
+            .flatten();
+        if selected.is_some() && selected.unwrap() >= probe_count {
+            selected = None;
+            ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Option::<usize>::None));
+        }
+
+        if probe_count > 0 {
+            let mut group_set: std::collections::HashSet<usize> = ui
+                .data_mut(|d| d.get_temp::<std::collections::HashSet<usize>>("probe_group_set".into()))
+                .unwrap_or_default();
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                for (i, probe) in args.renderer.light_probes.probes.iter().enumerate() {
+                    let mut in_set = group_set.contains(&i);
+                    let label = format!(
+                        "Probe {i}  ({:.1}, {:.1}, {:.1}){}",
+                        probe.position.x,
+                        probe.position.y,
+                        probe.position.z,
+                        if probe.group != 0 { format!("  [G{}]", probe.group) } else { String::new() }
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut in_set, "").changed() {
+                            if in_set {
+                                group_set.insert(i);
+                            } else {
+                                group_set.remove(&i);
+                            }
+                        }
+                        if ui
+                            .selectable_label(selected == Some(i), label)
+                            .clicked()
+                        {
+                            selected = Some(i);
+                            ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), selected));
+                        }
+                    });
+                }
+            });
+            ui.data_mut(|d| d.insert_temp("probe_group_set".into(), group_set.clone()));
+
+            // ── Group controls ────────────────────────────────────────────
+            let set: Vec<usize> = {
+                let s: std::collections::HashSet<usize> = ui
+                    .data(|d| d.get_temp::<std::collections::HashSet<usize>>("probe_group_set".into()))
+                    .unwrap_or_default();
+                let mut v: Vec<usize> = s.into_iter().collect();
+                v.sort_unstable();
+                v
+            };
+            ui.label(
+                RichText::new(format!("{} probe(s) checked for grouping", set.len()))
+                    .small()
+                    .color(Color32::from_rgb(121, 131, 145)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Group checked").clicked() {
+                    if !set.is_empty() {
+                        let gid = args.renderer.light_probes.next_group_id();
+                        args.renderer.light_probes.assign_group(&set, gid);
+                        args.error_log.push(format!("[Lighting] Grouped {} probe(s) as group {gid}", set.len()));
+                    }
+                }
+                if ui.button("Ungroup checked").clicked() {
+                    args.renderer.light_probes.assign_group(&set, 0);
+                    args.error_log.push("[Lighting] Ungrouped checked probes".to_string());
+                }
+                if ui.button("Clear checks").clicked() {
+                    ui.data_mut(|d| d.insert_temp("probe_group_set".into(), std::collections::HashSet::<usize>::new()));
+                }
+            });
+            ui.label(
+                RichText::new("Drag any probe in a group (in the viewport or the list) and the whole group moves together.")
+                    .small()
+                    .color(Color32::from_rgb(121, 131, 145)),
+            );
+        }
+
+        if let Some(idx) = selected {
+            if idx < args.renderer.light_probes.probes.len() {
+                let mut remove = false;
+                let gid = args.renderer.light_probes.probes[idx].group;
+                {
+                    let start_pos = args.renderer.light_probes.probes[idx].position;
+                    let mut edit_pos = start_pos;
+                    {
+                        let probe = &mut args.renderer.light_probes.probes[idx];
+                        ui.horizontal(|ui| {
+                            ui.label("Radius");
+                            ui.add(egui::Slider::new(&mut probe.radius, 2.0..=80.0));
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Position");
+                        ui.add(
+                            egui::DragValue::new(&mut edit_pos.x).speed(0.1).prefix("x "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut edit_pos.y).speed(0.1).prefix("y "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut edit_pos.z).speed(0.1).prefix("z "),
+                        );
+                    });
+                    let delta = edit_pos - start_pos;
+                    if delta.length_squared() > 0.0001 {
+                        if gid != 0 {
+                            args.renderer.light_probes.move_probe_or_group(idx, delta);
+                        } else {
+                            args.renderer.light_probes.probes[idx].position = edit_pos;
+                        }
+                    }
+                    if gid != 0 {
+                        ui.label(
+                            RichText::new(format!("In group G{gid} — dragging moves the whole group."))
+                                .small()
+                                .color(Color32::from_rgb(255, 214, 102)),
+                        );
+                    }
+                }
+                ui.label(
+                    RichText::new("A bigger radius makes the probe spread its light further; \
+overlap two probes to blend between them.")
+                        .small()
+                        .color(Color32::from_rgb(121, 131, 145)),
+                );
+                if ui.button("Remove Selected").clicked() {
+                    remove = true;
+                }
+                if remove {
+                    args.renderer.light_probes.probes.remove(idx);
+                    ui.data_mut(|d| d.insert_temp("probe_selected_index".into(), Option::<usize>::None));
+                }
+            }
+        } else {
+            ui.label(RichText::new("Click a probe in the list or viewport to edit it.").small().weak());
         }
     });
 }

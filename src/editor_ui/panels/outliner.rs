@@ -249,6 +249,81 @@ fn has_descendant_matching(
     false
 }
 
+/// Import an external asset (mesh/texture/audio) into this project's Content/
+/// directory. The file is copied under Content/Meshes (or Content/Textures)
+/// with a unique name, then immediately loaded into the asset store so it can
+/// be spawned/assigned in the current scene.
+///
+/// Returns `Some(Ok(()))` on success, `Some(Err(msg))` on failure, and `None`
+/// if the user cancelled the dialog.
+fn import_asset_to_content(
+    external_path: &std::path::Path,
+    args: &mut UiFrameArgs<'_>,
+) -> Option<Result<(), String>> {
+    let ext = external_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let (target_dir, is_mesh) = match ext.as_str() {
+        "obj" | "gltf" | "glb" => ("Content/Meshes", true),
+        "png" | "jpg" | "jpeg" | "tga" => ("Content/Textures", false),
+        "wav" | "ogg" | "mp3" | "flac" => ("Content/Audio", false),
+        _ => ("Content/Imported", false),
+    };
+
+    if std::fs::create_dir_all(target_dir).is_err() {
+        return Some(Err(format!(
+            "Could not create import directory {}",
+            target_dir
+        )));
+    }
+
+    let file_name = external_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("asset")
+        .to_string();
+
+    // De-duplicate: append a numeric suffix if the name already exists.
+    let mut dest_name = file_name.clone();
+    let mut counter = 1;
+    while std::path::Path::new(target_dir).join(&dest_name).exists() {
+        let stem = std::path::Path::new(&file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("asset");
+        dest_name = format!("{}_{}.{}", stem, counter, ext);
+        counter += 1;
+    }
+
+    let dest_path = std::path::Path::new(target_dir).join(&dest_name);
+    if let Err(e) = std::fs::copy(external_path, &dest_path) {
+        return Some(Err(format!("Failed to copy {} -> {}: {}", external_path.display(), dest_path.display(), e)));
+    }
+
+    let dest_str = dest_path.to_string_lossy().to_string();
+    tracing::info!("[Import] Copied {} -> {}", external_path.display(), dest_str);
+
+    if is_mesh {
+        // Load immediately into the mesh store + cache so the user can assign
+        // it to a Renderable without restarting.
+        match crate::assets::mesh::Mesh::load(&dest_str) {
+            Ok(mesh) => {
+                let handle = args.meshes.add(mesh);
+                args.mesh_cache.insert(dest_str.clone(), handle);
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(format!("Imported mesh failed to parse: {}", e))),
+        }
+    } else {
+        // Textures/audio are picked up by the existing hot-reload watcher and
+        // asset browser scan on the next frame; no store registration needed.
+        Some(Ok(()))
+    }
+}
+
 pub fn render_outliner_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
     let (roots, parent_to_children) = build_hierarchy(args.world);
     let total_entities = args.world.query::<hecs::Entity>().iter().count();
@@ -448,8 +523,12 @@ pub fn render_outliner_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
                                     .add_filter("All Files", &["*"])
                                     .pick_file()
                                 {
-                                    tracing::info!("[Import] Selected mesh: {:?}", path);
-                                    // TODO: Actually load the mesh file
+                                    if let Some(result) = import_asset_to_content(&path, args) {
+                                        ui.memory_mut(|m| m.close_popup(add_menu_id));
+                                        if let Err(e) = result {
+                                            args.error_log.push(format!("[Import] {}", e));
+                                        }
+                                    }
                                 }
                                 ui.memory_mut(|m| m.close_popup(add_menu_id));
                             }

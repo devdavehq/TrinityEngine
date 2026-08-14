@@ -1,5 +1,5 @@
 // src/renderer/water.wgsl
-// Water surface rendering shader — AAA-quality with GGX microfacet specular.
+// Water surface rendering shader â€” AAA-quality with GGX microfacet specular.
 //
 // Features:
 //   - Gerstner wave vertex displacement (3 overlapping waves)
@@ -12,14 +12,14 @@
 //   - Subsurface scattering approximation (light through shallow water)
 //   - Transparency with scene colour refraction
 //
-// ── How it works ────────────────────────────────────────────────────────────
+// â”€â”€ How it works â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // 1. Vertex shader applies Gerstner wave displacement to a flat water mesh.
 // 2. Fragment shader computes analytical normals + procedural detail normals.
 // 3. GGX specular replaces Blinn-Phong for physically accurate highlights.
 // 4. Fresnel blends reflected sky and refracted scene colour.
 // 5. Depth-based absorption, subsurface scattering, and shoreline foam.
 
-// ── Uniform buffer ──────────────────────────────────────────────────────────
+// â”€â”€ Uniform buffer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 struct WaterUniforms {
     // Wave parameters
     wave_params:   vec4<f32>,  // x=height, y=speed, z=choppy, w=time
@@ -48,7 +48,7 @@ struct WaterUniforms {
 @group(0) @binding(3) var t_depth: texture_depth_2d;
 @group(0) @binding(4) var s_depth: sampler;
 
-// ── Vertex input/output ─────────────────────────────────────────────────────
+// â”€â”€ Vertex input/output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 struct WaterVertIn {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
@@ -61,7 +61,7 @@ struct WaterVertOut {
     @location(2)       wave_height:  f32,
 }
 
-// ── Gerstner wave displacement ──────────────────────────────────────────────
+// â”€â”€ Gerstner wave displacement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn gerstner_wave(pos: vec3<f32>, time: f32, dir: vec3<f32>, steepness: f32, speed: f32, height: f32) -> vec3<f32> {
     let a = height * 0.5;
     let q = steepness;
@@ -76,7 +76,7 @@ fn gerstner_wave(pos: vec3<f32>, time: f32, dir: vec3<f32>, steepness: f32, spee
     );
 }
 
-// ── Water normal (analytical from Gerstner derivatives) ─────────────────────
+// â”€â”€ Water normal (analytical from Gerstner derivatives) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn water_normal(pos: vec3<f32>, time: f32, height: f32) -> vec3<f32> {
     let h = height * 0.5;
     let sp = water.wave_params.y;
@@ -130,7 +130,7 @@ fn water_normal(pos: vec3<f32>, time: f32, height: f32) -> vec3<f32> {
     return normalize(n);
 }
 
-// ── Procedural normal map (replaces texture-based normal maps) ──────────────
+// â”€â”€ Procedural normal map (replaces texture-based normal maps) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Generates fine-scale ripple and capillary wave normals procedurally.
 // Two octaves of gradient noise at different scales create realistic detail.
 fn procedural_water_normal(pos: vec3<f32>, time: f32) -> vec3<f32> {
@@ -159,7 +159,7 @@ fn procedural_water_normal(pos: vec3<f32>, time: f32) -> vec3<f32> {
     return normalize(vec3<f32>(perturbation.x, 1.0, perturbation.y));
 }
 
-// ── GGX Normal Distribution Function ────────────────────────────────────────
+// â”€â”€ GGX Normal Distribution Function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Trowbridge-Reitz NDF: probability distribution of microfacet orientations.
 // Used for physically-based specular highlights.
 fn ggx_ndf(NdotH: f32, roughness: f32) -> f32 {
@@ -169,7 +169,7 @@ fn ggx_ndf(NdotH: f32, roughness: f32) -> f32 {
     return a2 / (3.14159265 * d * d);
 }
 
-// ── Schlick-GGX Geometry function ───────────────────────────────────────────
+// â”€â”€ Schlick-GGX Geometry function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Smith's geometry function: accounts for microfacet self-shadowing.
 fn schlick_ggx(NdotV: f32, roughness: f32) -> f32 {
     let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
@@ -182,7 +182,7 @@ fn geometry_smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
     return g1 * g2;
 }
 
-// ── Fresnel (Schlick) ───────────────────────────────────────────────────────
+// â”€â”€ Fresnel (Schlick) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn fresnel_schlick(cos_theta: f32, F0: f32) -> f32 {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
@@ -214,10 +214,10 @@ fn vs_water(in: WaterVertIn) -> WaterVertOut {
 
 @fragment
 fn fs_water(in: WaterVertOut) -> @location(0) vec4<f32> {
-    // ── Compute base normal analytically from Gerstner derivatives ────────
+    // â”€â”€ Compute base normal analytically from Gerstner derivatives â”€â”€â”€â”€â”€â”€â”€â”€
     let base_N = water_normal(in.world_pos, water.wave_params.w * water.wave_params.y, water.wave_params.x);
 
-    // ── Add procedural detail normal (ripples + capillary waves) ─────────
+    // â”€â”€ Add procedural detail normal (ripples + capillary waves) â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let detail_N = procedural_water_normal(in.world_pos, water.wave_params.w);
     // Blend: 80% analytical + 20% detail for realistic surface micro-detail.
     let N = normalize(base_N * 0.8 + detail_N * 0.2);
@@ -231,7 +231,7 @@ fn fs_water(in: WaterVertOut) -> @location(0) vec4<f32> {
     let NdotH = max(dot(N, H), 0.0);
     let HdotV = max(dot(H, V), 0.0);
 
-    // ── GGX Microfacet specular (replaces Blinn-Phong) ──────────────────
+    // â”€â”€ GGX Microfacet specular (replaces Blinn-Phong) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // roughness from light_color.w (legacy specular_power is now roughness)
     let roughness = clamp(water.light_color.w / 512.0, 0.02, 1.0);
     let D = ggx_ndf(NdotH, roughness);
@@ -243,68 +243,68 @@ fn fs_water(in: WaterVertOut) -> @location(0) vec4<f32> {
     let kS = F;
     let kD = (1.0 - kS) * (1.0); // metals: kD = 0; dielectrics: energy conserved
 
-    // ── Fresnel ──────────────────────────────────────────────────────────
+    // â”€â”€ Fresnel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let fresnel = fresnel_schlick(NdotV, 0.02);
 
-    // ── Reflection (sample scene colour at reflected UV) ─────────────────
+    // â”€â”€ Reflection (sample scene colour at reflected UV) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let R = reflect(-V, N);
     let reflected_clip = water.view_proj * vec4<f32>(in.world_pos + R * 100.0, 1.0);
     let reflected_uv = (reflected_clip.xy / reflected_clip.w) * 0.5 + vec2<f32>(0.5, 0.5);
     var reflection = textureSample(t_scene, s_scene, clamp(reflected_uv, vec2<f32>(0.001), vec2<f32>(0.999))).rgb;
 
-    // ── Refraction (depth-based absorption) ──────────────────────────────
+    // â”€â”€ Refraction (depth-based absorption) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let scene_uv = in.clip_pos.xy / vec2<f32>(textureDimensions(t_scene, 0));
-    let scene_depth = textureSampleDepth(t_depth, s_depth, scene_uv);
+    let scene_depth = textureSample(t_depth, s_depth, scene_uv);
     let water_depth = max(scene_depth - in.clip_pos.z, 0.0);
 
     // Exponential absorption: deeper water = more blue, less light.
     let absorption = exp(-water_depth * vec3<f32>(0.3, 0.6, 0.9));
     let refraction = mix(water.shallow_color.rgb, water.deep_color.rgb, clamp(water_depth * 2.0, 0.0, 1.0));
 
-    // ── Subsurface scattering approximation ──────────────────────────────
+    // â”€â”€ Subsurface scattering approximation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Light transmitted through thin water (shallows) gives a green-blue glow.
     let sss_intensity = exp(-water_depth * 2.0) * 0.15;
     let sss = water.light_color.rgb * sss_intensity * max(dot(L, -V), 0.0);
 
-    // ── Blend reflection and refraction via Fresnel ──────────────────────
+    // â”€â”€ Blend reflection and refraction via Fresnel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     var water_color = mix(refraction + sss, reflection, fresnel);
 
-    // ── Apply GGX specular ───────────────────────────────────────────────
+    // â”€â”€ Apply GGX specular â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     water_color += water.light_color.rgb * specular * kD * NdotL;
 
-    // ── Foam at wave crests ──────────────────────────────────────────────
+    // â”€â”€ Foam at wave crests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let foam_threshold = water.wave_params.x * 0.6;
     let foam_mask = smoothstep(foam_threshold - 0.05, foam_threshold + 0.05, in.wave_height);
     let foam_color = vec3<f32>(0.9, 0.95, 1.0);
 
-    // ── Shoreline foam ───────────────────────────────────────────────────
+    // â”€â”€ Shoreline foam â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Detects where water meets terrain using depth buffer analysis.
     // Cross-pattern sampling finds the nearest geometry; where it is close
     // to the water surface we are near shore and render a foam band.
     // Parameters: deep_color.w = shore_foam_intensity, light_dir.w = shore_foam_width
     let shore_texel = 1.0 / vec2<f32>(textureDimensions(t_depth, 0));
-    let d_n = textureSampleDepth(t_depth, s_depth, scene_uv + vec2<f32>( 0.0,          shore_texel.y));
-    let d_s = textureSampleDepth(t_depth, s_depth, scene_uv + vec2<f32>( 0.0,         -shore_texel.y));
-    let d_e = textureSampleDepth(t_depth, s_depth, scene_uv + vec2<f32>( shore_texel.x, 0.0));
-    let d_w = textureSampleDepth(t_depth, s_depth, scene_uv + vec2<f32>(-shore_texel.x, 0.0));
+    let d_n = textureSample(t_depth, s_depth, scene_uv + vec2<f32>( 0.0,          shore_texel.y));
+    let d_s = textureSample(t_depth, s_depth, scene_uv + vec2<f32>( 0.0,         -shore_texel.y));
+    let d_e = textureSample(t_depth, s_depth, scene_uv + vec2<f32>( shore_texel.x, 0.0));
+    let d_w = textureSample(t_depth, s_depth, scene_uv + vec2<f32>(-shore_texel.x, 0.0));
 
-    // Minimum scene depth among neighbours — close to water surface = near shore.
+    // Minimum scene depth among neighbours â€” close to water surface = near shore.
     let min_neighbor_depth = min(min(d_n, d_s), min(d_e, d_w));
     let shore_water_depth  = max(min_neighbor_depth - in.clip_pos.z, 0.0);
 
-    // Depth gradient across the pixel — large = sharp shoreline edge.
+    // Depth gradient across the pixel â€” large = sharp shoreline edge.
     let depth_gradient = max(
         max(abs(scene_depth - d_n), abs(scene_depth - d_s)),
         max(abs(scene_depth - d_e), abs(scene_depth - d_w))
     );
 
     // Foam mask: exponential falloff with distance from shore, sharpened by gradient.
-    let shore_width    = max(light_dir.w, 0.001);
+    let shore_width    = max(water.light_dir.w, 0.001);
     let foam_band      = exp(-shore_water_depth / shore_width);
     let edge_sharpen   = smoothstep(0.0005, 0.005, depth_gradient);
     let shore_foam_base = foam_band * edge_sharpen;
 
-    // Animated procedural foam texture — two scrolling noise layers at
+    // Animated procedural foam texture â€” two scrolling noise layers at
     // different scales and speeds produce a shimmering, organic look.
     let foam_uv_1 = in.world_pos.xz * 0.8
                   + vec2<f32>(water.wave_params.w *  0.3, water.wave_params.w *  0.15);
@@ -315,13 +315,13 @@ fn fs_water(in: WaterVertOut) -> @location(0) vec4<f32> {
     let foam_detail = clamp(foam_tex_1 * 0.6 + foam_tex_2 * 0.4, 0.0, 1.0);
 
     // Final shoreline foam: masked by intensity uniform and foam texture.
-    let shore_foam_mask = shore_foam_base * foam_detail * deep_color.w;
+    let shore_foam_mask = shore_foam_base * foam_detail * water.deep_color.w;
 
     // Combine wave-crest foam and shoreline foam (additive max).
     let combined_foam = max(foam_mask * water.camera_pos.w, shore_foam_mask);
     water_color = mix(water_color, foam_color, combined_foam);
 
-    // ── Apply absorption and opacity ─────────────────────────────────────
+    // â”€â”€ Apply absorption and opacity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     water_color *= absorption;
     let opacity = water.shallow_color.a;
 

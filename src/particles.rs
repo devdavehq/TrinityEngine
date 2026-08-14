@@ -23,6 +23,24 @@
 use glam::{Vec3, Vec4};
 use std::collections::HashMap;
 
+/// Where new particles are spawned inside the emitter's spawn volume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpawnShape {
+    /// Uniform box volume sized by `spawn_extents` (default).
+    Box,
+    /// Volume of a sphere of the given radius centred on the emitter.
+    Sphere { radius: f32 },
+    /// Cone pointing +Y: apex at the emitter, `angle_rad` = full cone angle,
+    /// height = `spawn_extents.y`, base radius = `spawn_extents.x`.
+    Cone { angle_rad: f32 },
+}
+
+impl Default for SpawnShape {
+    fn default() -> Self {
+        Self::Box
+    }
+}
+
 // ── Single particle (CPU-side) ───────────────────────────────────────────────
 // Each emitter maintains a pool of these. Not sent to GPU directly.
 #[derive(Clone, Debug)]
@@ -84,6 +102,26 @@ pub struct ParticleEmitter {
     pub max_particles: usize,
     /// Whether this emitter is currently active.
     pub active: bool,
+    /// Shape of the spawn volume (box / sphere / cone).
+    pub spawn_shape: SpawnShape,
+    /// Number of particles still waiting to be spawned in one shot (burst).
+    burst_pending: u32,
+    /// Velocity damping per second. 0 = none, higher = particles slow faster
+    /// (air resistance). Applied as `v /= 1 + drag*dt`.
+    pub drag: f32,
+    /// Turbulence multiplier (1.0 = default gusting, 0 = calm).
+    pub turbulence: f32,
+    /// End size for size-over-life lerp. 0 = keep legacy "grows 30% with age".
+    pub size_end: f32,
+    /// Optional end colour for a colour-over-life gradient. Only used when
+    /// `use_color_end` is true.
+    pub color_end: Vec4,
+    /// Whether `color_end` is used to lerp colour as particles age.
+    pub use_color_end: bool,
+    /// If true, ParticleSystem::update() re-centres this emitter on the camera
+    /// every frame (weather emitters). Scripted emitters leave this false so
+    /// they stay anchored where they were placed.
+    pub follow_camera: bool,
     /// Internal particle pool.
     particles: Vec<Particle>,
     /// Fractional particle accumulator for sub-frame spawning.
@@ -106,6 +144,14 @@ impl ParticleEmitter {
             acceleration: Vec3::new(0.0, -9.8, 0.0),
             max_particles,
             active: true,
+            spawn_shape: SpawnShape::Box,
+            burst_pending: 0,
+            drag: 0.0,
+            turbulence: 1.0,
+            size_end: 0.0,
+            color_end: Vec4::ZERO,
+            use_color_end: false,
+            follow_camera: false,
             particles: Vec::with_capacity(max_particles),
             spawn_accumulator: 0.0,
         }
@@ -128,11 +174,35 @@ impl ParticleEmitter {
         *rng_seed = (*rng_seed * 16807.0 + 1.0) % 2147483647.0;
         let r5 = *rng_seed / 2147483647.0; // [0, 1]
 
-        let pos = self.position + Vec3::new(
-            r1 * self.spawn_extents.x,
-            r2 * self.spawn_extents.y,
-            r3 * self.spawn_extents.z,
-        );
+        let pos = match self.spawn_shape {
+            SpawnShape::Box => {
+                self.position + Vec3::new(
+                    r1 * self.spawn_extents.x,
+                    r2 * self.spawn_extents.y,
+                    r3 * self.spawn_extents.z,
+                )
+            }
+            SpawnShape::Sphere { radius } => {
+                // Uniform point inside the sphere (cube-root falloff so the
+                // distribution is even, not centre-heavy).
+                let r = radius * r5.cbrt();
+                let theta = r1 * std::f32::consts::PI;
+                let phi = r2 * std::f32::consts::TAU;
+                let (sp, cp) = theta.sin_cos();
+                let (st, ct) = phi.sin_cos();
+                self.position + r * Vec3::new(sp * ct, cp, sp * st)
+            }
+            SpawnShape::Cone { angle_rad } => {
+                // Height up to spawn_extents.y; radius grows with height by the
+                // cone's half-angle; base radius is spawn_extents.x.
+                let h = r5 * self.spawn_extents.y.max(0.01);
+                let half_angle = (angle_rad * 0.5).clamp(0.0, 1.2);
+                let radius = h * half_angle.tan().max(0.0) * self.spawn_extents.x.max(0.01);
+                let phi = r1 * std::f32::consts::TAU;
+                let (sp, cp) = phi.sin_cos();
+                self.position + Vec3::new(cp * radius, h, sp * radius)
+            }
+        };
         let vel = self.initial_velocity + Vec3::new(
             r4 * self.velocity_spread.x,
             (r1 * 0.5) * self.velocity_spread.y,
@@ -152,6 +222,12 @@ impl ParticleEmitter {
         });
     }
 
+    /// Queue `count` particles to spawn instantly on the next update() call.
+    /// Handy for one-shot effects (explosions, muzzle flashes, splashes).
+    pub fn burst(&mut self, count: u32) {
+        self.burst_pending = self.burst_pending.saturating_add(count);
+    }
+
     /// Advance all particles by dt seconds. Apply physics, kill dead, spawn new.
     /// Turbulence adds noise-based perturbation for realistic wind gusting.
     pub fn update(&mut self, dt: f32, wind_dir: Vec3, wind_strength: f32, rng_seed: &mut f32, time: f32) {
@@ -160,6 +236,11 @@ impl ParticleEmitter {
         }
 
         // ── Spawn ──────────────────────────────────────────────────────────
+        // One-shot burst first (respects max_particles), then steady rate.
+        while self.burst_pending > 0 && self.particles.len() < self.max_particles {
+            self.spawn_one(rng_seed);
+            self.burst_pending -= 1;
+        }
         let new_count = self.spawn_rate * dt;
         self.spawn_accumulator += new_count;
         while self.spawn_accumulator >= 1.0 {
@@ -169,21 +250,29 @@ impl ParticleEmitter {
 
         // ── Physics update with turbulence ─────────────────────────────────
         let wind_force = wind_dir * wind_strength * 2.0;
+        let drag_factor = if self.drag > 0.0 {
+            1.0 / (1.0 + self.drag * dt)
+        } else {
+            1.0
+        };
+        let turb = self.turbulence.max(0.0);
         for p in &mut self.particles {
             p.age += dt;
 
             // Turbulence: Perlin-like noise gusting based on particle position + time.
             // Uses sin/cos hash for cheap turbulence without a noise texture.
             let turb_freq = 0.8;
-            let turb_strength = wind_strength * 0.15;
-            let turb = Vec3::new(
+            let turb_strength = wind_strength * 0.15 * turb;
+            let gust = Vec3::new(
                 (p.position.x * turb_freq + time * 1.3).sin() * (p.position.z * turb_freq * 0.7 + time * 0.9).cos(),
                 (p.position.y * turb_freq * 0.5 + time * 0.7).sin() * 0.3,
                 (p.position.z * turb_freq + time * 1.1).cos() * (p.position.x * turb_freq * 0.6 + time * 1.2).sin(),
             ) * turb_strength;
 
             // Apply acceleration (gravity + wind + turbulence).
-            p.velocity += (self.acceleration + wind_force + turb) * dt;
+            p.velocity += (self.acceleration + wind_force + gust) * dt;
+            // Air resistance (drag) — damps velocity without reversing it.
+            p.velocity *= drag_factor;
             p.position += p.velocity * dt;
         }
 
@@ -198,9 +287,24 @@ impl ParticleEmitter {
             // Fade alpha as the particle ages.
             let life_ratio = (p.age / p.lifetime).clamp(0.0, 1.0);
             let fade = 1.0 - life_ratio; // linear fade
-            // Size grows slightly as raindrop falls (perspective illusion).
-            let size = p.size * (1.0 + life_ratio * 0.3);
-            let mut color = p.color;
+            // Size over life: explicit `size_end` lerp, else the legacy
+            // "grows slightly with age" behaviour (rain perspective illusion).
+            let size = if self.size_end > 0.0 {
+                p.size + (self.size_end - p.size) * life_ratio
+            } else {
+                p.size * (1.0 + life_ratio * 0.3)
+            };
+            // Colour over life: optional end-colour gradient.
+            let mut color = if self.use_color_end {
+                Vec4::new(
+                    p.color.x + (self.color_end.x - p.color.x) * life_ratio,
+                    p.color.y + (self.color_end.y - p.color.y) * life_ratio,
+                    p.color.z + (self.color_end.z - p.color.z) * life_ratio,
+                    p.color.w + (self.color_end.w - p.color.w) * life_ratio,
+                )
+            } else {
+                p.color
+            };
             color.w *= fade;
 
             GpuParticle {
@@ -258,13 +362,17 @@ impl ParticleSystem {
     /// Update all emitters. Call once per frame.
     pub fn update(&mut self, dt: f32, camera_pos: Vec3, time: f32) {
         for emitter in &mut self.emitters {
-            // Center spawn area on camera XZ, offset Y upward.
-            let spawn_center = Vec3::new(
-                camera_pos.x,
-                camera_pos.y + emitter.spawn_extents.y + 5.0,
-                camera_pos.z,
-            );
-            emitter.set_position(spawn_center);
+            // Only camera-tracking emitters (weather) follow the camera.
+            // Scripted/attached emitters keep their own position.
+            if emitter.follow_camera {
+                // Center spawn area on camera XZ, offset Y upward.
+                let spawn_center = Vec3::new(
+                    camera_pos.x,
+                    camera_pos.y + emitter.spawn_extents.y + 5.0,
+                    camera_pos.z,
+                );
+                emitter.set_position(spawn_center);
+            }
             emitter.update(dt, self.wind_dir, self.wind_strength, &mut self.rng_seed, time);
         }
     }
@@ -306,6 +414,7 @@ impl ParticleSystem {
         e.size_max = 0.035;
         e.color = Vec4::new(0.75, 0.82, 0.95, 0.5);
         e.acceleration = Vec3::new(0.0, -4.0, 0.0); // slight extra downward pull
+        e.follow_camera = true; // rain tracks the camera
         e.active = false; // activated when weather is rainy
         e
     }
@@ -323,6 +432,7 @@ impl ParticleSystem {
         e.size_max = 0.025;
         e.color = Vec4::new(0.95, 0.95, 1.0, 0.7);
         e.acceleration = Vec3::new(0.0, -0.5, 0.0); // snow floats
+        e.follow_camera = true; // snow tracks the camera
         e.active = false; // activated when weather is snowy
         e
     }
@@ -340,6 +450,7 @@ impl ParticleSystem {
         e.size_max = 5.0;
         e.color = Vec4::new(0.85, 0.85, 0.88, 0.08);
         e.acceleration = Vec3::ZERO;
+        e.follow_camera = true; // mist tracks the camera
         e.active = false;
         e
     }
@@ -357,6 +468,7 @@ impl ParticleSystem {
         e.size_max = 0.01;
         e.color = Vec4::new(0.8, 0.85, 0.95, 0.3);
         e.acceleration = Vec3::new(0.0, -15.0, 0.0);
+        e.follow_camera = true; // splatter spawns near the camera's ground plane
         e.active = false;
         e
     }
@@ -691,5 +803,83 @@ mod tests {
         );
         assert!(!system.emitters[indices[0]].active); // rain off
         assert!(system.emitters[indices[1]].active);  // snow on
+    }
+
+    #[test]
+    fn burst_spawns_immediately() {
+        let mut e = ParticleEmitter::new(100);
+        e.spawn_rate = 0.0; // no steady spawning
+        e.lifetime_min = 10.0;
+        e.lifetime_max = 10.0;
+        e.burst(25);
+        let mut seed = 42.0;
+        e.update(0.001, Vec3::ZERO, 0.0, &mut seed, 0.0);
+        assert_eq!(e.particle_count(), 25, "burst should spawn all 25 at once");
+    }
+
+    #[test]
+    fn drag_damps_velocity() {
+        let mut e = ParticleEmitter::new(100);
+        e.spawn_rate = 0.0;
+        e.lifetime_min = 10.0;
+        e.lifetime_max = 10.0;
+        e.initial_velocity = Vec3::new(10.0, 0.0, 0.0);
+        e.acceleration = Vec3::ZERO;
+        e.drag = 4.0;
+        e.burst(1);
+        let mut seed = 42.0;
+        e.update(0.01, Vec3::ZERO, 0.0, &mut seed, 0.0);
+        let v0 = e.particles[0].velocity.x;
+        e.update(1.0, Vec3::ZERO, 0.0, &mut seed, 1.0);
+        let v1 = e.particles[0].velocity.x;
+        assert!(v1.abs() < v0.abs(), "drag must slow the particle down");
+    }
+
+    #[test]
+    fn size_end_grows_particles_over_life() {
+        let mut e = ParticleEmitter::new(100);
+        e.spawn_rate = 0.0;
+        e.lifetime_min = 1.0;
+        e.lifetime_max = 1.0;
+        e.size_min = 0.1;
+        e.size_max = 0.1;
+        e.size_end = 0.5;
+        e.burst(1);
+        let mut seed = 42.0;
+        e.update(0.01, Vec3::ZERO, 0.0, &mut seed, 0.0); // spawn, age ~0.01
+        e.update(0.9, Vec3::ZERO, 0.0, &mut seed, 0.9);  // age to ~0.91
+        let inst = e.gpu_instances();
+        assert!(inst[0].size > 0.4, "size should lerp toward size_end");
+    }
+
+    #[test]
+    fn cone_shape_spawns_above_origin() {
+        let mut e = ParticleEmitter::new(100);
+        e.spawn_rate = 0.0;
+        e.lifetime_min = 10.0;
+        e.lifetime_max = 10.0;
+        e.spawn_shape = SpawnShape::Cone { angle_rad: 0.6 };
+        e.spawn_extents = Vec3::new(1.0, 3.0, 1.0);
+        e.burst(50);
+        let mut seed = 42.0;
+        e.update(0.001, Vec3::ZERO, 0.0, &mut seed, 0.0);
+        for p in &e.particles {
+            assert!(p.position.y >= -1e-4, "cone particles spawn at/above apex");
+        }
+    }
+
+    #[test]
+    fn scripted_emitter_does_not_follow_camera() {
+        let mut system = ParticleSystem::new();
+        let mut e = ParticleEmitter::new(50);
+        e.spawn_rate = 100.0;
+        e.lifetime_min = 10.0;
+        e.lifetime_max = 10.0;
+        e.follow_camera = false; // scripted emitter stays put
+        e.position = Vec3::new(12.0, 3.0, -4.0);
+        let idx = system.add_emitter(e);
+        let mut seed = 42.0;
+        system.update(0.1, Vec3::new(0.0, 0.0, 0.0), 0.0);
+        assert_eq!(system.emitters[idx].position, Vec3::new(12.0, 3.0, -4.0));
     }
 }

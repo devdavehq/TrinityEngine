@@ -25,6 +25,24 @@ use loader::EntityDesc;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+/// Default folder scene files live in, relative to the project root.
+/// Scenes are part of the game's Content, so they live under Content/scenes.
+pub const SCENE_DIR: &str = "Content/scenes";
+
+/// Build a scene path for a bare name (adds `.scene` if missing).
+pub fn scene_path(name: &str) -> String {
+    let n = if name.ends_with(".scene") {
+        name.to_string()
+    } else {
+        format!("{}.scene", name)
+    };
+    if n.contains('/') || n.contains('\\') {
+        n
+    } else {
+        format!("{}/{}", SCENE_DIR, n)
+    }
+}
+
 // SceneManager owns the scene file path and the current list of entities.
 // When the file changes, rebuild() clears the world and respawns everything.
 pub struct SceneManager {
@@ -87,6 +105,14 @@ impl SceneManager {
         );
 
         for desc in entities {
+            // ── Skip dead / not-spawnable entities ────────────────────────
+            // Survives a save/load round trip: `alive = 0` entities were killed
+            // or collected before saving and must not respawn.
+            if !desc.alive {
+                tracing::info!("[Scene]   Skipping (not alive): {}", desc.name);
+                continue;
+            }
+
             // ── Prefab Resolution ──────────────────────────────────────────
             // If this entity references a prefab, load it and merge defaults.
             // Scene fields override prefab defaults (only non-default values win).
@@ -137,6 +163,7 @@ impl SceneManager {
                                     color,
                                     intensity,
                                     range,
+                                    spot_angle: 45.0,
                                 });
                             }
                         }
@@ -198,7 +225,12 @@ impl SceneManager {
                 });
                 let mut light = resolved.light.map(|l| PointLight {
                     color: l.color, intensity: l.intensity, range: l.range,
-                    light_type: 1.0, spot_angle: 45.0, shadow_casting: false,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0, // point (default)
+                    },
+                    spot_angle: l.spot_angle, shadow_casting: false,
                 });
                 let ent = world.spawn((
                     Position { x: resolved.position[0], y: resolved.position[1], z: resolved.position[2] },
@@ -213,6 +245,11 @@ impl SceneManager {
                 if let Some(l) = light.take() {
                     let _ = world.insert(ent, (l,));
                 }
+                if let Some((current, max)) = resolved.health {
+                    let _ = world.insert(ent, (crate::components::Health {
+                        current, max,
+                    },));
+                }
             } else {
                 let mut body = resolved.rigidbody.map(|mass| {
                     let mut b = RigidBody::dynamic();
@@ -221,7 +258,12 @@ impl SceneManager {
                 });
                 let mut light = resolved.light.map(|l| PointLight {
                     color: l.color, intensity: l.intensity, range: l.range,
-                    light_type: 1.0, spot_angle: 45.0, shadow_casting: false,
+                    light_type: match l.light_type.as_str() {
+                        "directional" => 0.0,
+                        "spot" => 2.0,
+                        _ => 1.0, // point (default)
+                    },
+                    spot_angle: l.spot_angle, shadow_casting: false,
                 });
                 let ent = world.spawn((
                     Position { x: resolved.position[0], y: resolved.position[1], z: resolved.position[2] },
@@ -234,6 +276,11 @@ impl SceneManager {
                 }
                 if let Some(l) = light.take() {
                     let _ = world.insert(ent, (l,));
+                }
+                if let Some((current, max)) = resolved.health {
+                    let _ = world.insert(ent, (crate::components::Health {
+                        current, max,
+                    },));
                 }
             }
 
@@ -351,19 +398,21 @@ impl SceneManager {
         }
     }
 
-    /// List all .scene files in a directory.
+    /// List all .scene files in a directory (through the VFS, so a packed
+    /// game.pak still exposes its levels).
     pub fn list_scene_files(dir: &str) -> Vec<String> {
-        let mut scenes = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "scene").unwrap_or(false) {
-                    if let Some(s) = path.to_str() {
-                        scenes.push(s.to_string());
-                    }
+        let mut scenes: Vec<String> = crate::vfs::walk_dir(dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rel| rel.ends_with(".scene"))
+            .map(|rel| {
+                if dir.is_empty() || dir == "." {
+                    rel
+                } else {
+                    format!("{}/{}", dir.trim_end_matches('/'), rel)
                 }
-            }
-        }
+            })
+            .collect();
         scenes.sort();
         scenes
     }
@@ -389,24 +438,43 @@ pub enum SceneAction {
 }
 
 /// Save all entities in the world back to a .scene file.
-/// Each entity needs a SceneMeta + Position + Renderable component.
-/// Entities without SceneMeta are skipped (they weren't loaded from a file).
-pub fn save_scene(
-    scene_path: &str,
-    world: &mut World,
-) -> Result<(), String> {
-    use crate::components::SceneMeta;
+/// Serialize the current world to a .scene-format string.
+/// Each contributing entity needs a SceneMeta + Position + Renderable
+/// component; entities without SceneMeta are skipped (not loaded from a file).
+///
+/// Gameplay state is included so a save round-trip preserves the runtime world:
+///   - rotation (degrees)          — was previously dropped on save
+///   - health (current max)        — damage/destruction state
+///   - alive = 0                   — dead entities don't respawn on load
+pub fn serialize_scene(world: &mut World) -> Result<String, String> {
+    use crate::components::{Health, Rotation, SceneMeta};
 
     let mut lines: Vec<String> = Vec::new();
     let mut count: usize = 0;
 
-    for (pos, renderable, meta) in
-        world.query::<(&Position, &Renderable, &SceneMeta)>().iter()
+    for (pos, renderable, meta, rot, health) in world
+        .query::<(&Position, &Renderable, &SceneMeta, Option<&Rotation>, Option<&Health>)>()
+        .iter()
     {
+        let alive = health.map_or(true, |h| h.current > 0);
+        // Dead entities are fully dropped from the file — nothing to restore
+        // afterwards. Killed NPCs / collected pickups must not come back.
+        if !alive {
+            continue;
+        }
+
         lines.push("[entity]".to_string());
         lines.push(format!("name = {}", meta.name));
         lines.push(format!("mesh = {}", meta.mesh_path));
         lines.push(format!("position = {} {} {}", pos.x, pos.y, pos.z));
+        if let Some(r) = rot {
+            lines.push(format!(
+                "rotation = {} {} {}",
+                r.pitch.to_degrees(),
+                r.yaw.to_degrees(),
+                r.roll.to_degrees()
+            ));
+        }
         lines.push(format!(
             "scale = {} {} {}",
             renderable.scale[0], renderable.scale[1], renderable.scale[2]
@@ -418,28 +486,142 @@ pub fn save_scene(
         lines.push(format!("metallic = {}", renderable.metallic));
         lines.push(format!("roughness = {}", renderable.roughness));
         lines.push(format!("ao = {}", renderable.ao));
+        if let Some(h) = health {
+            lines.push(format!("health = {} {}", h.current, h.max));
+            lines.push("alive = 1".to_string());
+        }
         lines.push(String::new());
         count += 1;
     }
 
     // Second pass: collect scripts to inject into entity blocks.
-    let mut scripts: Vec<(f32, f32, f32, String)> = Vec::new();
-    for (pos, script) in world.query_mut::<(&Position, &Script)>() {
-        scripts.push((pos.x, pos.y, pos.z, script.path.clone()));
+    // Scripts are matched to their entity by exact name so rotation/health
+    // round-trips don't break the name→entity association.
+    let mut scripts: Vec<(String, String)> = Vec::new();
+    for (meta, script) in world.query_mut::<(&SceneMeta, &Script)>() {
+        scripts.push((meta.name.clone(), script.path.clone()));
     }
-    for (sx, sy, sz, script_path) in &scripts {
-        if let Some(idx) = lines.iter().position(|l| {
-            l.starts_with("position = ")
-                && l.contains(&format!("{} {} {}", sx, sy, sz))
-        }) {
+    for (name, script_path) in &scripts {
+        // The `name = ...` line for an entity block is written verbatim, so an
+        // exact match swaps scripts without cross-matching similarly-named
+        // entities ("goblin" must not match "goblin_01").
+        let expected = format!("name = {}", name);
+        if let Some(idx) = lines.iter().position(|l| l == &expected) {
             lines.insert(idx + 1, format!("script = {}", script_path));
         }
     }
 
     let content = lines.join("\n");
+    tracing::info!("[Scene] Serialized {} entities", count);
+    Ok(content)
+}
+
+/// Each entity needs a SceneMeta + Position + Renderable component.
+/// Entities without SceneMeta are skipped (they weren't loaded from a file).
+pub fn save_scene(
+    scene_path: &str,
+    world: &mut World,
+) -> Result<(), String> {
+    let content = serialize_scene(world)?;
     std::fs::write(scene_path, content)
         .map_err(|e| format!("Failed to save scene {}: {}", scene_path, e))?;
-
-    tracing::info!("[Scene] Saved {} entities to {}", count, scene_path);
+    tracing::info!("[Scene] Saved to {}", scene_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::{Handle, Mesh};
+    use crate::components::{SceneMeta, Script};
+
+    fn renderable(handle: Handle<Mesh>, color: [f32; 3]) -> crate::components::Renderable {
+        crate::components::Renderable {
+            mesh: handle,
+            color,
+            metallic: 0.1,
+            roughness: 0.6,
+            ao: 0.8,
+            scale: [2.0, 1.0, 0.5],
+        }
+    }
+
+    /// Save → parse round-trip: every authored entity must come back with the
+    /// same name, mesh, position, scale, color, and attached script.
+    #[test]
+    fn scene_save_load_roundtrip() {
+        let mut world = World::new();
+        let handle = Handle::new(7);
+
+        world.spawn((
+            Position { x: 1.0, y: 2.0, z: 3.0 },
+            renderable(handle, [1.0, 0.0, 0.0]),
+            SceneMeta { name: "cube_a".to_string(), mesh_path: "meshes/cube.obj".to_string() },
+        ));
+        world.spawn((
+            Position { x: -4.0, y: 0.0, z: 5.0 },
+            renderable(handle, [0.0, 1.0, 0.0]),
+            SceneMeta { name: "mover".to_string(), mesh_path: "Content/sphere.obj".to_string() },
+            Script { path: "scripts/mover.lua".to_string() },
+        ));
+
+        let path = std::env::temp_dir().join(format!(
+            "trinity_roundtrip_{}_{}.scene",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        save_scene(&path_str, &mut world).expect("save must succeed");
+        let descs = parse_scene(&path_str).expect("parse must succeed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(descs.len(), 2, "both entities must round-trip");
+
+        let by_name: std::collections::HashMap<&str, &loader::EntityDesc> =
+            descs.iter().map(|d| (d.name.as_str(), d)).collect();
+
+        let cube = by_name["cube_a"];
+        assert_eq!(cube.position, [1.0, 2.0, 3.0]);
+        assert_eq!(cube.scale, [2.0, 1.0, 0.5]);
+        assert_eq!(cube.color, [1.0, 0.0, 0.0]);
+        assert_eq!(cube.mesh, "meshes/cube.obj");
+
+        let mover = by_name["mover"];
+        assert_eq!(mover.position, [-4.0, 0.0, 5.0]);
+        assert_eq!(mover.color, [0.0, 1.0, 0.0]);
+        assert_eq!(mover.mesh, "Content/sphere.obj");
+        assert_eq!(mover.script.as_deref(), Some("scripts/mover.lua"));
+    }
+
+    /// An empty world saves to a valid (empty) scene file that parses to zero
+    /// entities rather than erroring.
+    #[test]
+    fn scene_save_load_empty_roundtrip() {
+        let mut world = World::new();
+        let path = std::env::temp_dir().join(format!(
+            "trinity_empty_{}_{}.scene",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        save_scene(&path_str, &mut world).expect("save must succeed");
+        let descs = parse_scene(&path_str).expect("parse must succeed");
+        let _ = std::fs::remove_file(&path);
+        assert!(descs.is_empty());
+    }
+
+    /// Handles are cheap copyable IDs used as Renderable.mesh values.
+    #[test]
+    fn handle_types_resolve() {
+        let h: Handle<Mesh> = Handle::new(42);
+        let g: Handle<Mesh> = h;
+        assert_eq!(g.id, 42);
+    }
 }

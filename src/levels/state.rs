@@ -127,6 +127,65 @@ impl WorldStateManager {
         let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
+
+    /// Snapshot the live ECS world into a WorldStateManager, keyed by a level
+    /// name. Called automatically at save time so the save slot bundles actual
+    /// gameplay state (health, alive flags, transform) — not just scene layout.
+    pub fn capture_world(&mut self, world: &hecs::World, level_name: &str) {
+        use crate::components::{Health, Position, Rotation, SceneMeta};
+
+        // Remove stale state for this level first so killed/removed entities
+        // don't linger.
+        self.clear_level(level_name);
+
+        for (pos, meta, _rot, health) in world
+            .query::<(&Position, &SceneMeta, Option<&Rotation>, Option<&Health>)>()
+            .iter()
+        {
+            let alive = health.map_or(true, |h| h.current > 0);
+            let state = EntityState {
+                entity_name: meta.name.clone(),
+                position: [pos.x, pos.y, pos.z],
+                health: health.map(|h| h.current),
+                is_alive: alive,
+                custom_flags: std::collections::HashMap::new(),
+            };
+            self.save_entity(level_name, state);
+        }
+    }
+
+    /// Apply saved gameplay state back onto a freshly-loaded world.
+    ///
+    /// For every saved entity that still exists in the world (matched by name):
+    ///   - restores position
+    ///   - restores health (current/max)
+    /// (Rotation is already round-tripped through the .scene text.)
+    /// Entities that were saved as dead are NOT touched here — the scene
+    /// serializer already drops `alive = 0` entities so they never spawn.
+    pub fn apply_to_world(&self, world: &mut hecs::World, level_name: &str) {
+        use crate::components::{Health, Position, SceneMeta};
+
+        for state in self.get_level_states(level_name) {
+            let mut query = world
+                .query::<(hecs::Entity, &SceneMeta, Option<&mut Position>, Option<&mut Health>)>();
+            for (entity, meta, pos, health) in query.iter() {
+                if meta.name != state.entity_name {
+                    continue;
+                }
+                if let Some(p) = pos {
+                    p.x = state.position[0];
+                    p.y = state.position[1];
+                    p.z = state.position[2];
+                }
+                if let Some(h) = health {
+                    if let Some(current) = state.health {
+                        h.current = current;
+                    }
+                }
+                let _ = entity;
+            }
+        }
+    }
 }
 
 impl Default for WorldStateManager {

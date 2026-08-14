@@ -48,7 +48,6 @@
 use mlua::prelude::*;
 use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -121,7 +120,7 @@ pub const FLAT_API_NAMES: &[&str] = &[
     // Health
     "get_health", "set_health", "damage", "is_dead",
     // Spawning / assets
-    "spawn_mesh", "spawn_box", "load_model", "set_mesh_entity",
+    "spawn_mesh", "spawn_box", "spawn_prefab", "load_model", "set_mesh_entity",
     // Effects / environment
     "set_fire", "remove_fire", "set_weather",
     // UI (global helpers, in addition to the ui.* namespace)
@@ -132,9 +131,12 @@ pub const FLAT_API_NAMES: &[&str] = &[
     "get_camera", "set_camera", "look_at", "get_camera_direction", "screen_to_ray",
     "skip_next_frames", "dt",
     // Audio
-    "audio_play_sfx", "audio_play_music", "audio_play_at", "audio_stop_all",
+    "audio_play_sfx", "audio_play_music", "audio_play_at", "audio_play_at_loop",
+    "audio_move_sound", "audio_stop_all",
     "audio_set_volume", "audio_set_master_volume", "audio_is_music_playing",
     "audio_active_count", "audio_attenuation",
+    // Network
+    "net_host", "net_join", "net_stop", "net_role",
     // Events / timers / modules / files
     "on_event", "fire_event", "set_timeout", "clear_timeout", "require", "fs",
     "api_catalogue",
@@ -163,7 +165,7 @@ pub const NAMESPACED_API: &[(&str, &[&str])] = &[
     ),
     (
         "particles",
-        &["new_emitter", "active", "count", "fire", "remove_fire", "wind"],
+        &["new_emitter", "active", "count", "fire", "remove_fire", "wind", "burst"],
     ),
     (
         "levels",
@@ -465,6 +467,9 @@ pub struct ScriptEngine {
     meshes_ptr: usize,
     // Raw pointer to the environment WeatherState for set_weather().
     weather_ptr: usize,
+    // Raw pointer to the PrefabRegistry for spawn_prefab(). Set via
+    // set_prefabs() before each run_update() call.
+    prefabs_ptr: usize,
     // Raw pointer to the ParticleSystem for the particles.* Lua API.
     // Set via set_external_refs()/set_particles() before run_update().
     particles_ptr: usize,
@@ -501,6 +506,7 @@ pub struct ScriptEngine {
     /// Runtime UI manager exposed to Lua via the `ui.*` API and rendered by
     /// the engine each frame. Shared so Lua mutations are visible to the
     /// overlay renderer.
+    #[cfg(feature = "editor")]
     pub ui_manager: Option<std::sync::Arc<std::sync::Mutex<crate::ui::UiManager>>>,
     /// String-keyed Lua event callbacks. `on_event("name", fn)` registers a
     /// callback; `fire_event("name", ...)` calls all callbacks for that name.
@@ -617,6 +623,7 @@ impl ScriptEngine {
             terrain_world_ptr: 0,
             meshes_ptr: 0,
             weather_ptr: 0,
+            prefabs_ptr: 0,
             particles_ptr: 0,
             levels_ptr: 0,
             boids_ptr: 0,
@@ -629,6 +636,7 @@ impl ScriptEngine {
             sandbox: SandboxConfig::default(),
             plugins: Vec::new(),
             lua_plugins: Vec::new(),
+            #[cfg(feature = "editor")]
             ui_manager: None,
             lua_events: HashMap::new(),
             timers: HashMap::new(),
@@ -926,6 +934,13 @@ impl ScriptEngine {
         self.particles_ptr = particles as *mut crate::particles::ParticleSystem as usize;
     }
 
+    /// Store the raw pointer to the engine PrefabRegistry so the `spawn_prefab`
+    /// Lua API can instantiate `.prefab` templates at runtime.  Must be called
+    /// before run_update() each frame.
+    pub fn set_prefabs(&mut self, prefabs: &crate::scene::PrefabRegistry) {
+        self.prefabs_ptr = prefabs as *const crate::scene::PrefabRegistry as usize;
+    }
+
     /// Store the raw pointer to the engine LevelState so the `levels.*` Lua
     /// API can manage level lifecycle, the loading screen, and flooding.
     /// Must be called before run_update() each frame.
@@ -1084,10 +1099,13 @@ impl ScriptEngine {
         // Register UI-related Lua bindings (ui.create, ui.show, etc.) backed
         // by a real UiManager. The shared handle is stored so the engine can
         // render the active design each frame.
-        let ui_plugin = crate::ui::UiScriptPlugin::new();
-        self.ui_manager = Some(ui_plugin.manager_clone());
-        let ui_ref: &dyn crate::scripting_api::ScriptPlugin = &ui_plugin;
-        crate::scripting_api::mount_plugins(&self.lua, &[ui_ref])?;
+        #[cfg(feature = "editor")]
+        {
+            let ui_plugin = crate::ui::UiScriptPlugin::new();
+            self.ui_manager = Some(ui_plugin.manager_clone());
+            let ui_ref: &dyn crate::scripting_api::ScriptPlugin = &ui_plugin;
+            crate::scripting_api::mount_plugins(&self.lua, &[ui_ref])?;
+        }
 
         // ── Plugins ───────────────────────────────────────────────────────
         // Mount any game/engine-provided ScriptPlugins.  Each plugin is a
@@ -1259,7 +1277,9 @@ impl ScriptEngine {
         }
         let rel = format!("{}.lua", name.replace('.', "/"));
         let full = resolve_sandbox_read(&self.script_root, &rel)?;
-        let code = fs::read_to_string(&full).map_err(|e| {
+        // VFS so modules resolve from a packed game.pak in shipped builds too.
+        let full_str = full.to_string_lossy().to_string();
+        let code = crate::vfs::read_to_string(&full_str).map_err(|e| {
             LuaError::RuntimeError(format!("require '{name}': {}", e))
         })?;
         let env = self.lua.create_table()?;
@@ -1384,10 +1404,12 @@ impl ScriptEngine {
         Ok(table)
     }
 
-    // load_script() reads a .lua file from disk and executes it.
-    // This defines any top-level variables and the update() function.
+    // load_script() reads a .lua file from the VFS (disk or packed game.pak)
+    // and executes it. This defines any top-level variables and the update()
+    // function. A shipped pak-only game has no loose Content folder, so reads
+    // MUST go through the global VFS or scripts silently never load.
     pub fn load_script(&mut self, path: &str) -> LuaResult<()> {
-        let code = fs::read_to_string(path)
+        let code = crate::vfs::read_to_string(path)
             .map_err(|e| LuaError::RuntimeError(
                 format!("Could not load script {}: {}", path, e)
             ))?;
@@ -1424,24 +1446,25 @@ impl ScriptEngine {
 
     /// Load every `.lua` file in `dir` as a plugin.  Returns how many loaded.
     /// Skips failures (logged) so one broken plugin never blocks the rest.
+    /// Enumerates through the VFS so plugins ship inside a packed game.pak too.
     pub fn load_plugins(&mut self, dir: &str) -> LuaResult<usize> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
+        let found = match crate::vfs::walk_dir(dir) {
+            Ok(f) => f,
             Err(e) => {
                 tracing::warn!("[Plugins] Directory {} unavailable: {}", dir, e);
                 return Ok(0);
             }
         };
         let mut loaded = 0;
-        let mut files: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                let is_lua = p.extension().map_or(false, |x| x == "lua");
-                if !is_lua {
-                    return None;
+        let mut files: Vec<String> = found
+            .into_iter()
+            .filter(|rel| rel.ends_with(".lua"))
+            .map(|rel| {
+                if dir.is_empty() || dir == "." {
+                    rel
+                } else {
+                    format!("{}/{}", dir.trim_end_matches('/'), rel)
                 }
-                p.to_str().map(|s| s.to_string())
             })
             .collect();
         files.sort();
@@ -1459,7 +1482,7 @@ impl ScriptEngine {
 
     /// Load a single plugin file.  Returns the plugin name on success.
     pub fn load_plugin(&mut self, path: &str) -> LuaResult<String> {
-        let code = std::fs::read_to_string(path).map_err(|e| {
+        let code = crate::vfs::read_to_string(path).map_err(|e| {
             LuaError::RuntimeError(format!("plugin {path}: {e}"))
         })?;
 
@@ -1689,7 +1712,7 @@ impl ScriptEngine {
         Option<LuaRegistryKey>,
         u64,
     )> {
-        let code = fs::read_to_string(path)
+        let code = crate::vfs::read_to_string(path)
             .map_err(|e| LuaError::RuntimeError(format!("Could not load script {}: {}", path, e)))?;
 
         let globals = self.lua.globals();
@@ -1764,6 +1787,7 @@ impl ScriptEngine {
         script_path: &str,
         dt: f32,
         audio: Option<&mut crate::audio::AudioSystem>,
+        net: Option<&mut crate::net::NetworkManager>,
         screen_w: f32,
         screen_h: f32,
         fov_degrees: f32,
@@ -2128,6 +2152,66 @@ impl ScriptEngine {
             Ok(dead)
         })?;
         globals.set("is_dead", id)?;
+
+        // ── Destruction ───────────────────────────────────────────────────
+        // set_destructible(entity, shard_count, shard_mass, blast_velocity, lifetime)
+        // Marks the entity to shatter when its health hits 0.
+        let sd = self.lua.create_function(
+            move |_, (eid, count, mass, blast, lifetime): (u64, f32, f32, f32, f32)| {
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in set_destructible", eid);
+                    return Ok(());
+                };
+                let shards = (count as usize).clamp(2, 48);
+                let _ = world.insert(
+                    entity,
+                    (
+                        crate::destruction::Destructible {
+                            shard_count: shards,
+                            shard_mass: if mass > 0.0 { mass } else { 0.3 },
+                            blast_velocity: blast,
+                            shard_lifetime: if lifetime > 0.0 { lifetime } else { 6.0 },
+                        },
+                    ),
+                );
+                Ok(())
+            },
+        )?;
+        globals.set("set_destructible", sd)?;
+
+        // fracture(entity, shard_count, blast_velocity)
+        // Immediately shatters the entity, ignoring health. Returns shard count.
+        let fr = self.lua.create_function(
+            move |_, (eid, count, blast): (u64, f32, f32)| {
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let Some(entity) = Entity::from_bits(eid) else {
+                    tracing::warn!("[Scripting] Invalid entity bits 0x{:x} in fracture", eid);
+                    return Ok(0usize);
+                };
+                let shards = (count as usize).clamp(2, 48);
+                let _ = world.insert(
+                    entity,
+                    (
+                        crate::destruction::Destructible {
+                            shard_count: shards,
+                            shard_mass: 0.3,
+                            blast_velocity: blast,
+                            shard_lifetime: 6.0,
+                        },
+                    ),
+                );
+                // Force health to 0 so the destruction system picks it up next
+                // frame (its mesh + position are read before it despawns).
+                if let Ok(mut h) = world.get::<&mut Health>(entity) {
+                    h.current = 0;
+                } else {
+                    let _ = world.insert(entity, (Health::new(0),));
+                }
+                Ok(shards)
+            },
+        )?;
+        globals.set("fracture", fr)?;
 
         // ── Renderable ────────────────────────────────────────────────────
         // set_color(entity, r, g, b) — tint the entity this frame
@@ -2734,6 +2818,121 @@ impl ScriptEngine {
         })?;
         globals.set("set_mesh_entity", set_mesh)?;
 
+        // spawn_prefab(path_or_name, x, y, z, scale?) → entity id
+        // Instantiates a `.prefab` template from the engine PrefabRegistry at
+        // runtime.  `path_or_name` matches by file path ("Content/Prefabs/..")
+        // or by prefab name ("wooden_crate").  Optional `scale` uniformly
+        // scales the prefab's own scale.  The prefab supplies mesh, material,
+        // color, rotation, rigidbody, light and script; position/scale here are
+        // runtime overrides, mirroring how the editor places prefabs.
+        let prefabs_ptr = self.prefabs_ptr;
+        let spawn_prefab = self.lua.create_function(
+            move |_, (path, x, y, z, scale_override): (String, f32, f32, f32, mlua::Value)| {
+                if prefabs_ptr == 0 {
+                    return Err(mlua::Error::RuntimeError(
+                        "spawn_prefab: prefab registry is not available".to_string(),
+                    ));
+                }
+                let registry = unsafe { &*(prefabs_ptr as *const crate::scene::PrefabRegistry) };
+                let prefab = registry
+                    .get_by_path(&path)
+                    .or_else(|| registry.get_by_name(&path))
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "spawn_prefab: prefab '{path}' not found (loaded prefabs: {})",
+                            registry.count()
+                        ))
+                    })?;
+                let scale = match scale_override {
+                    mlua::Value::Number(n) => n as f32,
+                    _ => 1.0,
+                };
+
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                let meshes = unsafe { &mut *(meshes_ptr as *mut crate::assets::AssetStore<crate::assets::Mesh>) };
+                let cache = unsafe { &mut *(cache_ptr as *mut HashMap<String, crate::assets::Handle<crate::assets::Mesh>>) };
+
+                let handle = if let Some(h) = cache.get(&prefab.mesh).copied() {
+                    h
+                } else {
+                    let mesh = crate::assets::Mesh::load(&prefab.mesh)
+                        .map_err(mlua::Error::RuntimeError)?;
+                    let h = meshes.add(mesh);
+                    cache.insert(prefab.mesh.clone(), h);
+                    h
+                };
+
+                let sx = prefab.scale[0] * scale;
+                let sy = prefab.scale[1] * scale;
+                let sz = prefab.scale[2] * scale;
+                let entity = world.spawn((
+                    crate::components::Position { x, y, z },
+                    crate::components::Rotation {
+                        pitch: prefab.rotation[0].to_radians(),
+                        yaw: prefab.rotation[1].to_radians(),
+                        roll: prefab.rotation[2].to_radians(),
+                    },
+                    crate::components::Renderable {
+                        mesh: handle,
+                        color: prefab.color,
+                        metallic: prefab.metallic,
+                        roughness: prefab.roughness,
+                        ao: prefab.ao,
+                        scale: [sx, sy, sz],
+                    },
+                ));
+
+                if let Some(mass) = prefab.rigidbody {
+                    if mass > 0.0 {
+                        let mut body = crate::components::RigidBody::dynamic();
+                        body.mass = mass;
+                        let _ = world.insert(
+                            entity,
+                            (
+                                body,
+                                crate::components::Collider {
+                                    half_w: sx.abs() * 0.5,
+                                    half_h: sy.abs() * 0.5,
+                                    half_d: sz.abs() * 0.5,
+                                    layer: 1,
+                                    mask: 1,
+                                },
+                            ),
+                        );
+                    }
+                }
+                if let Some((light_type, color, intensity, range)) = &prefab.light {
+                    let _ = world.insert(
+                        entity,
+                        (crate::components::PointLight {
+                            color: *color,
+                            intensity: *intensity,
+                            range: *range,
+                            light_type: if light_type == "point" {
+                                1.0
+                            } else if light_type == "spot" {
+                                2.0
+                            } else {
+                                0.0
+                            },
+                            spot_angle: 45.0,
+                            shadow_casting: false,
+                        },),
+                    );
+                }
+                if let Some(script_path) = &prefab.script {
+                    let _ = world.insert(
+                        entity,
+                        (crate::components::Script {
+                            path: script_path.clone(),
+                        },),
+                    );
+                }
+                Ok(entity.to_bits().get())
+            },
+        )?;
+        globals.set("spawn_prefab", spawn_prefab)?;
+
         // get_all_entities() → Lua array of entity ids, optionally filtered by a
         // component name (e.g. "Position", "RigidBody") and/or "tag".
         let get_all = self.lua.create_function(
@@ -3295,18 +3494,26 @@ impl ScriptEngine {
             let ap_sfx = audio_ptr;
             let play_sfx_fn = self.lua.create_function(move |_, (path, volume, looping): (String, Option<f32>, Option<bool>)| {
                 let audio = unsafe { &mut *(ap_sfx as *mut crate::audio::AudioSystem) };
-                audio.play_sfx(&path, volume.unwrap_or(1.0), looping.unwrap_or(false));
-                Ok(())
+                let handle = audio.play_sfx(&path, volume.unwrap_or(1.0), looping.unwrap_or(false));
+                Ok(handle.map(|h| h.id()).unwrap_or(0))
             })?;
             globals.set("audio_play_sfx", play_sfx_fn)?;
 
             let ap_music = audio_ptr;
             let play_music_fn = self.lua.create_function(move |_, (path, volume, looping): (String, Option<f32>, Option<bool>)| {
                 let audio = unsafe { &mut *(ap_music as *mut crate::audio::AudioSystem) };
-                audio.play_music(&path, volume, looping.unwrap_or(true));
-                Ok(())
+                let handle = audio.play_music(&path, volume, looping.unwrap_or(true));
+                Ok(handle.map(|h| h.id()).unwrap_or(0))
             })?;
             globals.set("audio_play_music", play_music_fn)?;
+
+            let ap_ambient = audio_ptr;
+            let play_ambient_fn = self.lua.create_function(move |_, (path, volume): (String, Option<f32>)| {
+                let audio = unsafe { &mut *(ap_ambient as *mut crate::audio::AudioSystem) };
+                let handle = audio.play_ambient(&path, volume.unwrap_or(1.0));
+                Ok(handle.map(|h| h.id()).unwrap_or(0))
+            })?;
+            globals.set("audio_play_ambient", play_ambient_fn)?;
 
             let ap_stop = audio_ptr;
             let stop_all_fn = self.lua.create_function(move |_, ()| {
@@ -3315,6 +3522,25 @@ impl ScriptEngine {
                 Ok(())
             })?;
             globals.set("audio_stop_all", stop_all_fn)?;
+
+            let ap_stop_one = audio_ptr;
+            let stop_fn = self.lua.create_function(move |_, handle_id: u64| {
+                let audio = unsafe { &mut *(ap_stop_one as *mut crate::audio::AudioSystem) };
+                audio.stop(crate::audio::SoundHandle::from_id(handle_id, crate::audio::Channel::Sfx));
+                Ok(())
+            })?;
+            globals.set("audio_stop", stop_fn)?;
+
+            let ap_pitch = audio_ptr;
+            let set_pitch_fn = self.lua.create_function(move |_, (handle_id, pitch): (u64, f32)| {
+                let audio = unsafe { &mut *(ap_pitch as *mut crate::audio::AudioSystem) };
+                audio.set_sound_pitch(
+                    &crate::audio::SoundHandle::from_id(handle_id, crate::audio::Channel::Sfx),
+                    pitch,
+                );
+                Ok(())
+            })?;
+            globals.set("audio_set_pitch", set_pitch_fn)?;
 
             let ap_vol = audio_ptr;
             let set_volume_fn = self.lua.create_function(move |_, (channel, volume): (String, f32)| {
@@ -3357,17 +3583,36 @@ impl ScriptEngine {
             let play_at_fn = self.lua.create_function(
                 move |_, (path, x, y, z): (String, f32, f32, f32)| {
                     let audio = unsafe { &mut *(ap_at as *mut crate::audio::AudioSystem) };
-                    // Distance + stereo-pan spatial attenuation relative to the
-                    // listener (camera).  Base volume is 1.0; attenuation scopes
-                    // it to the world position so far sounds are quieter.
-                    let vol = audio.apply_spatial([x, y, z], 1.0);
-                    let pan = audio.stereo_pan([x, y, z]);
-                    let _ = pan; // pan is applied by the underlying sink mix.
-                    audio.play_sfx(&path, vol, false);
-                    Ok(())
+                    // Full 3D positional playback: per-ear panning + distance
+                    // falloff, refreshed against the listener every frame.
+                    let handle = audio.play_at(&path, [x, y, z], 1.0, false, 1.0, 100.0);
+                    Ok(handle.map(|h| h.id()).unwrap_or(0))
                 },
             )?;
             globals.set("audio_play_at", play_at_fn)?;
+
+            let ap_atl = audio_ptr;
+            let play_at_loop_fn = self.lua.create_function(
+                move |_, (path, x, y, z): (String, f32, f32, f32)| {
+                    let audio = unsafe { &mut *(ap_atl as *mut crate::audio::AudioSystem) };
+                    let handle = audio.play_at(&path, [x, y, z], 1.0, true, 1.0, 100.0);
+                    Ok(handle.map(|h| h.id()).unwrap_or(0))
+                },
+            )?;
+            globals.set("audio_play_at_loop", play_at_loop_fn)?;
+
+            let ap_mv = audio_ptr;
+            let move_sound_fn = self.lua.create_function(
+                move |_, (handle_id, x, y, z): (u64, f32, f32, f32)| {
+                    let audio = unsafe { &mut *(ap_mv as *mut crate::audio::AudioSystem) };
+                    audio.move_sound_to(
+                        &crate::audio::SoundHandle::from_id(handle_id, crate::audio::Channel::Sfx),
+                        [x, y, z],
+                    );
+                    Ok(())
+                },
+            )?;
+            globals.set("audio_move_sound", move_sound_fn)?;
 
             let ap_atten = audio_ptr;
             let attenuation_fn = self.lua.create_function(
@@ -3377,6 +3622,64 @@ impl ScriptEngine {
                 },
             )?;
             globals.set("audio_attenuation", attenuation_fn)?;
+        }
+
+        // ── Network API ────────────────────────────────────────────────
+        // Lua can host a session, join one, and tag entities with NetIds via
+        // `net_attach(id)`. Bindings are only mounted when networking is linked.
+        if let Some(net_ref) = net {
+            let net_ptr = net_ref as *mut crate::net::NetworkManager as usize;
+
+            let np_role = net_ptr;
+            let net_host_fn = self.lua.create_function(move |_, port: u32| {
+                let net_self = unsafe { &mut *(np_role as *mut crate::net::NetworkManager) };
+                match net_self.host(&format!("0.0.0.0:{}", port)) {
+                    Ok(()) => {
+                        tracing::info!("[Lua] net_host({})", port);
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        tracing::error!("[Lua] net_host failed: {}", e);
+                        Err(mlua::Error::runtime(e))
+                    }
+                }
+            })?;
+            globals.set("net_host", net_host_fn)?;
+
+            let np_join = net_ptr;
+            let net_join_fn = self.lua.create_function(
+                move |_, (host, port, net_id): (String, u32, u32)| {
+                    let net_self = unsafe { &mut *(np_join as *mut crate::net::NetworkManager) };
+                    let addr = format!("{}:{}", host, port);
+                    match net_self.connect(&addr, net_id) {
+                        Ok(()) => {
+                            tracing::info!("[Lua] net_join({}, {})", addr, net_id);
+                            Ok(true)
+                        }
+                        Err(e) => Err(mlua::Error::runtime(e)),
+                    }
+                },
+            )?;
+            globals.set("net_join", net_join_fn)?;
+
+            let np_attach = net_ptr;
+            let net_role_fn = self.lua.create_function(move |_, ()| {
+                let net_self = unsafe { &*(np_attach as *const crate::net::NetworkManager) };
+                Ok(match net_self.role() {
+                    crate::net::NetRole::Off => 0,
+                    crate::net::NetRole::Host => 1,
+                    crate::net::NetRole::Client => 2,
+                })
+            })?;
+            globals.set("net_role", net_role_fn)?;
+
+            let np_stop = net_ptr;
+            let net_stop_fn = self.lua.create_function(move |_, ()| {
+                let net_self = unsafe { &mut *(np_stop as *mut crate::net::NetworkManager) };
+                net_self.shutdown();
+                Ok(())
+            })?;
+            globals.set("net_stop", net_stop_fn)?;
         }
 
         // ── Behavior Tree (bt) API ─────────────────────────────────────
@@ -4092,7 +4395,10 @@ impl ScriptEngine {
             // particles.new(params) → emitter id.  `params` is a table:
             //   { x,y,z (position), spawn=, extent=Vec3, velocity=Vec3,
             //     spread=Vec3, rate=, life=(min,max), size=(min,max),
-            //     r,g,b,a (color), gravity=, active=bool, max=int }
+            //     r,g,b,a (color), gravity=, active=bool, max=int,
+            //     shape=("box"|"sphere"|"cone"), radius=, cone_angle=,
+            //     drag=, turbulence=, size_end=, color2_r/g/b/a=,
+            //     burst=int, follow_camera=bool }
             let new_emitter = self.lua.create_function(move |_lua, params: mlua::Table| {
                 let Some(ps) = particles_ref() else {
                     return Ok(0);
@@ -4121,7 +4427,7 @@ impl ScriptEngine {
                     params.get("spread_y").unwrap_or(0.5),
                     params.get("spread_z").unwrap_or(0.5),
                 );
-                                let lt_min: f32 = params.get("life_min").unwrap_or(1.0);
+                let lt_min: f32 = params.get("life_min").unwrap_or(1.0);
                 let lt_max: f32 = params.get("life_max").unwrap_or(2.0);
                 e.lifetime_min = lt_min;
                 e.lifetime_max = lt_max.max(lt_min);
@@ -4137,9 +4443,54 @@ impl ScriptEngine {
                 );
                 e.acceleration = glam::Vec3::new(0.0, params.get("gravity").unwrap_or(-9.8), 0.0);
                 e.active = params.get("active").unwrap_or(true);
+                // ── Power-up knobs ────────────────────────────────────────
+                use crate::particles::SpawnShape;
+                let shape = params.get::<String>("shape").unwrap_or_default();
+                e.spawn_shape = match shape.as_str() {
+                    "sphere" => SpawnShape::Sphere {
+                        radius: {
+                            let r: f32 = params.get("radius").unwrap_or(1.0);
+                            r.max(0.01)
+                        },
+                    },
+                    "cone" => SpawnShape::Cone {
+                        angle_rad: {
+                            let a: f32 = params.get("cone_angle").unwrap_or(1.0);
+                            a.max(0.001)
+                        },
+                    },
+                    _ => SpawnShape::Box,
+                };
+                e.drag = params.get("drag").unwrap_or(0.0);
+                e.turbulence = params.get("turbulence").unwrap_or(1.0);
+                e.size_end = params.get("size_end").unwrap_or(0.0);
+                let ce_r: f32 = params.get("color2_r").unwrap_or(-1.0);
+                if ce_r >= 0.0 {
+                    e.color_end = glam::Vec4::new(
+                        ce_r,
+                        params.get("color2_g").unwrap_or(1.0),
+                        params.get("color2_b").unwrap_or(1.0),
+                        params.get("color2_a").unwrap_or(0.0),
+                    );
+                    e.use_color_end = true;
+                }
+                e.follow_camera = params.get("follow_camera").unwrap_or(false);
+                e.burst(params.get("burst").unwrap_or(0u32));
                 Ok(ps.add_emitter(e))
             })?;
             particle_table.set("new_emitter", new_emitter)?;
+
+            // particles.burst(id, count) → spawn `count` particles instantly.
+            let burst = self.lua.create_function(move |_, (id, count): (usize, u32)| {
+                let Some(ps) = particles_ref() else {
+                    return Ok(());
+                };
+                if let Some(e) = ps.emitters.get_mut(id) {
+                    e.burst(count);
+                }
+                Ok(())
+            })?;
+            particle_table.set("burst", burst)?;
 
             // particles.active(id, enabled) → toggle an emitter on/off.
             let set_active = self.lua.create_function(move |_, (id, enabled): (usize, bool)| {
@@ -5032,11 +5383,11 @@ mod tests {
         let input = InputState::new();
 
         // First run: start() throws → swallowed, instance marked failed.
-        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, 640.0, 480.0, 60.0)?;
+        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, None, 640.0, 480.0, 60.0)?;
         assert!(scripts.failed_instances.contains_key(&bits));
 
         // Second run: skipped entirely (no re-build / no re-error).
-        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, 640.0, 480.0, 60.0)?;
+        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, None, 640.0, 480.0, 60.0)?;
         assert!(
             !scripts.instances.contains_key(&bits),
             "failed script must not be re-built every frame"
@@ -5046,7 +5397,7 @@ mod tests {
         // Fix the file and hot-reload → revision bump rebuilds and recovers.
         std::fs::write(&script_path, "function update(e, dt) log('fixed') end\n").unwrap();
         scripts.reload_script(&path)?;
-        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, 640.0, 480.0, 60.0)?;
+        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, None, 640.0, 480.0, 60.0)?;
         assert!(!scripts.failed_instances.contains_key(&bits));
         assert!(scripts.instances.contains_key(&bits));
 
@@ -5078,7 +5429,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn((crate::components::Script { path: path.clone() },));
         let input = InputState::new();
-        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, 640.0, 480.0, 60.0)?;
+        scripts.run_update(&mut world, &input, [0.0; 3], [0.0; 3], entity, &path, 0.016, None, None, 640.0, 480.0, 60.0)?;
         assert!(scripts_dir.join("data.txt").exists(), "restricted tier writes under script_root");
         assert!(!root.join("data.txt").exists());
         std::fs::remove_file(scripts_dir.join("data.txt")).unwrap();
@@ -5098,7 +5449,7 @@ mod tests {
 
         let mut world2 = hecs::World::new();
         let entity2 = world2.spawn((crate::components::Script { path: path.clone() },));
-        scripts2.run_update(&mut world2, &input, [0.0; 3], [0.0; 3], entity2, &path, 0.016, None, 640.0, 480.0, 60.0)?;
+        scripts2.run_update(&mut world2, &input, [0.0; 3], [0.0; 3], entity2, &path, 0.016, None, None, 640.0, 480.0, 60.0)?;
         assert!(root.join("data.txt").exists(), "privileged tier writes under fs_root");
 
         let _ = std::fs::remove_dir_all(&dir);

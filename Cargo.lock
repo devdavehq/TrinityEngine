@@ -12,13 +12,17 @@ dependencies = [
  "egui-winit",
  "egui_dock",
  "env_logger",
+ "flate2",
+ "game_api",
  "gilrs",
  "glam 0.32.1",
  "gltf",
  "hecs",
  "image",
+ "libloading",
  "log",
  "mlua",
+ "naga",
  "notify",
  "pollster",
  "rayon",
@@ -1590,6 +1594,17 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "game_api"
+version = "0.1.0"
+
+[[package]]
+name = "game_plugin"
+version = "0.1.0"
+dependencies = [
+ "game_api",
 ]
 
 [[package]]

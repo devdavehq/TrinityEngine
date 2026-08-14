@@ -149,6 +149,16 @@ impl CloudParams {
     /// GPU uniform data for the cloud shader.
     pub fn to_uniform_data(&self) -> CloudUniformData {
         let scale = self.type_scale();
+        // Cloud type must map to the ids the shader expects:
+        // 0 = None (no clouds), 1 = Cirrus, 2 = Stratus, 3 = Cumulus.
+        // The shader's `cloud_type.x < 0.5` early-out relies on None being 0 —
+        // the enum's own discriminants (Cirrus=0) would suppress all clouds.
+        let type_id = match self.cloud_type {
+            CloudType::None => 0.0,
+            CloudType::Cirrus => 1.0,
+            CloudType::Stratus => 2.0,
+            CloudType::Cumulus => 3.0,
+        };
         CloudUniformData {
             params: [
                 self.coverage,
@@ -163,7 +173,7 @@ impl CloudParams {
                 self.precipitation,
             ],
             scroll: [self.uv_offset.x, self.uv_offset.y, self.speed, 0.0],
-            cloud_type: [self.cloud_type as u32 as f32, 0.0, 0.0, 0.0],
+            cloud_type: [type_id, 0.0, 0.0, 0.0],
         }
     }
 }

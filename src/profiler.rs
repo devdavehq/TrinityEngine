@@ -1,6 +1,24 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::renderer::DrawStats;
+
+/// Rolling window of recent frame times (ms), newest last.
+/// Kept so the HUD can show live framing instead of only interval averages.
+const FRAME_HISTORY_CAP: usize = 240;
+
+/// Point-in-time frame stats for HUD / validation overlays.
+#[derive(Debug, Clone, Copy)]
+pub struct ProfilerSnapshot {
+    pub fps: f32,
+    pub frame_ms: f32,
+    pub avg_frame_ms: f32,
+    pub p95_frame_ms: f32,
+    pub min_frame_ms: f32,
+    pub max_frame_ms: f32,
+    pub draw_visible: u32,
+    pub draw_total: u32,
+}
 
 pub struct FrameProfiler {
     enabled: bool,
@@ -14,6 +32,9 @@ pub struct FrameProfiler {
     accum_visible: u64,
     accum_total: u64,
     last_overlay: String,
+    /// Recent per-frame times (ms) for live HUD stats.
+    frame_history: VecDeque<f32>,
+    last_draw_stats: DrawStats,
 }
 
 impl FrameProfiler {
@@ -30,6 +51,8 @@ impl FrameProfiler {
             accum_visible: 0,
             accum_total: 0,
             last_overlay: String::new(),
+            frame_history: VecDeque::with_capacity(FRAME_HISTORY_CAP),
+            last_draw_stats: DrawStats::default(),
         }
     }
 
@@ -53,6 +76,12 @@ impl FrameProfiler {
             "Triengine | FPS {:.1} | Frame {:.2}ms | Draw {}/{}",
             fps, frame_ms, draw_stats.visible, draw_stats.total
         );
+
+        self.frame_history.push_back(frame_ms as f32);
+        if self.frame_history.len() > FRAME_HISTORY_CAP {
+            self.frame_history.pop_front();
+        }
+        self.last_draw_stats = draw_stats;
 
         self.frame_count += 1;
         self.accum_frame_ms += frame_time.as_secs_f64() * 1000.0;
@@ -108,5 +137,85 @@ impl FrameProfiler {
         } else {
             None
         }
+    }
+
+    /// Live framing stats over the rolling window (synthetic data if fewer
+    /// than two frames have been recorded or the profiler is disabled).
+    pub fn snapshot(&self) -> ProfilerSnapshot {
+        let mut times: Vec<f32> = self.frame_history.iter().copied().collect();
+        times.sort_by(|a, b| a.total_cmp(b));
+        let len = times.len() as f32;
+        let sum: f32 = times.iter().sum();
+        let avg = if len > 0.0 { sum / len } else { 0.0 };
+        let (min, max) = if times.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (*times.first().unwrap(), *times.last().unwrap())
+        };
+        let p95 = if times.is_empty() {
+            0.0
+        } else {
+            let idx = ((times.len() as f64 * 0.95) - 1.0).max(0.0) as usize;
+            times[idx]
+        };
+        let frame_ms = *times.last().unwrap_or(&0.0);
+        let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
+        ProfilerSnapshot {
+            fps,
+            frame_ms,
+            avg_frame_ms: avg,
+            p95_frame_ms: p95,
+            min_frame_ms: min,
+            max_frame_ms: max,
+            draw_visible: self.last_draw_stats.visible as u32,
+            draw_total: self.last_draw_stats.total as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(total: usize, visible: usize) -> DrawStats {
+        DrawStats { total, visible, drawn: visible }
+    }
+
+    /// Frame-history framing: recording a set of frames must produce sane
+    /// average / p95 / min / max values and a livable FPS estimate.
+    #[test]
+    fn profiler_frames_and_snapshot_stats() {
+        let mut p = FrameProfiler::new(true, 1000);
+        // Feed a mix of frame times: mostly 16ms plus a couple of spikes.
+        for i in 0..100 {
+            let ms = if i % 25 == 0 { 50.0 } else { 16.0 };
+            p.record(
+                Duration::from_millis(ms as u64),
+                Duration::from_micros(200),
+                Duration::from_micros(300),
+                Duration::from_micros(1400),
+                Duration::from_micros(100),
+                stats(200, 120),
+                true,
+            );
+        }
+        let s = p.snapshot();
+        assert!((s.avg_frame_ms - 17.36).abs() < 0.5, "avg was {}", s.avg_frame_ms);
+        // 95% of frames are 16ms; the top-5% spikes don't move the p95 point.
+        assert!(s.p95_frame_ms >= 16.0 && s.p95_frame_ms <= 50.0);
+        assert!(s.min_frame_ms >= 15.9 && s.max_frame_ms <= 50.1);
+        assert!(s.fps >= 19.0 && s.fps <= 63.0);
+        assert_eq!(s.draw_total, 200);
+        assert_eq!(s.draw_visible, 120);
+    }
+
+    /// Disabled profiler must not accumulate history but still answer.
+    #[test]
+    fn profiler_disabled_returns_zeroed_snapshot() {
+        let mut p = FrameProfiler::new(false, 10);
+        p.record(Duration::from_millis(16), Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO, stats(10, 5), false);
+        let s = p.snapshot();
+        assert_eq!(s.avg_frame_ms, 0.0);
+        assert_eq!(s.draw_total, 0);
     }
 }

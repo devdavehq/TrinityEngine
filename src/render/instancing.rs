@@ -90,6 +90,11 @@ pub struct InstanceBatch {
     pub mesh_id: u32,
     /// Which material to use.
     pub material_id: u32,
+    /// LOD band of this batch (0 = full detail, 1-4 = progressively
+    /// simplified). Splitting batches along the LOD axis means every instance
+    /// in a batch shares one vertex buffer, so near instances never get
+    /// degraded because of a far one in the same batch.
+    pub lod_band: u8,
     /// CPU-side instance data. Rebuilt each frame (or when dirty).
     pub instances: Vec<InstanceData>,
     /// GPU buffer. Created/resized when instance count changes.
@@ -101,10 +106,11 @@ pub struct InstanceBatch {
 }
 
 impl InstanceBatch {
-    pub fn new(mesh_id: u32, material_id: u32) -> Self {
+    pub fn new(mesh_id: u32, material_id: u32, lod_band: u8) -> Self {
         Self {
             mesh_id,
             material_id,
+            lod_band,
             instances: Vec::new(),
             buffer: None,
             dirty: true,
@@ -120,8 +126,8 @@ impl InstanceBatch {
 //   3. render_batch() — issue one draw call per batch
 
 pub struct InstancingManager {
-    /// Key: (mesh_id, material_id) -> batch index
-    batch_index: HashMap<(u32, u32), usize>,
+    /// Key: (mesh_id, material_id, lod_band) -> batch index
+    batch_index: HashMap<(u32, u32, u32), usize>,
     /// All batches, indexed by batch_index.
     batches: Vec<InstanceBatch>,
     /// Maximum instances we've seen in any single batch (for buffer sizing).
@@ -147,16 +153,18 @@ impl InstancingManager {
     }
 
     /// Add an entity to the appropriate batch.
+    /// `lod_band` picks which simplified mesh the batch uses (0 = full detail).
     pub fn add_instance(
         &mut self,
         mesh_id: u32,
         material_id: u32,
+        lod_band: u8,
         instance: InstanceData,
     ) {
-        let key = (mesh_id, material_id);
+        let key = (mesh_id, material_id, lod_band as u32);
         let idx = *self.batch_index.entry(key).or_insert_with(|| {
             let idx = self.batches.len();
-            self.batches.push(InstanceBatch::new(mesh_id, material_id));
+            self.batches.push(InstanceBatch::new(mesh_id, material_id, lod_band));
             idx
         });
         self.batches[idx].instances.push(instance);
@@ -173,25 +181,35 @@ impl InstancingManager {
             let needed_size =
                 (batch.instances.len() * InstanceData::STRIDE) as wgpu::BufferAddress;
 
-            // Reuse buffer if large enough, otherwise recreate.
+            // Reuse buffer if large enough, otherwise recreate. Track the
+            // worst-case size we've ever needed so a fluctuating frame never
+            // forces an allocation after a lightly populated frame.
             let too_small = batch
                 .buffer
                 .as_ref()
                 .map_or(true, |b| b.size() < needed_size);
 
+            // Grow the historical max: this is what drives initial sizing, so
+            // later re-frames keep reusing the biggest buffer we've seen.
+            if batch.instances.len() > self.max_instances_per_batch {
+                self.max_instances_per_batch = batch.instances.len();
+            }
+
             if too_small {
-                // Allocate with 2x headroom to avoid frequent reallocation.
-                let alloc_size = (needed_size * 2).max(256 * InstanceData::STRIDE as u64);
+                // Allocate with headroom on top of the historical max so a
+                // buffer only reallocates when the workload actually grows
+                // beyond anything we've seen before.
+                let alloc_instances = self
+                    .max_instances_per_batch
+                    .max(batch.instances.len());
+                let alloc_size =
+                    (alloc_instances * InstanceData::STRIDE) as wgpu::BufferAddress;
                 batch.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Instance Buffer"),
                     size: alloc_size,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
-                // Update max for diagnostics.
-                self.max_instances_per_batch = self
-                    .max_instances_per_batch
-                    .max(batch.instances.len());
             }
 
             if let Some(buffer) = &batch.buffer {

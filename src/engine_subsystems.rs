@@ -102,6 +102,11 @@ pub struct AssetState {
 }
 
 impl AssetState {
+    /// Total mesh assets loaded in the store.
+    pub fn meshes_count_hint(&self) -> usize {
+        self.meshes.count()
+    }
+
     pub fn new() -> Self {
         Self {
             meshes: AssetStore::new(),

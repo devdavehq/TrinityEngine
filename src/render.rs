@@ -19,6 +19,7 @@
 pub mod instancing;
 pub mod graph;
 pub mod shader_manager;
+pub mod occlusion;
 
 pub use instancing::InstancingManager;
 pub use shader_manager::ShaderManager;

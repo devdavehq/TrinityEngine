@@ -71,6 +71,8 @@ script_hot_reload_enabled = true
 preferred_script_editor = ""
 # Watch Content/ for .obj/.png/.jpg changes and hot-reload assets.
 asset_hot_reload_enabled = true
+# Rust hot reload: rebuild + swap game_plugin.dll when game_plugin/**/*.rs changes.
+rust_hot_reload_enabled = true
 # Fast-object safety mode (substeps) to reduce bullet tunneling.
 physics_ccd_enabled = false
 # Upper bound for CCD substeps.

@@ -1,4 +1,4 @@
-#![allow(deprecated)]
+﻿#![allow(deprecated)]
 
 mod panels;
 
@@ -249,6 +249,8 @@ pub struct UiFrameArgs<'a> {
     pub time_of_day: &'a mut crate::environment::time_of_day::TimeOfDay,
     pub weather: &'a mut crate::environment::weather::WeatherState,
     pub audio: &'a mut Option<crate::audio::AudioSystem>,
+    /// Set true by the "Bake Lighting" button; main loop performs the bake.
+    pub bake_requested: &'a mut bool,
 }
 
 fn nearly_eq(a: f32, b: f32) -> bool {
@@ -947,9 +949,9 @@ impl EditorUi {
                                                         let _ = std::fs::create_dir_all(root.join("Content/Textures"));
                                                         let _ = std::fs::create_dir_all(root.join("Content/Scripts"));
                                                         let _ = std::fs::create_dir_all(root.join("Content/Prefabs"));
-                                                        let _ = std::fs::create_dir_all(root.join("scenes"));
+                                                        let _ = std::fs::create_dir_all(root.join(crate::scene::SCENE_DIR));
                                                         let _ = std::fs::create_dir_all(root.join(".trinity/cache/thumbnails"));
-                                                        let scene = root.join("scenes/main.scene");
+                                                        let scene = root.join(crate::scene::SCENE_DIR).join("main.scene");
                                                         if !scene.exists() {
                                                             let _ = std::fs::write(&scene, "");
                                                         }
@@ -1009,7 +1011,7 @@ impl EditorUi {
                 ui.vertical_centered(|ui| {
                     ui.heading(RichText::new("TrinityEngine Hub").color(Color32::from_rgb(214, 216, 220)));
                     ui.label(
-                        RichText::new(format!("Engine v{ENGINE_VERSION} · Integrated GPU: use editor toolbar preset if this PC struggles."))
+                        RichText::new(format!("Engine v{ENGINE_VERSION} Â· Integrated GPU: use editor toolbar preset if this PC struggles."))
                             .color(Color32::from_rgb(150, 155, 164)),
                     );
                     ui.add_space(16.0);
@@ -1019,14 +1021,14 @@ impl EditorUi {
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                             if hub_registry.projects.is_empty() {
-                                ui.label("No saved projects yet — add or create one below.");
+                                ui.label("No saved projects yet â€” add or create one below.");
                             } else {
                                 let mut remove_idx: Option<usize> = None;
                                 for (i, p) in hub_registry.projects.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new(&p.name).strong());
                                         let ev = if p.engine_version_at_last_open.is_empty() {
-                                            "—".to_string()
+                                            "â€”".to_string()
                                         } else {
                                             p.engine_version_at_last_open.clone()
                                         };
@@ -1100,9 +1102,9 @@ impl EditorUi {
                                         let _ = std::fs::create_dir_all(root.join("Content/Textures"));
                                         let _ = std::fs::create_dir_all(root.join("Content/Scripts"));
                                         let _ = std::fs::create_dir_all(root.join("Content/Prefabs"));
-                                        let _ = std::fs::create_dir_all(root.join("scenes"));
+                                        let _ = std::fs::create_dir_all(root.join(crate::scene::SCENE_DIR));
                                         let _ = std::fs::create_dir_all(root.join(".trinity/cache/thumbnails"));
-                                        let scene = root.join("scenes/main.scene");
+                                        let scene = root.join(crate::scene::SCENE_DIR).join("main.scene");
                                         if !scene.exists() {
                                             let _ = std::fs::write(&scene, "");
                                         }
@@ -1130,7 +1132,7 @@ impl EditorUi {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!(
-                            "Session {:.1}s · layouts save to {:?}",
+                            "Session {:.1}s Â· layouts save to {:?}",
                             elapsed,
                             editor_persist::trinity_data_dir()
                         ))
@@ -1274,7 +1276,7 @@ impl EditorUi {
                             .color(Color32::from_rgb(210, 212, 218)),
                     );
                     ui.label(
-                        RichText::new("Loading workspace…")
+                        RichText::new("Loading workspaceâ€¦")
                             .color(Color32::from_rgb(150, 155, 165)),
                     );
                     ui.add_space(10.0);
@@ -1655,9 +1657,7 @@ fn build_ui(
     });
 
     if !(args.settings.runtime.legacy_editor_ui || std::env::var("TRINITY_LEGACY_UI").is_ok()) {
-        if args.available_scene_paths.iter().all(|p| p != scene_picker_choice) {
-            *scene_picker_choice = args.scene_path.clone();
-        } else if scene_picker_choice.is_empty() {
+        if args.available_scene_paths.iter().all(|p| p != scene_picker_choice) || scene_picker_choice.is_empty() {
             *scene_picker_choice = args.scene_path.clone();
         }
         let project_name = std::env::current_dir()
@@ -1752,6 +1752,7 @@ fn build_ui(
                         self.show_foliage_editor,
                         self.args.error_log,
                         self.egui_ctx,
+                        self.args.bake_requested,
                     ),
                     EditorDockTab::Profiler => {
                         if let Some(text) = self.args.profiler.overlay_text() {
@@ -2102,10 +2103,11 @@ fn build_ui(
                         "Material Editor",
                         "Instance-driven workflow mapped to your current render/material system.",
                     );
-                    if let Some(entity) = args.selected_renderable.as_ref().copied() {
+if let Some(entity) = args.selected_renderable.as_ref().copied() {
                         editor_tool_card(ui, "Selection", |ui| {
                             ui.label(RichText::new(format!("Selected {:?}", entity)).strong());
                         });
+                        let mut pending_apply: Option<(String, Result<(), String>)> = None;
                         if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
                             editor_tool_card(ui, "Surface", |ui| {
                                 ui.color_edit_button_rgb(&mut rend.color);
@@ -2118,13 +2120,18 @@ fn build_ui(
                                 ui.horizontal_wrapped(|ui| {
                                     for name in args.materials.instance_names() {
                                         if ui.button(&name).clicked() {
-                                            if let Err(e) = args.materials.apply_instance(&name, &mut rend) {
-                                                args.error_log.push(format!("[Material] {}", e));
-                                            }
+                                            pending_apply = Some((name.clone(), args.materials.apply_instance(&name, &mut rend)));
                                         }
                                     }
                                 });
                             });
+                        }
+                        if let Some((name, res)) = pending_apply.take() {
+                            if let Err(e) = res {
+                                args.error_log.push(format!("[Material] {}", e));
+                            } else if let Ok(extras) = args.materials.instance_extras(&name) {
+                                let _ = args.world.insert(entity, (extras,));
+                            }
                         }
                         ui.add_space(8.0);
                         editor_tool_card(ui, "Texture Slots", |ui| {
@@ -2358,8 +2365,8 @@ fn build_ui(
                             if !name.ends_with(".scene") {
                                 name.push_str(".scene");
                             }
-                            let _ = fs::create_dir_all("scenes");
-                            let p = format!("scenes/{}", name);
+                            let _ = fs::create_dir_all(crate::scene::SCENE_DIR);
+                            let p = crate::scene::scene_path(&name);
                             if fs::write(&p, "").is_ok() {
                                 *scene_picker_choice = p.clone();
                                 *args.requested_scene_switch = Some(p);
@@ -2375,7 +2382,7 @@ fn build_ui(
                             if !dst_name.ends_with(".scene") {
                                 dst_name.push_str(".scene");
                             }
-                            let dst = format!("scenes/{}", dst_name);
+                            let dst = crate::scene::scene_path(&dst_name);
                             match fs::copy(&src, &dst) {
                                 Ok(_) => args.error_log.push(format!("[Scene] Duplicated to {}", dst)),
                                 Err(e) => args.error_log.push(format!("[Scene] Duplicate failed: {}", e)),
@@ -2391,7 +2398,7 @@ fn build_ui(
                             if !dst_name.ends_with(".scene") {
                                 dst_name.push_str(".scene");
                             }
-                            let dst = format!("scenes/{}", dst_name);
+                            let dst = crate::scene::scene_path(&dst_name);
                             match fs::rename(&src, &dst) {
                                 Ok(_) => {
                                     *args.requested_scene_switch = Some(dst.clone());
@@ -2444,8 +2451,8 @@ fn build_ui(
                                     if let Some(home) = std::env::var_os("USERPROFILE") {
                                         let p = std::path::PathBuf::from(home).join("Documents").join("TriengineProject");
                                         let _ = std::fs::create_dir_all(p.join("Content"));
-                                        let _ = std::fs::create_dir_all(p.join("scenes"));
-                                        let scene = p.join("scenes/main.scene");
+                                        let _ = std::fs::create_dir_all(p.join(crate::scene::SCENE_DIR));
+                                        let scene = p.join(crate::scene::SCENE_DIR).join("main.scene");
                                         if !scene.exists() {
                                             let _ = std::fs::write(&scene, "");
                                         }
@@ -2716,7 +2723,7 @@ fn build_ui(
                                     ui.label("Z:");
                                     ui.add(egui::DragValue::new(&mut w.z_order).range(-10..=10));
                                 });
-                                // Colour editors — show RGB sliders for text and background.
+                                // Colour editors â€” show RGB sliders for text and background.
                                 ui.horizontal(|ui| {
                                     ui.label("Text:");
                                     ui.add(egui::DragValue::new(&mut w.color[0]).prefix("R ").speed(0.01).range(0.0..=1.0));
@@ -2731,7 +2738,7 @@ fn build_ui(
                                     ui.add(egui::DragValue::new(&mut w.bg_color[3]).prefix("A ").speed(0.01).range(0.0..=1.0));
                                 });
                             });
-                            // Drag-and-drop handle — click & drag to reposition.
+                            // Drag-and-drop handle â€” click & drag to reposition.
                             let resp = ui.interact(ui.max_rect(), egui::Id::new(format!("widget_drag_{}", w.id)), egui::Sense::drag());
                             if resp.dragged() {
                                 let delta = resp.drag_delta();
@@ -2746,10 +2753,10 @@ fn build_ui(
                 }
                 ui.separator();
                 ui.label(RichText::new("Lua API").small().strong());
-                ui.label("set_ui_value(\"id\", 0.75)  — numeric value");
-                ui.label("set_ui_text(\"id\", \"text\")  — text override");
-                ui.label("set_ui_visible(\"id\", true)  — show/hide");
-                ui.label("get_ui_value(\"id\")  — read back value");
+                ui.label("set_ui_value(\"id\", 0.75)  â€” numeric value");
+                ui.label("set_ui_text(\"id\", \"text\")  â€” text override");
+                ui.label("set_ui_visible(\"id\", true)  â€” show/hide");
+                ui.label("get_ui_value(\"id\")  â€” read back value");
             });
 
         for w in widget_specs.iter() {
@@ -2906,13 +2913,13 @@ UiWidgetKind::Slider => {
             }
             if ui
                 .button("Integrated GPU")
-                .on_hover_text("Low-cost preset: smaller shadows, no probes/bloom/SSAO/voxel — good for Intel UHD and battery")
+                .on_hover_text("Low-cost preset: smaller shadows, no probes/bloom/SSAO/voxel â€” good for Intel UHD and battery")
                 .clicked()
             {
                 args.renderer.features = RenderFeatures::low_end();
                 args.settings.sync_render_from_renderer_features(&args.renderer.features);
                 args.error_log.push(
-                    "[Quality] Applied Integrated GPU profile — heavy effects off. Toggle them in the toolbar when on a faster PC."
+                    "[Quality] Applied Integrated GPU profile â€” heavy effects off. Toggle them in the toolbar when on a faster PC."
                         .to_string(),
                 );
             }
@@ -3154,6 +3161,7 @@ UiWidgetKind::Slider => {
                         self.show_foliage_editor,
                         self.args.error_log,
                         self.egui_ctx,
+                        self.args.bake_requested,
                     );
                 }
                 EditorDockTab::Profiler => {
@@ -3172,7 +3180,7 @@ UiWidgetKind::Slider => {
                         ui.add(
                             egui::TextEdit::singleline(self.console_filter)
                                 .desired_width(220.0)
-                                .hint_text("substring…"),
+                                .hint_text("substringâ€¦"),
                         );
                         if ui.button("Clear log").clicked() {
                             self.args.error_log.clear();
@@ -3490,7 +3498,7 @@ UiWidgetKind::Slider => {
             ui.add(egui::Slider::new(&mut args.renderer.features.ssao_strength, 0.0..=1.0).text("SSAO"));
             ui.add(egui::Slider::new(&mut args.renderer.features.fog_density, 0.0..=0.20).text("Fog density"));
             ui.separator();
-            // ── Tone Mapping + Colour Grading ──────────────────────────────
+            // â”€â”€ Tone Mapping + Colour Grading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.horizontal(|ui| {
                 ui.label("Tone Mapping");
                 ui.checkbox(&mut args.renderer.features.tonemap_enabled, "");
@@ -3504,7 +3512,7 @@ UiWidgetKind::Slider => {
                 ui.add(egui::Slider::new(&mut args.renderer.features.tonemap_grain, 0.0..=0.1).text("Film Grain"));
             }
             ui.separator();
-            // ── Wind ───────────────────────────────────────────────────────
+            // â”€â”€ Wind â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.label("Wind");
             ui.add(egui::Slider::new(&mut args.renderer.features.wind_strength, 0.0..=1.0).text("Strength"));
             ui.horizontal(|ui| {
@@ -3514,7 +3522,7 @@ UiWidgetKind::Slider => {
                 ui.add(egui::Slider::new(&mut args.renderer.features.wind_dir[2], -1.0..=1.0).step_by(0.01));
             });
             ui.separator();
-            // ── Screen-Space Reflections ────────────────────────────────────
+            // â”€â”€ Screen-Space Reflections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.horizontal(|ui| {
                 ui.label("Screen-Space Reflections");
                 ui.checkbox(&mut args.renderer.features.ssr_enabled, "");
@@ -3526,13 +3534,13 @@ UiWidgetKind::Slider => {
                 ui.add(egui::Slider::new(&mut args.renderer.features.ssr_intensity, 0.0..=2.0).text("Intensity"));
             }
             ui.separator();
-            // ── Water Rendering ─────────────────────────────────────────────
+            // â”€â”€ Water Rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.horizontal(|ui| {
                 ui.label("Water Surfaces");
                 ui.checkbox(&mut args.renderer.features.water_enabled, "");
             });
             ui.separator();
-            // ── Lava Rendering ──────────────────────────────────────────────
+            // â”€â”€ Lava Rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.horizontal(|ui| {
                 ui.label("Lava Surfaces");
                 ui.checkbox(&mut args.renderer.features.lava_enabled, "");
@@ -3582,7 +3590,7 @@ UiWidgetKind::Slider => {
             ui.add(egui::Slider::new(&mut args.weather.cloud_coverage, 0.0..=1.0).text("Clouds"));
             ui.add(egui::Slider::new(&mut args.weather.wind_strength, 0.0..=20.0).text("Wind"));
             ui.separator();
-            // ── Audio Controls ──────────────────────────────────────────────
+            // â”€â”€ Audio Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.label("Audio");
             if let Some(audio) = args.audio.as_mut() {
                 ui.horizontal(|ui| {
@@ -3745,15 +3753,24 @@ UiWidgetKind::Slider => {
                     if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
                         let _ = args.materials.apply_instance("matte_black", &mut rend);
                     }
+                    if let Ok(extras) = args.materials.instance_extras("matte_black") {
+                        let _ = args.world.insert(entity, (extras,));
+                    }
                 }
                 if ui.button("Apply silver_brushed").clicked() {
                     if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
                         let _ = args.materials.apply_instance("silver_brushed", &mut rend);
                     }
+                    if let Ok(extras) = args.materials.instance_extras("silver_brushed") {
+                        let _ = args.world.insert(entity, (extras,));
+                    }
                 }
                 if ui.button("Apply foliage_leaf").clicked() {
                     if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
                         let _ = args.materials.apply_instance("foliage_leaf", &mut rend);
+                    }
+                    if let Ok(extras) = args.materials.instance_extras("foliage_leaf") {
+                        let _ = args.world.insert(entity, (extras,));
                     }
                 }
                 ui.separator();
@@ -4476,8 +4493,8 @@ UiWidgetKind::Slider => {
                         if !name.ends_with(".scene") {
                             name.push_str(".scene");
                         }
-                        let _ = fs::create_dir_all("scenes");
-                        let p = format!("scenes/{}", name);
+                        let _ = fs::create_dir_all(crate::scene::SCENE_DIR);
+                        let p = crate::scene::scene_path(&name);
                         if fs::write(&p, "").is_ok() {
                             *scene_picker_choice = p.clone();
                             *args.requested_scene_switch = Some(p);
@@ -4493,7 +4510,7 @@ UiWidgetKind::Slider => {
                         if !dst_name.ends_with(".scene") {
                             dst_name.push_str(".scene");
                         }
-                        let dst = format!("scenes/{}", dst_name);
+                        let dst = crate::scene::scene_path(&dst_name);
                         match fs::copy(&src, &dst) {
                             Ok(_) => args.error_log.push(format!("[Scene] Duplicated to {}", dst)),
                             Err(e) => args.error_log.push(format!("[Scene] Duplicate failed: {}", e)),
@@ -4509,7 +4526,7 @@ UiWidgetKind::Slider => {
                         if !dst_name.ends_with(".scene") {
                             dst_name.push_str(".scene");
                         }
-                        let dst = format!("scenes/{}", dst_name);
+                        let dst = crate::scene::scene_path(&dst_name);
                         match fs::rename(&src, &dst) {
                             Ok(_) => {
                                 *args.requested_scene_switch = Some(dst.clone());
@@ -4558,8 +4575,8 @@ UiWidgetKind::Slider => {
                     if let Some(home) = std::env::var_os("USERPROFILE") {
                         let p = std::path::PathBuf::from(home).join("Documents").join("TriengineProject");
                         let _ = std::fs::create_dir_all(p.join("Content"));
-                        let _ = std::fs::create_dir_all(p.join("scenes"));
-                        let scene = p.join("scenes/main.scene");
+                        let _ = std::fs::create_dir_all(p.join(crate::scene::SCENE_DIR));
+                        let scene = p.join(crate::scene::SCENE_DIR).join("main.scene");
                         if !scene.exists() {
                             let _ = std::fs::write(&scene, "");
                         }
@@ -5051,7 +5068,7 @@ pub(crate) fn pick_entity_in_viewport(
     best.map(|b| b.0)
 }
 
-fn project_to_screen(camera: &dyn Camera, rect: egui::Rect, world: glam::Vec3) -> Option<egui::Pos2> {
+pub(crate) fn project_to_screen(camera: &dyn Camera, rect: egui::Rect, world: glam::Vec3) -> Option<egui::Pos2> {
     let clip = camera.view_projection_matrix() * glam::Vec4::new(world.x, world.y, world.z, 1.0);
     if clip.w <= 0.0001 {
         return None;
@@ -5060,6 +5077,34 @@ fn project_to_screen(camera: &dyn Camera, rect: egui::Rect, world: glam::Vec3) -
     let sx = rect.left() + ((ndc.x + 1.0) * 0.5) * rect.width();
     let sy = rect.top() + ((1.0 - (ndc.y + 1.0) * 0.5) * rect.height());
     Some(egui::pos2(sx, sy))
+}
+
+/// Unprojects a screen point onto the world plane passing through
+/// `plane_point` with normal `plane_normal` (used for gizmo dragging).
+pub(crate) fn screen_to_plane_world(
+    camera: &dyn Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    plane_point: glam::Vec3,
+    plane_normal: glam::Vec3,
+) -> Option<glam::Vec3> {
+    let inv_vp = camera.view_projection_matrix().inverse();
+    let ndc_x = ((pointer.x - rect.left()) / rect.width()) * 2.0 - 1.0;
+    let ndc_y = 1.0 - ((pointer.y - rect.top()) / rect.height()) * 2.0;
+    let near = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+    let far = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let near = (near.truncate() / near.w.max(1e-6));
+    let far = (far.truncate() / far.w.max(1e-6));
+    let dir = (far - near).normalize();
+    let denom = plane_normal.dot(dir);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = plane_normal.dot(plane_point - near) / denom;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(near + dir * t)
 }
 
 fn dist_point_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {

@@ -35,6 +35,14 @@ pub struct MasterMaterial {
     pub metallic: f32,
     pub roughness: f32,
     pub ao: f32,
+    /// Self-illumination: albedo × emissive_strength added to lighting.
+    pub emissive_strength: f32,
+    /// Subsurface scattering amount (skin, leaves, wax).
+    pub subsurface: f32,
+    /// Clearcoat layer strength (car paint, lacquered wood).
+    pub clearcoat: f32,
+    /// Clearcoat roughness (0 = mirror, 1 = rough clearcoat).
+    pub clearcoat_roughness: f32,
 }
 
 /// A material instance that references a master and applies multipliers.
@@ -45,6 +53,10 @@ pub struct MaterialInstance {
     pub metallic_mul: f32,
     pub roughness_mul: f32,
     pub ao_mul: f32,
+    pub emissive_mul: f32,
+    pub subsurface_mul: f32,
+    pub clearcoat_mul: f32,
+    pub clearcoat_roughness_mul: f32,
 }
 
 /// Parsed representation of a .material TOML file.
@@ -82,6 +94,10 @@ impl MaterialLibrary {
                 metallic: 0.0,
                 roughness: 0.7,
                 ao: 1.0,
+                emissive_strength: 0.0,
+                subsurface: 0.0,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.6,
             },
         );
         self.masters.insert(
@@ -91,6 +107,10 @@ impl MaterialLibrary {
                 metallic: 1.0,
                 roughness: 0.3,
                 ao: 1.0,
+                emissive_strength: 0.0,
+                subsurface: 0.0,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.4,
             },
         );
         self.masters.insert(
@@ -100,6 +120,10 @@ impl MaterialLibrary {
                 metallic: 0.0,
                 roughness: 0.9,
                 ao: 1.0,
+                emissive_strength: 0.0,
+                subsurface: 0.25,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.6,
             },
         );
 
@@ -111,6 +135,10 @@ impl MaterialLibrary {
                 metallic_mul: 0.0,
                 roughness_mul: 1.1,
                 ao_mul: 1.0,
+                emissive_mul: 1.0,
+                subsurface_mul: 1.0,
+                clearcoat_mul: 1.0,
+                clearcoat_roughness_mul: 1.0,
             },
         );
         self.instances.insert(
@@ -121,6 +149,10 @@ impl MaterialLibrary {
                 metallic_mul: 1.0,
                 roughness_mul: 1.2,
                 ao_mul: 1.0,
+                emissive_mul: 1.0,
+                subsurface_mul: 1.0,
+                clearcoat_mul: 0.2,
+                clearcoat_roughness_mul: 1.0,
             },
         );
         self.instances.insert(
@@ -131,6 +163,10 @@ impl MaterialLibrary {
                 metallic_mul: 0.0,
                 roughness_mul: 1.0,
                 ao_mul: 1.0,
+                emissive_mul: 1.0,
+                subsurface_mul: 1.0,
+                clearcoat_mul: 1.0,
+                clearcoat_roughness_mul: 1.0,
             },
         );
     }
@@ -139,42 +175,39 @@ impl MaterialLibrary {
 
     /// Scan a directory for .material files and load them.
     /// This is the main data-driven entry point.
+    /// Enumerates through the VFS so materials ship inside a packed game.pak
+    /// too (a shipped game has no loose Content folder on disk).
     pub fn load_from_directory(&mut self, dir: impl AsRef<Path>) {
-        let dir = dir.as_ref();
-        if !dir.is_dir() {
+        let dir = dir.as_ref().to_string_lossy().to_string();
+        if !crate::vfs::exists(&dir) {
             tracing::info!(
                 "[Materials] Directory {:?} not found, using hardcoded defaults.",
                 dir
             );
             return;
         }
-        self.visit_directory(dir);
+        let mut files: Vec<String> = crate::vfs::walk_dir(&dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rel| {
+                let ext = rel
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                ext == "material" || ext == "mat"
+            })
+            .map(|rel| format!("{}/{}", dir.trim_end_matches('/'), rel))
+            .collect();
+        files.sort();
+        for path_str in files {
+            self.load_material_file(Path::new(&path_str));
+        }
         tracing::info!(
             "[Materials] Loaded {} masters, {} instances from disk.",
             self.masters.len(),
             self.instances.len()
         );
-    }
-
-    fn visit_directory(&mut self, dir: &Path) {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                self.visit_directory(&path);
-                continue;
-            }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if ext == "material" || ext == "mat" {
-                self.load_material_file(&path);
-            }
-        }
     }
 
     /// Parse a single .material TOML file and register it.
@@ -296,6 +329,28 @@ impl MaterialLibrary {
         Ok(())
     }
 
+    /// Apply a material instance and ALSO configure the advanced PBR extras
+    /// (emissive, subsurface, clearcoat) that drive the material-node shading.
+    /// Returns the MaterialExtras to insert on the entity.
+    pub fn instance_extras(&self, name: &str) -> Result<crate::components::MaterialExtras, String> {
+        let inst = self
+            .instances
+            .get(name)
+            .ok_or_else(|| format!("Material instance '{}' not found", name))?;
+        let master = self
+            .masters
+            .get(&inst.master)
+            .ok_or_else(|| format!("Master material '{}' not found", inst.master))?;
+        Ok(crate::components::MaterialExtras {
+            subsurface: (master.subsurface * inst.subsurface_mul).clamp(0.0, 1.0),
+            clearcoat: (master.clearcoat * inst.clearcoat_mul).clamp(0.0, 1.0),
+            clearcoat_roughness: (master.clearcoat_roughness
+                * inst.clearcoat_roughness_mul)
+                .clamp(0.0, 1.0),
+            emissive_strength: (master.emissive_strength * inst.emissive_mul).clamp(0.0, 10.0),
+        })
+    }
+
     /// Apply a master material directly (no instance multiplier).
     pub fn apply_master(
         &self,
@@ -330,6 +385,10 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
     let mut metallic = 0.0f32;
     let mut roughness = 0.5f32;
     let mut ao = 1.0f32;
+    let mut emissive_strength = 0.0f32;
+    let mut subsurface = 0.0f32;
+    let mut clearcoat = 0.0f32;
+    let mut clearcoat_roughness = 0.6f32;
 
     // Instance fields
     let mut master_ref = String::new();
@@ -337,6 +396,10 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
     let mut metallic_mul = 1.0f32;
     let mut roughness_mul = 1.0f32;
     let mut ao_mul = 1.0f32;
+    let mut emissive_mul = 1.0f32;
+    let mut subsurface_mul = 1.0f32;
+    let mut clearcoat_mul = 1.0f32;
+    let mut clearcoat_roughness_mul = 1.0f32;
 
     let mut in_material_section = false;
 
@@ -379,6 +442,14 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             "metallic_mul" => metallic_mul = parse_f32(value),
             "roughness_mul" => roughness_mul = parse_f32(value),
             "ao_mul" => ao_mul = parse_f32(value),
+            "emissive" | "emissive_strength" => emissive_strength = parse_f32(value),
+            "emissive_mul" => emissive_mul = parse_f32(value),
+            "subsurface" => subsurface = parse_f32(value),
+            "subsurface_mul" => subsurface_mul = parse_f32(value),
+            "clearcoat" => clearcoat = parse_f32(value),
+            "clearcoat_mul" => clearcoat_mul = parse_f32(value),
+            "clearcoat_roughness" => clearcoat_roughness = parse_f32(value),
+            "clearcoat_roughness_mul" => clearcoat_roughness_mul = parse_f32(value),
 
             // Array values: base_color = [0.5, 0.3, 0.1]
             "base_color" => {
@@ -417,6 +488,10 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             metallic_mul,
             roughness_mul,
             ao_mul,
+            emissive_mul,
+            subsurface_mul,
+            clearcoat_mul,
+            clearcoat_roughness_mul,
         })
     } else {
         MaterialFile::Master(MasterMaterial {
@@ -424,6 +499,10 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             metallic,
             roughness,
             ao,
+            emissive_strength,
+            subsurface,
+            clearcoat,
+            clearcoat_roughness,
         })
     };
 

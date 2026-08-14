@@ -4,11 +4,16 @@ version = "0.1.0"
 edition = "2024"   # Always use 2025, it's the modern Rust edition
 
 [features]
-default = ["audio", "scripting", "editor"]
+default = ["audio", "scripting", "editor", "hotreload"]
 audio = ["dep:rodio"]
 scripting = ["dep:mlua"]
 editor = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit", "dep:egui_dock"]
 jolt = ["dep:rolt"]
+# Rust hot reload: engine keeps running while game_plugin.dll is rebuilt/swapped.
+hotreload = ["dep:libloading", "dep:game_api"]
+# Shippable game build: no editor binaries at all. `--game` boots straight
+# into Play mode. Build with: cargo build --release --no-default-features --features runtime
+runtime = ["audio", "scripting"]
 
 [dependencies]
 # We'll add libraries here as we need them, one phase at a time
@@ -40,8 +45,19 @@ gltf = "1.4.1"
 rodio = { version = "0.19", optional = true }
 rolt = { version = "0.3", optional = true }
 rfd = "0.15"
+flate2 = "1.0"
+# Hot-reload runtime: map game_plugin.dll and swap it live on save.
+libloading = { version = "0.8", optional = true }
+game_api = { path = "game_api", optional = true }
+
+
+[workspace]
+members = ["game_api", "game_plugin"]
 
 
 [lib]
 name = "triengine"
 crate-type = ["rlib"]  # "rlib" means reusable library
+
+[dev-dependencies]
+naga = { version = "29.0.1", features = ["wgsl-in"] }

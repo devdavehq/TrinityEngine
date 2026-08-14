@@ -373,7 +373,6 @@ impl NavMesh {
                 } else {
                     result.push(left);
                     apex = left;
-                    left = apex;
                     right = apex;
                 }
             }
@@ -384,7 +383,6 @@ impl NavMesh {
                 } else {
                     result.push(right);
                     apex = right;
-                    right = apex;
                     left = apex;
                 }
             }

@@ -226,6 +226,8 @@ pub struct RuntimeSettings {
     pub script_hot_reload_enabled: bool,
     pub preferred_script_editor: String,
     pub asset_hot_reload_enabled: bool,
+    /// Rebuild + swap game_plugin.dll on save (editor mode only).
+    pub rust_hot_reload_enabled: bool,
     /// Continuous-collision style substep mode for fast projectiles.
     pub physics_ccd_enabled: bool,
     /// Maximum physics substeps per frame when CCD mode is enabled.
@@ -268,6 +270,16 @@ pub struct RuntimeSettings {
     pub startup_scene_path: String,
     /// When true, use the old undocked multi-panel editor instead of egui_dock (deprecated).
     pub legacy_editor_ui: bool,
+    /// Write a rolling autosave/checkpoint to the autosave slot while running.
+    pub autosave_enabled: bool,
+    /// Seconds between autosave writes (0 disables the interval timer).
+    pub autosave_interval_seconds: f32,
+    /// Default window width for the shippable runtime (no editor prefs).
+    pub window_width: u32,
+    /// Default window height for the shippable runtime (no editor prefs).
+    pub window_height: u32,
+    /// Present synchronised to the display refresh (true) or uncapped (false).
+    pub vsync_enabled: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -284,6 +296,7 @@ impl Default for RuntimeSettings {
             script_hot_reload_enabled: true,
             preferred_script_editor: String::new(),
             asset_hot_reload_enabled: true,
+            rust_hot_reload_enabled: true,
             physics_ccd_enabled: false,
             physics_max_substeps: 2,
             physics_broadphase_enabled: true,
@@ -303,8 +316,13 @@ impl Default for RuntimeSettings {
             physics_manifold_warm_start_enabled: false,
             physics_full_angular_3d_enabled: false,
             gpu_scalability_tier: "auto".to_string(),
-            startup_scene_path: "scenes/main.scene".to_string(),
+            startup_scene_path: "Content/scenes/main.scene".to_string(),
             legacy_editor_ui: false,
+            autosave_enabled: true,
+            autosave_interval_seconds: 30.0,
+            window_width: 1280,
+            window_height: 720,
+            vsync_enabled: true,
         }
     }
 }

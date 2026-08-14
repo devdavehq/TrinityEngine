@@ -64,4 +64,9 @@ impl<T> AssetStore<T> {
     pub fn replace(&mut self, handle: &Handle<T>, new_asset: T) {
         self.assets.insert(handle.id, new_asset);
     }
+
+    /// Number of assets currently held.
+    pub fn count(&self) -> usize {
+        self.assets.len()
+    }
 }

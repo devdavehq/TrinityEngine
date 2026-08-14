@@ -433,6 +433,33 @@ pub struct MaterialTexture {
 // PlayerStart marks where player-controlled entities spawn in Game Preview.
 pub struct PlayerStart;
 
+// Decal — a projector volume that paints albedo onto the G-buffer after the
+// geometry pass. The box (transform scale) is where the paint appears; pixels
+// of the stored depth that pass through the box get the decal colour blended
+// in. Great for bullet holes, warning stripes, road markings, dirt.
+#[derive(Clone, Copy)]
+pub struct Decal {
+    /// Decal colour / tint (RGB).
+    pub color: [f32; 3],
+    /// Blend opacity (0 = invisible, 1 = full).
+    pub opacity: f32,
+    /// Rotation in degrees around the decal's facing axis (roll on the surface).
+    pub roll_deg: f32,
+    /// Projector box size — the volume of the surface that receives the paint.
+    pub size: [f32; 3],
+}
+
+impl Default for Decal {
+    fn default() -> Self {
+        Self {
+            color: [0.9, 0.2, 0.2],
+            opacity: 0.85,
+            roll_deg: 0.0,
+            size: [2.0, 2.0, 0.6],
+        }
+    }
+}
+
 // PointLight — a local light source (point, spot, or directional).
 // Multiple lights are supported via the multi-light uniform buffer (up to 16).
 #[derive(Clone, Copy)]
@@ -569,6 +596,31 @@ pub enum CollisionPhase {
 pub struct SceneMeta {
     pub name: String,
     pub mesh_path: String,
+}
+
+// NetId — marks an entity as shared over the network. The host replicates every
+// NetId entity in its snapshot; clients apply updates to local copies with the
+// same id. Simply adding this component to both sides makes an entity
+// multiplayer-aware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetId {
+    pub id: u32,
+}
+
+// Occluder — marks an entity as a large static volume that should occlude
+// geometry behind it. Used by the software occlusion culler to reject hidden
+// meshes. Entities with this component are still rendered normally; they just
+// also feed the occlusion grid.
+#[derive(Clone, Copy)]
+pub struct Occluder {
+    /// Radius of the occluding volume in world units. Larger = hides more.
+    pub radius: f32,
+}
+
+impl Default for Occluder {
+    fn default() -> Self {
+        Self { radius: 5.0 }
+    }
 }
 
 // WaterSurface — marks an entity as a water body.

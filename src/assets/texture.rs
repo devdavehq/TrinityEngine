@@ -33,8 +33,12 @@ impl Texture {
         path:    &str,
         is_srgb: bool,
     ) -> Result<Texture, String> {
-        let img  = image::open(path)
-            .map_err(|e| format!("Cannot open texture {}: {}", path, e))?;
+        // Read through the VFS so textures can come from a packed .pak archive
+        // just as easily as from loose files.
+        let bytes = crate::vfs::read(path)
+            .map_err(|e| format!("Cannot read texture {}: {}", path, e))?;
+        let img  = image::load_from_memory(&bytes)
+            .map_err(|e| format!("Cannot decode texture {}: {}", path, e))?;
         let rgba = img.to_rgba8();
         let (w, h) = img.dimensions();
 

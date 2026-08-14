@@ -1,19 +1,19 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+﻿#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![allow(dead_code)]
 
 // src/main.rs
 // Engine entry point. Wires all systems together.
 // Uses winit 0.30's ApplicationHandler trait (no old EventLoop::run() closure).
 //
-// ── winit 0.30 pattern ───────────────────────────────────────────────────────
-// • Create EventLoop, call run_app() with a struct that impls ApplicationHandler.
-// • resumed()      → called when the OS says the app is ready (create window here).
-// • window_event() → called for keyboard, resize, close, redraw requests.
-// • about_to_wait()→ idle — good place to request the next frame.
+// â”€â”€ winit 0.30 pattern â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â€¢ Create EventLoop, call run_app() with a struct that impls ApplicationHandler.
+// â€¢ resumed()      â†’ called when the OS says the app is ready (create window here).
+// â€¢ window_event() â†’ called for keyboard, resize, close, redraw requests.
+// â€¢ about_to_wait()â†’ idle â€” good place to request the next frame.
 //
-// ── wgpu 29 changes ──────────────────────────────────────────────────────────
-// • Renderer::new() takes Arc<Window> instead of &Window.
-// • Renderer has no lifetime parameter.
+// â”€â”€ wgpu 29 changes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â€¢ Renderer::new() takes Arc<Window> instead of &Window.
+// â€¢ Renderer has no lifetime parameter.
 
 mod core;
 mod render;
@@ -41,14 +41,18 @@ mod materials;
 mod navigation;
 mod navmesh;
 mod boids;
+mod destruction;
 mod cinematics;
 mod ai;
 mod physics;
 mod particles;
 mod profiler;
+#[cfg(feature = "hotreload")]
+mod hotreload;
 mod renderer;
 mod scene;
 mod levels;
+#[cfg(feature = "editor")]
 mod ui;
 mod settings;
 #[cfg(feature = "scripting")]
@@ -62,6 +66,74 @@ mod resources;
 mod engine_subsystems;
 mod demo_plugin;
 mod save_plugin;
+mod net;
+// Crash handler + persistent log sink (feature-independent).
+mod robustness;
+// Per-profile save slots (#4) — feature-independent.
+mod save_slots;
+
+// â”€â”€ Runtime (non-editor) shims â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// When built without the `editor` feature (a shippable game/runtime build), the
+// editor module and editor_persist are compiled out. These inert stand-ins keep
+// the editor-flavoured free functions referenced from the shared frame loop
+// valid so the SAME exe can ship stripped of every egui dependency.
+#[cfg(not(feature = "editor"))]
+mod editor {
+    pub fn describe_toggle(_name: &str) -> &'static str {
+        // Toggles still work in the runtime build; there is just no editor to
+        // explain what they do.
+        "Editor is not included in this build."
+    }
+
+    pub fn print_hierarchy(_world: &hecs::World) {}
+
+    pub fn print_asset_browser() {}
+
+    pub fn cycle_preset(current: crate::settings::RenderPreset) -> crate::settings::RenderPreset {
+        current
+    }
+
+    pub fn add_foliage_patch(
+        _world: &mut hecs::World,
+        _meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
+        _cache: &mut std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
+    ) {
+    }
+}
+
+#[cfg(not(feature = "editor"))]
+mod editor_persist {
+    pub struct EditorWindowPrefs {
+        pub width: u32,
+        pub height: u32,
+        pub pos_x: Option<i32>,
+        pub pos_y: Option<i32>,
+    }
+
+    /// Per-machine app data dir, shared with the editor build so saves and the
+    /// project registry survive a switch between editor and runtime builds.
+    pub fn trinity_data_dir() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                return std::path::PathBuf::from(local).join("TrinityEngine");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Ok(home) = std::env::var("HOME") {
+                return std::path::PathBuf::from(home).join(".local/share/TrinityEngine");
+            }
+        }
+        std::path::PathBuf::from(".trinity")
+    }
+
+    pub fn load_window_prefs() -> Option<EditorWindowPrefs> {
+        None
+    }
+
+    pub fn save_window_prefs(_prefs: &EditorWindowPrefs) {}
+}
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -87,18 +159,22 @@ use navigation::NavGrid;
 use ai::AiRegistry;
 use ai::components::ai_system;
 use physics::{physics_system, character_controller_system, ragdoll_system, water_trigger_system};
+use destruction::destruction_system;
 use profiler::FrameProfiler;
 use renderer::Renderer;
 use scene::{SceneManager, SubSceneManager, SceneTransition};
 use settings::EngineSettings;
 #[cfg(feature = "scripting")]
 use scripting::ScriptEngine;
+#[cfg(feature = "scripting")]
 use systems::scripting_system;
 use terrain::{remove_nearby_foliage, spawn_foliage_ring, TerrainWorld};
 
 // New core systems
 use core::{EventBus, BeginFrameEvent, EndFrameEvent};
-use core::events::{TimeOfDayChangedEvent, WeatherChangedEvent, ThunderEvent};
+use core::events::{TimeOfDayChangedEvent, ThunderEvent};
+#[cfg(feature = "editor")]
+use core::events::WeatherChangedEvent;
 use render::{InstancingManager, ShaderManager};
 #[cfg(feature = "audio")]
 use audio::AudioSystem;
@@ -134,7 +210,7 @@ enum AppStage {
     EditorReady,
 }
 
-// ── PlaySnapshot ─────────────────────────────────────────────────────────────
+// â”€â”€ PlaySnapshot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Captures the full editor state before entering Game Preview so we can
 // restore it when the user exits play mode.  This ensures the scene always
 // returns to exactly where the user left it in the editor.
@@ -149,25 +225,26 @@ struct PlaySnapshot {
     camera_pitch: f32,
 }
 
-// ── GameApp ───────────────────────────────────────────────────────────────────
+// â”€â”€ GameApp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Owns all engine state. Created before the event loop starts.
 // Fields are Option<> for anything that needs a window to initialise.
 struct GameApp {
-    // GPU renderer — None until resumed() fires and we have a window.
+    // GPU renderer â€” None until resumed() fires and we have a window.
     renderer:   Option<Renderer>,
     // winit window wrapped in Arc so wgpu Surface can hold a reference.
     window:     Option<Arc<Window>>,
 
     world:      World,
-    // ── Asset subsystem ──────────────────────────────────────────────────
+    // â”€â”€ Asset subsystem â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     assets: AssetState,
-    // ── Camera & input subsystem ─────────────────────────────────────────
+    // â”€â”€ Camera & input subsystem â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     input_state: CameraInputState,
     #[cfg(feature = "scripting")]
     scripts:    ScriptEngine,
     /// Demo plugin: shows the engine's formal ScriptPlugin extension pattern.
     /// Registered onto Lua globals and ticked each frame so Lua can call its
     /// `demo.*` functions and read per-frame state.
+    #[cfg(feature = "scripting")]
     demo_plugin: demo_plugin::DemoPlugin,
     scene_mgr:  SceneManager,
     /// Sub-scene manager: loads scenes inside the current scene at world offsets.
@@ -181,6 +258,7 @@ struct GameApp {
     #[cfg(feature = "editor")]
     editor_shell: EditorShell,
     #[cfg(feature = "editor")]
+    #[cfg(feature = "editor")]
     editor_ui: Option<EditorUi>,
     #[cfg(feature = "editor")]
     editor_backend: Box<dyn EditorBackend>,
@@ -190,7 +268,7 @@ struct GameApp {
     terrain_cursor_x: usize,
     terrain_cursor_z: usize,
 
-    // ── New core systems ──────────────────────────────────────────────────
+    // â”€â”€ New core systems â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Event bus: the nervous system. All inter-system communication goes here.
     events: EventBus,
     // GPU instancing: batches identical meshes into one draw call.
@@ -198,34 +276,47 @@ struct GameApp {
     // Shader management: compilation, caching, hot-reload.
     shader_mgr: ShaderManager,
 
-    // ── Environment subsystem ────────────────────────────────────────────
+    // â”€â”€ Environment subsystem â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     env: EnvironmentState,
 
-    // ── Splash visual system ─────────────────────────────────────────────
+    // â”€â”€ Splash visual system â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     splash_manager: SplashManager,
 
-    // ── Level streaming subsystem ────────────────────────────────────────
+    // â”€â”€ Level streaming subsystem â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     levels: LevelState,
 
-    // ── Audio system ────────────────────────────────────────────────────
+    // â”€â”€ Audio system â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[cfg(feature = "audio")]
     audio: Option<AudioSystem>,
 
-    // ── Particle system ────────────────────────────────────────────────
+    // â”€â”€ Network subsystem â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    net: net::NetworkManager,
+
+    // â”€â”€ Particle system â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     particles: particles::ParticleSystem,
     particle_indices: [usize; 4],
 
-    // ── Boids / flocking system ─────────────────────────────────────────
+    // â”€â”€ Boids / flocking system â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     boids: boids::BoidRegistry,
 
-    // ── Jolt Physics backend ────────────────────────────────────────────
+    // â”€â”€ Jolt Physics backend â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[cfg(feature = "jolt")]
     jolt: Option<physics::jolt_bridge::JoltBridge>,
 
-    // Hot-reload receivers — Option because they're set up after the watcher starts.
+    // Hot-reload receivers â€” Option because they're set up after the watcher starts.
     script_watcher: Option<std::sync::mpsc::Receiver<String>>,
     scene_watcher:  Option<std::sync::mpsc::Receiver<String>>,
     asset_watcher:  Option<std::sync::mpsc::Receiver<String>>,
+
+    /// True when launched with `--game [scene]` → skip the editor/hub entirely
+    /// and boot straight into Play mode. This is the shippable runtime path.
+    runtime_mode: bool,
+
+    /// Per-profile save slots (#4). Lives outside the game folder so repackaging
+    /// never wipes player saves.
+    save_slots: save_slots::SaveSlots,
+    /// When the next interval autosave is due (runtime mode only).
+    next_autosave_at: std::time::Instant,
 
     last_frame: std::time::Instant,
     start_time: std::time::Instant,
@@ -243,9 +334,12 @@ struct GameApp {
     script_hot_reload_enabled: bool,
     preferred_script_editor: String,
     asset_hot_reload_enabled: bool,
+    /// Rust hot reload: auto-rebuilds + swaps game_plugin.dll on save.
+    #[cfg(feature = "hotreload")]
+    hot_reload: Option<crate::hotreload::RustHotReloader>,
     game_preview_mode: bool,
     prev_game_preview_mode: bool,
-    /// Snapshot of entity state before entering Game Preview — restored on exit.
+    /// Snapshot of entity state before entering Game Preview â€” restored on exit.
     play_snapshot: Option<PlaySnapshot>,
     app_stage: AppStage,
     project_stage_started_at: std::time::Instant,
@@ -253,13 +347,81 @@ struct GameApp {
     available_scene_paths: Vec<String>,
     scene_list_dirty: bool,
     requested_scene_switch: Option<String>,
+    /// Set by the editor's "Bake Lighting" button; consumed next frame.
+    bake_requested: bool,
     stop_asset_watch: Arc<AtomicBool>,
     stop_scene_watch: Arc<AtomicBool>,
 }
 
 impl GameApp {
     fn new() -> Self {
-        let settings = EngineSettings::load("engine_settings.toml");
+        // `--game [scene]` boots the runtime (no hub/editor).
+        // Any extra positional args are treated as the scene path.
+        // `--pak <file.pak>` serves Content from a packed archive (read-first,
+        // disk fallback) — install it before anything reads assets.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let runtime_mode = args.iter().any(|a| a == "--game");
+        // Scene arg = the first positional token that is neither a flag nor the
+        // value consumed by a preceding flag (`--pak <file>`). Without this, a
+        // `--game --pak game.pak main.scene` launch would misread "game.pak".
+        let scene_arg = {
+            let mut found = None;
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--pak" {
+                    i += 2; // skip --pak and its value
+                    continue;
+                }
+                if !args[i].starts_with("--") {
+                    found = Some(args[i].clone());
+                    break;
+                }
+                i += 1;
+            }
+            found
+        };
+
+        #[allow(clippy::needless_collect)]
+        let pak_index = args.iter().position(|a| a == "--pak");
+        if let Some(idx) = pak_index {
+            if let Some(file) = args.get(idx + 1) {
+                match vfs::pak::PakFile::open(file) {
+                    Ok(pak) => {
+                        let overlay: Arc<dyn vfs::Vfs> =
+                            Arc::new(vfs::PakFirstVfs::new(pak));
+                        vfs::init_global_vfs(overlay);
+                        tracing::info!(
+                            "[Pak] Content served from {} (forwarded through VFS).",
+                            file
+                        );
+                    }
+                    Err(e) => tracing::error!("[Pak] Could not open {}: {}", file, e),
+                }
+            }
+        } else {
+            // No explicit --pak: a shippable game ships its data as `game.pak`
+            // beside the executable. Serve it pak-first (disk fallback) so a
+            // dev workspace with loose Content still works untouched.
+            for candidate in ["game.pak", "content.pak", "data.pak"] {
+                if std::path::Path::new(candidate).exists() {
+                    match vfs::pak::PakFile::open(candidate) {
+                        Ok(pak) => {
+                            let overlay: Arc<dyn vfs::Vfs> =
+                                Arc::new(vfs::PakFirstVfs::new(pak));
+                            vfs::init_global_vfs(overlay);
+                            tracing::info!(
+                                "[Pak] Auto-loaded {} (shipped game data).",
+                                candidate
+                            );
+                        }
+                        Err(e) => tracing::error!("[Pak] Could not open {}: {}", candidate, e),
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut settings = EngineSettings::load("engine_settings.toml");
         let jobs = JobSystem::new(
             settings.runtime.multithreading_enabled,
             settings.runtime.worker_threads,
@@ -271,9 +433,22 @@ impl GameApp {
         let script_hot_reload_enabled = settings.runtime.script_hot_reload_enabled;
         let preferred_script_editor = settings.runtime.preferred_script_editor.clone();
         let asset_hot_reload_enabled = settings.runtime.asset_hot_reload_enabled;
+        #[cfg(feature = "hotreload")]
+        let rust_hot_reload_enabled = settings.runtime.rust_hot_reload_enabled;
         let frame_interval = std::time::Duration::from_micros(
             (1_000_000u64 / settings.runtime.max_fps.max(15) as u64).max(1),
         );
+        // In --game mode an explicit scene path wins; otherwise fall back to the
+        // settings' startup scene (resolved under Content/scenes).
+        let scene_path = if runtime_mode {
+            scene_arg
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| resolve_primary_scene_path(&settings.runtime.startup_scene_path))
+        } else {
+            resolve_primary_scene_path(&settings.runtime.startup_scene_path)
+        };
+        // Remember the scene so switch_to_project() re-resolves to the same file.
+        settings.runtime.startup_scene_path = scene_path.clone();
 
         Self {
             renderer:       None,
@@ -283,11 +458,15 @@ impl GameApp {
             input_state:    CameraInputState::new(),
             #[cfg(feature = "scripting")]
             scripts:        ScriptEngine::new(),
+            #[cfg(feature = "scripting")]
             demo_plugin:    demo_plugin::DemoPlugin::new(),
-            scene_mgr:      SceneManager::new(&resolve_primary_scene_path(&settings.runtime.startup_scene_path)),
+            scene_mgr:      SceneManager::new(&scene_path),
             sub_scene_mgr:  SubSceneManager::new(),
             transition:     SceneTransition::new(),
+            runtime_mode,
             settings,
+            save_slots: save_slots::SaveSlots::new(),
+            next_autosave_at: std::time::Instant::now(),
             jobs,
             profiler,
             #[cfg(feature = "editor")]
@@ -304,6 +483,16 @@ impl GameApp {
             events:     EventBus::new(),
             instancing: InstancingManager::new(),
             shader_mgr: ShaderManager::new(),
+            #[cfg(feature = "hotreload")]
+            hot_reload: {
+                if runtime_mode || !rust_hot_reload_enabled {
+                    None
+                } else {
+                    Some(crate::hotreload::RustHotReloader::new(
+                        crate::hotreload::find_project_root(),
+                    ))
+                }
+            },
             // Environment subsystem
             env: EnvironmentState::new(),
             splash_manager: SplashManager::new(),
@@ -312,6 +501,8 @@ impl GameApp {
             // Audio
             #[cfg(feature = "audio")]
             audio: AudioSystem::new(),
+            // Network (UDP host/client world-state sync)
+            net: net::NetworkManager::new(),
             // Particles
             particles: particles::ParticleSystem::new(),
             particle_indices: [0, 1, 2, 3],
@@ -348,14 +539,140 @@ impl GameApp {
             available_scene_paths: Vec::new(),
             scene_list_dirty: true,
             requested_scene_switch: None,
+            bake_requested: false,
             stop_asset_watch: Arc::new(AtomicBool::new(false)),
             stop_scene_watch: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Serialize the live world into a save slot. Autosave/checkpoint slots roll
+    /// over on every write. Returns the persisted entity count (None on error).
+    ///
+    /// Two things are stored per slot:
+    ///   - `slot_<n>.dat`    → the .scene text (entity layout + transforms +
+    ///                         rotation + health + alive flags)
+    ///   - `slot_<n>.state`  → the WorldStateManager JSON (health/alive/flags)
+    ///
+    /// Capture happens against the shared world-state manager so the `save.*`
+    /// Lua plugin and the runtime autosave always agree.
+    fn write_save_slot(&mut self, slot: u32, label: &str, autosave: bool) -> Option<u32> {
+        let scene = self.scene_mgr.scene_path.clone();
+        let content = match crate::scene::serialize_scene(&mut self.world) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[Save] serialize failed: {}", e);
+                return None;
+            }
+        };
+        let entity_count = content.matches("[entity]").count() as u32;
+
+        // Capture live gameplay state into the shared WorldStateManager and
+        // stash its JSON beside the scene payload.
+        let level = self.scene_mgr.scene_name.clone();
+        {
+            let mut ws = self.levels.world_state.lock().unwrap();
+            ws.capture_world(&self.world, &level);
+            if let Ok(json) = serde_json::to_string(&*ws) {
+                if self.save_slots.save_state(slot, &json).is_err() {
+                    tracing::warn!("[Save] Could not write world-state file for slot {}", slot);
+                }
+            }
+        }
+
+        let mut meta = save_slots::SlotMeta::new(label);
+        meta.scene = scene;
+        meta.entity_count = entity_count;
+        meta.autosave = autosave;
+        match self.save_slots.save(slot, meta, &content) {
+            Ok(()) => {
+                tracing::info!(
+                    "[Save] Slot {} '{}' written ({} entities) -> {}",
+                    slot,
+                    label,
+                    entity_count,
+                    self.save_slots.dir().display()
+                );
+                Some(entity_count)
+            }
+            Err(e) => {
+                tracing::error!("[Save] Slot {} write failed: {}", slot, e);
+                None
+            }
+        }
+    }
+
+    /// Restore a slot's payload by pointing the scene manager at the saved
+    /// content and rebuilding the world (same full-rebuild path as scene load).
+    /// Afterwards restores the gameplay state (WorldStateManager) into the
+    /// shared manager and onto matching live entities.
+    fn load_save_slot(&mut self, slot: u32) -> bool {
+        let entry = match self.save_slots.load(slot) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                tracing::warn!("[Save] Slot {} is empty", slot);
+                return false;
+            }
+            Err(e) => {
+                tracing::error!("[Save] Slot {} read failed: {}", slot, e);
+                return false;
+            }
+        };
+        let stub = crate::editor_persist::trinity_data_dir()
+            .join("quicksave_tmp.scene")
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "Content/scenes/_quicksave_tmp.scene".to_string());
+        if std::fs::write(&stub, entry.payload.as_bytes()).is_err() {
+            tracing::error!("[Save] Could not stage quickload payload");
+            return false;
+        }
+        tracing::info!(
+            "[Save] Loading slot {} '{}' ({} entities, scene {})",
+            slot,
+            entry.meta.label,
+            entry.meta.entity_count,
+            entry.meta.scene
+        );
+        self.assets.mesh_cache.clear();
+        self.scene_mgr.scene_path.clone_from(&stub);
+        let rebuilt = self.scene_mgr.build(
+            &mut self.world,
+            &mut self.assets.meshes,
+            &mut self.assets.mesh_cache,
+            Some(&self.assets.prefab_registry),
+        );
+        let _ = std::fs::remove_file(&stub);
+        if rebuilt.is_err() {
+            tracing::error!("[Save] Quickload rebuild failed: {:?}", rebuilt);
+            return false;
+        }
+        // Reload baked light probes so quickloaded levels keep their GI.
+        if let Some(r) = self.renderer.as_mut() {
+            let _ = r.load_probes();
+        }
+
+        // Restore gameplay state: the saved WorldStateManager (health, alive,
+        // flags) is loaded back into the shared manager and applied to the
+        // freshly-spawned entities by name.
+        if let Ok(Some(state_json)) = self.save_slots.load_state(slot) {
+            match serde_json::from_str::<crate::levels::WorldStateManager>(&state_json) {
+                Ok(saved) => {
+                    let level = self.scene_mgr.scene_name.clone();
+                    saved.apply_to_world(&mut self.world, &level);
+                    let mut ws = self.levels.world_state.lock().unwrap();
+                    *ws = saved;
+                    tracing::info!("[Save] Restored gameplay state for level '{}'", level);
+                }
+                Err(e) => tracing::error!("[Save] World-state JSON invalid: {}", e),
+            }
+        }
+
+        true
+    }
+
     /// Attempt to initialize the Jolt Physics backend.
     /// Called once at startup or when the user explicitly requests Jolt.
-    /// Requires CMake to build the Jolt native library — falls back gracefully.
+    /// Requires CMake to build the Jolt native library â€” falls back gracefully.
     #[cfg(feature = "jolt")]
     fn init_jolt(&mut self) {
         if self.jolt.is_some() {
@@ -369,24 +686,27 @@ impl GameApp {
         if bridge.initialized {
             tracing::info!("[Jolt] Physics backend ready (gravity: {:?}).", bridge.gravity);
         } else {
-            tracing::warn!("[Jolt] Backend created but not fully initialized — using stub.");
+            tracing::warn!("[Jolt] Backend created but not fully initialized â€” using stub.");
         }
         self.jolt = Some(bridge);
     }
 
     fn refresh_available_scenes(&mut self) {
         self.available_scene_paths.clear();
-        if let Ok(rd) = std::fs::read_dir("scenes") {
-            for p in rd.flatten().map(|e| e.path()) {
-                if p.extension().and_then(|x| x.to_str()) == Some("scene") {
-                    self.available_scene_paths
-                        .push(p.to_string_lossy().to_string());
-                }
-            }
+        for dir in [scene::SCENE_DIR, "scenes"] {
+            // VFS so a shipped game (data packed in game.pak) still lists levels.
+            let mut files: Vec<String> = crate::vfs::walk_dir(dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rel| rel.ends_with(".scene"))
+                .map(|rel| format!("{}/{}", dir.trim_end_matches('/'), rel))
+                .collect();
+            self.available_scene_paths.append(&mut files);
         }
         self.available_scene_paths.sort();
+        self.available_scene_paths.dedup();
         if self.available_scene_paths.is_empty() {
-            self.available_scene_paths.push("scenes/main.scene".to_string());
+            self.available_scene_paths.push(format!("{}/main.scene", scene::SCENE_DIR));
         }
         self.scene_list_dirty = false;
     }
@@ -398,6 +718,7 @@ impl GameApp {
     }
 
     fn mark_editor_content_dirty(&mut self) {
+        #[cfg(feature = "editor")]
         if let Some(ui) = self.editor_ui.as_mut() {
             ui.mark_content_dirty();
         }
@@ -460,13 +781,22 @@ impl GameApp {
             tracing::info!("[Materials] No selected entity. Use N/M first.");
             return;
         };
-        if let Ok(mut rend) = self.world.get::<&mut components::Renderable>(entity) {
-            match self.assets.materials.apply_instance(name, &mut rend) {
-                Ok(_) => tracing::info!("[Materials] Applied '{}' to {:?}", name, entity),
-                Err(e) => tracing::error!("[Materials] {}", e),
+        let apply_result = if let Ok(mut rend) = self.world.get::<&mut components::Renderable>(entity) {
+            let applied = self.assets.materials.apply_instance(name, &mut rend);
+            if let Err(e) = &applied {
+                tracing::error!("[Materials] {}", e);
+            } else {
+                tracing::info!("[Materials] Applied '{}' to {:?}", name, entity);
             }
+            applied.is_ok()
         } else {
             tracing::error!("[Materials] Selected entity no longer has a Renderable.");
+            false
+        };
+        if apply_result {
+            if let Ok(extras) = self.assets.materials.instance_extras(name) {
+                self.world.insert(entity, (extras,));
+            }
         }
     }
 
@@ -591,43 +921,52 @@ impl GameApp {
                 self.error_log.push(format!("[Hub] Scene load failed: {}", e));
             }
         }
+        // Reload the baked light-probe data for this level (if it was baked).
+        if let Some(r) = self.renderer.as_mut() {
+            if let Err(e) = r.load_probes() {
+                self.error_log.push(format!("[Lighting] {}", e));
+            }
+        }
 self.nav_grid.rebuild_from_heights(&self.terrain_world);
                                         self.navmesh = navmesh::NavMesh::from_terrain(&self.nav_grid, &self.terrain_world);
         self.selected_renderable = None;
 
-        self.scripts = ScriptEngine::new();
-        // Enforce the scripting sandbox: 128 MB heap cap and a ~25 ms
-        // execution budget per Lua call.  os/io/loadfile/dofile/load/require
-        // are stripped by default in register_api(); these caps stop runaway
-        // scripts from exhausting memory or stalling a frame.
-        self.scripts.set_sandbox(crate::scripting::SandboxConfig {
-            max_memory_bytes: 128 << 20,
-            max_execution_time_ms: 25,
-            ..crate::scripting::SandboxConfig::default()
-        });
-        self.scripts.register_plugin(Box::new(demo_plugin::DemoPlugin::with_runtime(
-            self.demo_plugin.runtime(),
-        )));
-        self.scripts.register_plugin(Box::new(save_plugin::WorldStatePlugin::new(
-            self.levels.world_state.clone(),
-        )));
-        if self.scripts.register_api().is_ok() {
-            self.scripts
-                .load_script(&format!("{}/player.lua", CONTENT_SCRIPTS_DIR))
-                .ok();
-            self.scripts
-                .load_script(&format!("{}/enemy.lua", CONTENT_SCRIPTS_DIR))
-                .ok();
-            // Lua-native plugins: hot-reloadable, no Rust recompilation.
-            // Any .lua file returning { name, start, update, on_event } under
-            // Content/Scripts/plugins is loaded and ticked automatically.
-            let _ = std::fs::create_dir_all(CONTENT_PLUGINS_DIR);
-            let _ = self.scripts.load_plugins(CONTENT_PLUGINS_DIR);
-        }
+        #[cfg(feature = "scripting")]
+        {
+            self.scripts = ScriptEngine::new();
+            // Enforce the scripting sandbox: 128 MB heap cap and a ~25 ms
+            // execution budget per Lua call.  os/io/loadfile/dofile/load/require
+            // are stripped by default in register_api(); these caps stop runaway
+            // scripts from exhausting memory or stalling a frame.
+            self.scripts.set_sandbox(crate::scripting::SandboxConfig {
+                max_memory_bytes: 128 << 20,
+                max_execution_time_ms: 25,
+                ..crate::scripting::SandboxConfig::default()
+            });
+            self.scripts.register_plugin(Box::new(demo_plugin::DemoPlugin::with_runtime(
+                self.demo_plugin.runtime(),
+            )));
+            self.scripts.register_plugin(Box::new(save_plugin::WorldStatePlugin::new(
+                self.levels.world_state.clone(),
+            )));
+            if self.scripts.register_api().is_ok() {
+                self.scripts
+                    .load_script(&format!("{}/player.lua", CONTENT_SCRIPTS_DIR))
+                    .ok();
+                self.scripts
+                    .load_script(&format!("{}/enemy.lua", CONTENT_SCRIPTS_DIR))
+                    .ok();
+                // Lua-native plugins: hot-reloadable, no Rust recompilation.
+                // Any .lua file returning { name, start, update, on_event } under
+                // Content/Scripts/plugins is loaded and ticked automatically.
+                let _ = std::fs::create_dir_all(CONTENT_PLUGINS_DIR);
+                let _ = self.scripts.load_plugins(CONTENT_PLUGINS_DIR);
+            }
 
-        self.stop_project_watchers();
-        if self.script_hot_reload_enabled {
-            self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
+            self.stop_project_watchers();
+            if self.script_hot_reload_enabled {
+                self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
+            }
         }
         if self.asset_hot_reload_enabled {
             self.start_asset_watcher();
@@ -847,28 +1186,33 @@ fn load_window_icon(path: &str) -> Option<winit::window::Icon> {
 }
 
 fn resolve_primary_scene_path(preferred: &str) -> String {
+    // Check through the VFS so a shipped game (data in game.pak) still finds
+    // its baked-in startup scene — raw disk checks would always miss.
     if !preferred.trim().is_empty() {
-        let pref = std::path::Path::new(preferred.trim());
-        if pref.exists() {
-            return preferred.trim().to_string();
+        let pref = preferred.trim();
+        if crate::vfs::exists(pref) {
+            return pref.to_string();
         }
     }
-    let main = std::path::Path::new("scenes/main.scene");
-    if main.exists() {
-        return "scenes/main.scene".to_string();
-    }
-    if let Ok(rd) = std::fs::read_dir("scenes") {
-        let mut paths: Vec<std::path::PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("scene"))
+    // Scenes live under Content/scenes (part of the game's content bundle).
+    const SCENE_DIRS: [&str; 2] = [scene::SCENE_DIR, "scenes"];
+    for dir in SCENE_DIRS {
+        let main = format!("{}/main.scene", dir.trim_end_matches('/'));
+        if crate::vfs::exists(&main) {
+            return main;
+        }
+        let mut paths: Vec<String> = crate::vfs::walk_dir(dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rel| rel.ends_with(".scene"))
+            .map(|rel| format!("{}/{}", dir.trim_end_matches('/'), rel))
             .collect();
         paths.sort();
         if let Some(p) = paths.first() {
-            return p.to_string_lossy().to_string();
+            return p.clone();
         }
     }
-    "scenes/main.scene".to_string()
+    format!("{}/main.scene", scene::SCENE_DIR)
 }
 
 impl ApplicationHandler for GameApp {
@@ -880,10 +1224,16 @@ impl ApplicationHandler for GameApp {
         let mut win_attrs = Window::default_attributes()
             .with_title("TrinityEngine")
             .with_window_icon(load_window_icon(APP_ICON_PATH));
-        win_attrs = if let Some(ref p) = wp {
+        win_attrs = if let Some(p) = wp.as_ref() {
             win_attrs.with_inner_size(winit::dpi::PhysicalSize::new(
                 p.width.max(960),
                 p.height.max(540),
+            ))
+        } else if self.runtime_mode {
+            // Shippable runtime: honor engine_settings.toml resolution.
+            win_attrs.with_inner_size(winit::dpi::LogicalSize::new(
+                self.settings.runtime.window_width.max(640),
+                self.settings.runtime.window_height.max(360),
             ))
         } else {
             win_attrs.with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32))
@@ -900,9 +1250,12 @@ impl ApplicationHandler for GameApp {
         let phys = window.inner_size();
         self.input_state.camera.aspect = phys.width as f32 / phys.height as f32;
 
-        // Build the GPU renderer (blocking — we are on the main thread).
+        // Build the GPU renderer (blocking â€” we are on the main thread).
         let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)));
         let mut renderer = renderer;
+        if !self.settings.runtime.vsync_enabled {
+            renderer.set_vsync(false);
+        }
         self.settings.render.apply_to_features(&mut renderer.features);
         if !self.settings.render.sky_hdr_path.trim().is_empty() {
             if let Err(e) = renderer.apply_sky_environment(&self.settings.render.sky_hdr_path) {
@@ -935,19 +1288,39 @@ impl ApplicationHandler for GameApp {
             self.settings.input.left_stick_deadzone,
         );
 
+        #[cfg(feature = "editor")]
         EditorShell::print_help();
         MaterialLibrary::print_help();
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        if let (Some(window_ref), Some(renderer_ref)) = (self.window.as_ref(), self.renderer.as_ref()) {
-            self.editor_ui = Some(EditorUi::new(window_ref, renderer_ref));
+        #[cfg(feature = "editor")]
+        {
+            if let (Some(window_ref), Some(renderer_ref)) = (self.window.as_ref(), self.renderer.as_ref()) {
+                self.editor_ui = Some(EditorUi::new(window_ref, renderer_ref));
+            }
+            if let Some(ui) = self.editor_ui.as_mut() {
+                ui.mark_icons_dirty();
+            }
         }
-        if let Some(ui) = self.editor_ui.as_mut() {
-            ui.mark_icons_dirty();
+        if self.runtime_mode {
+            // Runtime/game build: skip the editor hub and load the game scene
+            // straight into Play mode. switch_to_project() performs the real
+            // scene build (materials, prefabs, scripting, navmesh).
+            self.switch_to_project(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+            self.app_stage = AppStage::EditorReady;
+            self.game_preview_mode = true;
+        } else {
+            self.app_stage = AppStage::ProjectHub;
         }
-        self.app_stage = AppStage::ProjectHub;
         self.project_stage_started_at = std::time::Instant::now();
+
+        // Kick an eager first build of game_plugin.dll (no restart needed to
+        // see the plugin the first time — saves trigger it too).
+        #[cfg(feature = "hotreload")]
+        if let Some(hot) = &self.hot_reload {
+            let _ = hot.kick();
+        }
     }
 
     fn window_event(
@@ -956,12 +1329,14 @@ impl ApplicationHandler for GameApp {
         _window_id: WindowId,
         event:      WindowEvent,
     ) {
+        #[cfg(feature = "editor")]
         if let (Some(window), Some(ui)) = (self.window.as_ref(), self.editor_ui.as_mut()) {
             let _ = ui.on_window_event(window, &event);
         }
 
         match event {
             WindowEvent::CloseRequested => {
+                #[cfg(feature = "editor")]
                 if let Some(w) = &self.window {
                     let sz = w.inner_size();
                     let pos = w.outer_position().ok();
@@ -1021,10 +1396,33 @@ impl ApplicationHandler for GameApp {
                                 }
                             }
                             KeyCode::F5 => {
-                                self.settings.render.preset = editor::cycle_preset(self.settings.render.preset);
-                                tracing::info!("[Preset] Switched to {:?}", self.settings.render.preset);
-                                tracing::info!("[Preset] In full visual editor this becomes a one-click dropdown.");
+                                if self.runtime_mode {
+                                    self.write_save_slot(
+                                        save_slots::FIRST_MANUAL_SLOT,
+                                        "quicksave",
+                                        false,
+                                    );
+                                } else {
+                                    self.settings.render.preset = editor::cycle_preset(self.settings.render.preset);
+                                    tracing::info!("[Preset] Switched to {:?}", self.settings.render.preset);
+                                    tracing::info!("[Preset] In full visual editor this becomes a one-click dropdown.");
+                                }
                             }
+                            KeyCode::F6 => {
+                                if self.runtime_mode {
+                                    self.write_save_slot(save_slots::AUTOSAVE_SLOT, "checkpoint", true);
+                                }
+                            }
+                            KeyCode::F9 => {
+                                if self.runtime_mode {
+                                    if let Some(latest) = self.save_slots.latest_manual_slot() {
+                                        self.load_save_slot(latest);
+                                    } else {
+                                        tracing::warn!("[Save] No manual save to load (press F5 to quicksave).");
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "editor")]
                             KeyCode::F10 => {
                                 self.editor_shell.visible = !self.editor_shell.visible;
                                 tracing::info!(
@@ -1032,6 +1430,15 @@ impl ApplicationHandler for GameApp {
                                     if self.editor_shell.visible { "OPEN" } else { "CLOSED" }
                                 );
                             }
+                            KeyCode::F12 => {
+                                if let Some(r) = &mut self.renderer {
+                                    let next = !r.vsync_enabled();
+                                    r.set_vsync(next);
+                                    self.settings.runtime.vsync_enabled = next;
+                                    tracing::info!("[Display] VSync {}", if next { "ON" } else { "OFF" });
+                                }
+                            }
+                            #[cfg(feature = "editor")]
                             KeyCode::F11 => {
                                 self.editor_shell.show_advanced = !self.editor_shell.show_advanced;
                                 tracing::info!(
@@ -1155,7 +1562,7 @@ impl ApplicationHandler for GameApp {
                                 self.input_state.nav_speed_scalar = (self.input_state.nav_speed_scalar * 1.12).min(80.0);
                                 tracing::info!("[Camera] Move speed: {:.2}", self.input_state.nav_speed_scalar);
                             }
-                            // ── Scene navigation: go back to previous scene ──
+                            // â”€â”€ Scene navigation: go back to previous scene â”€â”€
                             // Backspace triggers a transition back to the
                             // previously loaded scene (from the recent list).
                             KeyCode::Backspace => {
@@ -1163,7 +1570,7 @@ impl ApplicationHandler for GameApp {
                                     if let Some(prev_path) = self.scene_mgr.previous_scene().cloned() {
                                         let path_str = prev_path.to_string_lossy().to_string();
                                         self.transition.start_transition(&path_str);
-                                        tracing::info!("[Scene] Backspace → transitioning to previous scene: {}", path_str);
+                                        tracing::info!("[Scene] Backspace â†’ transitioning to previous scene: {}", path_str);
                                     } else {
                                         tracing::info!("[Scene] No previous scene to go back to");
                                     }
@@ -1237,19 +1644,72 @@ impl ApplicationHandler for GameApp {
             WindowEvent::RedrawRequested => {
                 self.frame_index = self.frame_index.wrapping_add(1);
                 let frame_start = std::time::Instant::now();
-                // ── Delta time ─────────────────────────────────────────────
+                // â”€â”€ Delta time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 let now = std::time::Instant::now();
                 let dt  = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
                 self.input_state.input.update_gamepads();
 
-                // ── Begin frame event ──────────────────────────────────────
+                // â”€â”€ Rust hot reload hook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // If game_plugin.dll is loaded, run its code every frame here.
+                // Editing game_plugin/src/*.rs rebuilds + swaps the DLL live.
+                #[cfg(feature = "hotreload")]
+                {
+                    if let Some(hot) = &mut self.hot_reload {
+                        if hot.enabled() {
+                            let cam = &self.input_state.camera;
+                            let fwd = (cam.target - cam.position).normalize_or_zero();
+                            let (w, h) = self
+                                .window
+                                .as_ref()
+                                .map(|w| w.inner_size())
+                                .map(|s| (s.width as f32, s.height as f32))
+                                .unwrap_or((0.0, 0.0));
+                            let inp = &self.input_state.input;
+                            let mut ctx = game_api::FrameCtx {
+                                time: self.start_time.elapsed().as_secs_f32(),
+                                dt,
+                                frame_index: self.frame_index,
+                                width: w,
+                                height: h,
+                                cam_pos: [cam.position.x, cam.position.y, cam.position.z],
+                                cam_forward: [fwd.x, fwd.y, fwd.z],
+                                move_x: inp.gamepad_left_x(),
+                                move_y: inp.gamepad_left_y(),
+                                look_x: 0.0,
+                                look_y: 0.0,
+                                key_w: (inp.is_virtual_key_held("W") as u8),
+                                key_a: (inp.is_virtual_key_held("A") as u8),
+                                key_s: (inp.is_virtual_key_held("S") as u8),
+                                key_d: (inp.is_virtual_key_held("D") as u8),
+                                key_space: (inp.is_virtual_key_held("Space") as u8),
+                                key_shift: (inp.is_virtual_key_held("Shift") as u8),
+                                key_e: (inp.is_virtual_key_held("E") as u8),
+                                key_r: (inp.is_virtual_key_held("R") as u8),
+                                key_f: (inp.is_virtual_key_held("F") as u8),
+                                key_q: (inp.is_virtual_key_held("Q") as u8),
+                                mouse_l: 0,
+                                mouse_r: 0,
+                                mouse_m: 0,
+                                reset: 0,
+                                _pad: [0; 3],
+                                log: crate::hotreload::plugin_log,
+                                debug_value: 0.0,
+                                debug_text: [0; 64],
+                                _pad2: [0; 4],
+                            };
+                            hot.tick(&mut ctx);
+                        }
+                    }
+                }
+
+                // â”€â”€ Begin frame event â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 self.events.emit(BeginFrameEvent {
                     frame_index: self.frame_index,
                     delta_time: dt,
                 });
 
-                // ── Environment update ─────────────────────────────────────
+                // â”€â”€ Environment update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Advance time of day, update sky/weather/clouds from new state.
                 // This runs every frame (even in editor mode) so the sky preview
                 // stays live. The time speed can be set to 0 to pause.
@@ -1272,7 +1732,7 @@ impl ApplicationHandler for GameApp {
                     });
                 }
 
-                // ── Weather Zone evaluation ─────────────────────────────────
+                // â”€â”€ Weather Zone evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Check if any WeatherZone entity is near the camera and
                 // override the global weather accordingly.
                 {
@@ -1283,7 +1743,7 @@ impl ApplicationHandler for GameApp {
                     self.env.weather.intensity = zone_weather.intensity;
                 }
 
-                // ── Wind Zone evaluation ────────────────────────────────────
+                // â”€â”€ Wind Zone evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Check if any WindZone entity is near the camera and override
                 // the global wind accordingly.
                 {
@@ -1308,20 +1768,25 @@ impl ApplicationHandler for GameApp {
                     });
                 }
 
-                // ── Shader hot-reload check ────────────────────────────────
+                // â”€â”€ Shader hot-reload check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Check if any .wgsl files were modified on disk and recompile
                 // them. Returns true if a shader was reloaded.
                 if let Some(renderer) = &self.renderer {
                     self.shader_mgr.check_hot_reload(&renderer.device);
                 }
 
-                // ── Audio system update ────────────────────────────────────
+                // â”€â”€ Audio system update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Clean up finished sounds each frame; sync 3D listener.
+                #[cfg(feature = "audio")]
                 if let Some(audio) = &mut self.audio {
                     let cp = self.input_state.camera.position;
                     let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
                     audio.set_listener_position([cp.x, cp.y, cp.z]);
                     audio.set_listener_forward([forward.x, forward.y, forward.z]);
+                    // Keep the weather ambient bed in sync with the current
+                    // condition (rain/snow/wind loops). No-op unless the tag
+                    // changed AND a matching audio file exists.
+                    audio.set_weather_ambience(self.env.weather.condition.ambient_sound_tag(), 1.0);
                     audio.update();
                 }
 
@@ -1343,34 +1808,37 @@ impl ApplicationHandler for GameApp {
                 self.assets.mesh_streaming.pump_requests();
                 let asset_time = asset_start.elapsed();
 
-                // ── Hot reload: scripts ────────────────────────────────────
-                if self.script_hot_reload_enabled && self.script_watcher.is_none() {
-                    self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
-                } else if !self.script_hot_reload_enabled {
-                    self.script_watcher = None;
-                }
-                if let Some(rx) = &self.script_watcher {
-                    let mut pending_errors: Vec<String> = Vec::new();
-                    while let Ok(path) = rx.try_recv() {
-                        // Plugins live under Content/Scripts/plugins — hot-reload
-                        // them through the plugin host so a changed file re-runs
-                        // start() cleanly (no stale event handlers or timers).
-                        let norm_path = path.replace('\\', "/");
-                        let is_plugin = norm_path.contains("/plugins/");
-                        match self.scripts.reload_plugin(&path) {
-                            Ok(true) => tracing::info!("[Hot] Plugin reloaded: {}", path),
-                            _ if is_plugin => {
-                                // A plugin file changed but wasn't loaded before.
-                                let _ = self.scripts.load_plugin(&path);
-                            }
-                            _ => match self.scripts.reload_script(&path) {
-                                Ok(_) => tracing::info!("[Hot] Script reloaded: {}", path),
-                                Err(e) => pending_errors.push(format!("[Hot] Script error {}: {}", path, e)),
-                            },
-                        }
+                // â”€â”€ Hot reload: scripts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                #[cfg(feature = "scripting")]
+                {
+                    if self.script_hot_reload_enabled && self.script_watcher.is_none() {
+                        self.script_watcher = Some(self.scripts.start_watching(CONTENT_SCRIPTS_DIR));
+                    } else if !self.script_hot_reload_enabled {
+                        self.script_watcher = None;
                     }
-                    for e in pending_errors {
-                        self.push_error(e);
+                    if let Some(rx) = &self.script_watcher {
+                        let mut pending_errors: Vec<String> = Vec::new();
+                        while let Ok(path) = rx.try_recv() {
+                            // Plugins live under Content/Scripts/plugins â€” hot-reload
+                            // them through the plugin host so a changed file re-runs
+                            // start() cleanly (no stale event handlers or timers).
+                            let norm_path = path.replace('\\', "/");
+                            let is_plugin = norm_path.contains("/plugins/");
+                            match self.scripts.reload_plugin(&path) {
+                                Ok(true) => tracing::info!("[Hot] Plugin reloaded: {}", path),
+                                _ if is_plugin => {
+                                    // A plugin file changed but wasn't loaded before.
+                                    let _ = self.scripts.load_plugin(&path);
+                                }
+                                _ => match self.scripts.reload_script(&path) {
+                                    Ok(_) => tracing::info!("[Hot] Script reloaded: {}", path),
+                                    Err(e) => pending_errors.push(format!("[Hot] Script error {}: {}", path, e)),
+                                },
+                            }
+                        }
+                        for e in pending_errors {
+                            self.push_error(e);
+                        }
                     }
                 }
                 if !self.asset_hot_reload_enabled {
@@ -1422,7 +1890,7 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                // ── Hot reload: scenes ─────────────────────────────────────
+                // â”€â”€ Hot reload: scenes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if let Some(rx) = &self.scene_watcher {
                     let mut pending_errors: Vec<String> = Vec::new();
                     let mut pending_toasts: Vec<String> = Vec::new();
@@ -1443,6 +1911,12 @@ impl ApplicationHandler for GameApp {
                             }
                             Err(e) => pending_errors.push(format!("[Hot] Scene error: {}", e)),
                         }
+                        // Hot-reloading a scene should also refresh its baked GI.
+                        if let Some(r) = self.renderer.as_mut() {
+                            if let Err(e) = r.load_probes() {
+                                pending_errors.push(format!("[Lighting] {}", e));
+                            }
+                        }
                     }
                     if content_dirty {
                         self.mark_editor_content_dirty();
@@ -1450,6 +1924,7 @@ impl ApplicationHandler for GameApp {
                     for e in pending_errors {
                         self.push_error(e);
                     }
+                    #[cfg(feature = "editor")]
                     if let Some(ui) = self.editor_ui.as_mut() {
                         let now = self.start_time.elapsed().as_secs_f32();
                         for msg in pending_toasts {
@@ -1464,14 +1939,14 @@ impl ApplicationHandler for GameApp {
                     self.nav_rebuild_requested = false;
                 }
 
-                // ── Reset physics ground flag ──────────────────────────────
+                // â”€â”€ Reset physics ground flag â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Must happen before physics_system so entities that walk off
                 // edges fall correctly on the next frame.
                 for body in self.world.query_mut::<&mut RigidBody>() {
                     body.on_ground = false;
                 }
 
-                // ── Systems ────────────────────────────────────────────────
+                // â”€â”€ Systems â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // TODO: Migrate these system calls to EngineSystems.scheduler:
                 //   - scripting_system
                 //   - character_controller_system
@@ -1484,7 +1959,7 @@ impl ApplicationHandler for GameApp {
                 // Game Preview = runs scripts/physics/animation, like Unreal PIE.
                 let run_sim = self.game_preview_mode && (!self.sim_paused || self.sim_step_once);
 
-                // ── Snapshot capture on Play ─────────────────────────────
+                // â”€â”€ Snapshot capture on Play â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Save all entity state before the simulation starts so we
                 // can restore it when the user presses Stop.
                 if self.game_preview_mode && !self.prev_game_preview_mode {
@@ -1492,7 +1967,7 @@ impl ApplicationHandler for GameApp {
                     self.apply_player_start_on_preview_begin();
                 }
 
-                // ── Snapshot restore on Stop ─────────────────────────────
+                // â”€â”€ Snapshot restore on Stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // When exiting Game Preview, restore entities to their
                 // pre-simulation positions/rotations/velocities.
                 if !self.game_preview_mode && self.prev_game_preview_mode {
@@ -1503,54 +1978,70 @@ impl ApplicationHandler for GameApp {
                 let mut script_time = std::time::Duration::ZERO;
                 let mut physics_time = std::time::Duration::ZERO;
                 if run_sim {
+                    if self.runtime_mode
+                        && self.settings.runtime.autosave_enabled
+                        && self.settings.runtime.autosave_interval_seconds > 0.0
+                        && std::time::Instant::now() >= self.next_autosave_at
+                    {
+                        self.write_save_slot(save_slots::AUTOSAVE_SLOT, "autosave", true);
+                        self.next_autosave_at = std::time::Instant::now()
+                            + std::time::Duration::from_secs_f32(
+                                self.settings.runtime.autosave_interval_seconds,
+                            );
+                    }
                     let script_start = std::time::Instant::now();
                     if self.script_skip_frames_remaining > 0 {
                         self.script_skip_frames_remaining -= 1;
                     } else {
-                        let (screen_w, screen_h) = self.window.as_ref()
-                            .map(|w| { let s = w.inner_size(); (s.width as f32, s.height as f32) })
-                            .unwrap_or((1280.0, 720.0));
-                        let camera_fov = self.input_state.camera.fov_degrees;
-                        scripting_system(
-                            &mut self.world,
-                            &mut self.scripts,
-                            &self.input_state.input,
-                            self.input_state.camera.position.to_array(),
-                            self.input_state.camera.target.to_array(),
-                            dt,
-                            self.audio.as_mut(),
-                            &self.nav_grid,
-                            &self.navmesh,
-                            &mut self.ai_registry,
-                            &mut self.terrain_world,
-                            &mut self.assets.meshes,
-                            &mut self.env.weather,
-                            &mut self.particles,
-                            &mut self.levels,
-                            &mut self.boids,
-                            screen_w,
-                            screen_h,
-                            camera_fov,
-                        );
-                        self.scripts.drain_destroys(&mut self.world);
-                        self.demo_plugin.tick();
-                        let _ = self.scripts.tick_timers(dt);
-                        let _ = self.scripts.tick_plugins(dt);
-                        self.scripts.tick_cinematics(dt);
-                        if let Some((pos, target)) = self.scripts.consume_camera_request() {
-                            self.input_state.camera.position = glam::Vec3::from_array(pos);
-                            self.input_state.camera.target = glam::Vec3::from_array(target);
-                            let mut dir =
-                                (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
-                            if dir.length_squared() < 1e-6 {
-                                dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+                        #[cfg(feature = "scripting")]
+                        {
+                            let (screen_w, screen_h) = self.window.as_ref()
+                                .map(|w| { let s = w.inner_size(); (s.width as f32, s.height as f32) })
+                                .unwrap_or((1280.0, 720.0));
+                            let camera_fov = self.input_state.camera.fov_degrees;
+                            scripting_system(
+                                &mut self.world,
+                                &mut self.scripts,
+                                &self.input_state.input,
+                                self.input_state.camera.position.to_array(),
+                                self.input_state.camera.target.to_array(),
+                                dt,
+                                self.audio.as_mut(),
+                                Some(&mut self.net),
+                                &self.nav_grid,
+                                &self.navmesh,
+                                &mut self.ai_registry,
+                                &mut self.terrain_world,
+                                &mut self.assets.meshes,
+                                &mut self.env.weather,
+                                &self.assets.prefab_registry,
+                                &mut self.particles,
+                                &mut self.levels,
+                                &mut self.boids,
+                                screen_w,
+                                screen_h,
+                                camera_fov,
+                            );
+                            self.scripts.drain_destroys(&mut self.world);
+                            self.demo_plugin.tick();
+                            let _ = self.scripts.tick_timers(dt);
+                            let _ = self.scripts.tick_plugins(dt);
+                            self.scripts.tick_cinematics(dt);
+                            if let Some((pos, target)) = self.scripts.consume_camera_request() {
+                                self.input_state.camera.position = glam::Vec3::from_array(pos);
+                                self.input_state.camera.target = glam::Vec3::from_array(target);
+                                let mut dir =
+                                    (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                                if dir.length_squared() < 1e-6 {
+                                    dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+                                }
+                                self.input_state.camera_yaw = dir.z.atan2(dir.x);
+                                self.input_state.camera_pitch = dir.y.asin();
                             }
-                            self.input_state.camera_yaw = dir.z.atan2(dir.x);
-                            self.input_state.camera_pitch = dir.y.asin();
-                        }
-                        let skip_n = self.scripts.consume_frame_skip_request();
-                        if skip_n > 0 {
-                            self.script_skip_frames_remaining = skip_n;
+                            let skip_n = self.scripts.consume_frame_skip_request();
+                            if skip_n > 0 {
+                                self.script_skip_frames_remaining = skip_n;
+                            }
                         }
                     }
                     script_time = script_start.elapsed();
@@ -1586,10 +2077,11 @@ impl ApplicationHandler for GameApp {
                         );
                         collision_events.extend(collisions);
                     }
+                    #[cfg(feature = "scripting")]
                     if let Err(err) = self.scripts.dispatch_collision_events(&collision_events) {
                         tracing::error!("[Scripting] Collision callback error: {}", err);
                     }
-                    // ── Emit collision events through EventBus ──────────────
+                    // â”€â”€ Emit collision events through EventBus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     // This enables loose coupling: audio, VFX, editor, etc.
                     // can listen for collisions without the physics system
                     // knowing they exist.
@@ -1654,10 +2146,19 @@ impl ApplicationHandler for GameApp {
                     // selects states based on parameters (speed, is_attacking, etc.),
                     // feeds transitions into SkeletalAnimator for crossfade.
                     anim_graph_system(&mut self.world, dt);
+                    // Two-bone IK: pull hands/feet onto targets after the blend
+                    // graph poses the skeleton. Runs after every pose producer so
+                    // the renderer picks up the corrected joint matrices.
+                    crate::animation::ik::ik_system(&mut self.world);
                     // Flood system: advances water level toward target, logs newly
                     // submerged entities. Runs after animation so submerged VFX
                     // can react to the updated water_level on the same frame.
                     flood_system(&mut self.levels.flood, &mut self.world, dt);
+                    // Destruction: fracture entities whose health hit zero.
+                    destruction_system(&mut self.world, &mut self.assets.meshes, dt);
+                    // Networking: host broadcasts snapshots; client applies them.
+                    // Runs after physics/scripts so replicated state is current.
+                    self.net.tick(&mut self.world, &mut self.assets);
                     if self.sim_step_once {
                         self.sim_step_once = false;
                         self.sim_paused = true;
@@ -1708,15 +2209,15 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                // ── Loading screen update ────────────────────────────────────
+                // â”€â”€ Loading screen update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Advance fade transitions each frame, even outside sim,
                 // so the loading screen fades out smoothly after streaming.
                 self.levels.loading_screen.update(dt);
 
-                // ── Level streaming check ──────────────────────────────────
+                // â”€â”€ Level streaming check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Periodically check player distance to registered levels and
                 // queue load/unload operations. This is the core of the
-                // streaming level system — levels load when the player is
+                // streaming level system â€” levels load when the player is
                 // nearby and unload when far away.
                 {
                     let player_pos = self.input_state.camera.position.to_array();
@@ -1753,15 +2254,15 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                // ── Render ─────────────────────────────────────────────────
+                // â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 let render_start = std::time::Instant::now();
                 let mut draw_stats = renderer::DrawStats::default();
                 // Sync environment state (sun position, fog) into renderer.
                 if let Some(renderer) = &mut self.renderer {
                     renderer.apply_environment(&self.env.time_of_day, &self.env.weather, &self.env.sky, &self.env.clouds, &self.env.lightning);
                 }
-                // ── Particle system update ──────────────────────────────────
-                // Sync weather → emitters (enable rain/snow/mist, adjust intensity).
+                // â”€â”€ Particle system update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // Sync weather â†’ emitters (enable rain/snow/mist, adjust intensity).
                 // Then advance particle physics. Particles are passed to draw_world as GpuParticle slice.
                 self.particles.apply_weather(
                     self.particle_indices,
@@ -1770,7 +2271,7 @@ impl ApplicationHandler for GameApp {
                     glam::Vec3::new(self.env.weather.wind_direction.x, 0.0, self.env.weather.wind_direction.y),
                     self.env.weather.wind_strength,
                 );
-                // ── Fire source sync ──────────────────────────────────────────
+                // â”€â”€ Fire source sync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Query all entities with FireSource + Position and create/update
                 // fire/smoke/ember particle emitters attached to them.
                 {
@@ -1792,7 +2293,7 @@ impl ApplicationHandler for GameApp {
                 self.particles.update(dt, glam::Vec3::new(
                     self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z,
                 ), self.start_time.elapsed().as_secs_f32());
-                // ── Dynamic light emission for fire and lava surfaces ─────
+                // â”€â”€ Dynamic light emission for fire and lava surfaces â”€â”€â”€â”€â”€
                 // Every frame, query all FireSurface and LavaSurface entities and
                 // ensure they have a PointLight whose color / intensity matches
                 // their emissive_light fields.  Flicker is applied by sampling a
@@ -1811,7 +2312,7 @@ impl ApplicationHandler for GameApp {
                         flicker: f32,
                     }
                     let mut entries: Vec<EmissiveEntry> = Vec::new();
-                    // Query FireSurface entities — flicker is derived from the
+                    // Query FireSurface entities â€” flicker is derived from the
                     // surface's flicker_strength field.
                     for (e, fs) in self.world.query::<(hecs::Entity, &components::FireSurface)>().iter() {
                         entries.push(EmissiveEntry {
@@ -1822,7 +2323,7 @@ impl ApplicationHandler for GameApp {
                             flicker: fs.flicker_strength,
                         });
                     }
-                    // Query LavaSurface entities — lava flickers less than fire,
+                    // Query LavaSurface entities â€” lava flickers less than fire,
                     // using a small fixed flicker factor of 0.08 for subtle
                     // variation in the glow.
                     for (e, ls) in self.world.query::<(hecs::Entity, &components::LavaSurface)>().iter() {
@@ -1844,7 +2345,7 @@ impl ApplicationHandler for GameApp {
                         let flicker_b = (sim_t * 7.3 + id_f * 2.1).sin();
                         let flicker_mod = 1.0 + entry.flicker * (0.6 * flicker_a + 0.4 * flicker_b);
                         let final_intensity = entry.base_strength * flicker_mod;
-                        // Check if entity already has a PointLight — if so,
+                        // Check if entity already has a PointLight â€” if so,
                         // update it in-place to avoid re-creating the component.
                         if let Ok(mut pl) = self.world.get::<&mut components::PointLight>(entry.entity) {
                             pl.color     = entry.color;
@@ -1852,7 +2353,7 @@ impl ApplicationHandler for GameApp {
                             pl.range     = entry.radius;
                             pl.light_type = 1.0; // ensure point light type
                         } else {
-                            // Entity has no PointLight yet — insert one.  The
+                            // Entity has no PointLight yet â€” insert one.  The
                             // renderer's multi-light pass will pick it up.
                             let _ = self.world.insert(entry.entity, (
                                 components::PointLight {
@@ -1868,6 +2369,7 @@ impl ApplicationHandler for GameApp {
                     }
                 }
                 let gpu_particles = self.particles.gpu_instances();
+                #[cfg(feature = "editor")]
                 if self.app_stage == AppStage::ProjectHub {
                     let hub_open = match (self.window.as_ref(), self.editor_ui.as_mut()) {
                         (Some(w), Some(ui)) => {
@@ -1894,20 +2396,22 @@ impl ApplicationHandler for GameApp {
                 }
                 let mut content_dirty_after_render = false;
                 let mut return_to_hub_after_render = false;
-                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                if let (Some(renderer), Some(_window)) = (&mut self.renderer, &self.window) {
                     if self.app_stage == AppStage::BootSplash {
+                        #[cfg(feature = "editor")]
                         if let Some(ui) = self.editor_ui.as_mut() {
                             ui.begin_editor_loading(
-                                window,
+                                _window,
                                 self.project_stage_started_at.elapsed().as_secs_f32(),
                             );
                         }
-                        let mut draw_ui = |device: &wgpu::Device,
-                                           queue: &wgpu::Queue,
-                                           encoder: &mut wgpu::CommandEncoder,
-                                           view: &wgpu::TextureView| {
+                        let mut draw_ui = |_device: &wgpu::Device,
+                                           _queue: &wgpu::Queue,
+                                           _encoder: &mut wgpu::CommandEncoder,
+                                           _view: &wgpu::TextureView| {
+                            #[cfg(feature = "editor")]
                             if let Some(ui) = self.editor_ui.as_mut() {
-                                ui.paint_on(device, queue, encoder, view);
+                                ui.paint_on(_device, _queue, _encoder, _view);
                             }
                         };
                         draw_stats = renderer.draw_world(
@@ -1932,12 +2436,13 @@ impl ApplicationHandler for GameApp {
                         return;
                     }
                     if self.app_stage == AppStage::ProjectHub {
-                        let mut draw_ui = |device: &wgpu::Device,
-                                           queue: &wgpu::Queue,
-                                           encoder: &mut wgpu::CommandEncoder,
-                                           view: &wgpu::TextureView| {
+                        let mut draw_ui = |_device: &wgpu::Device,
+                                           _queue: &wgpu::Queue,
+                                           _encoder: &mut wgpu::CommandEncoder,
+                                           _view: &wgpu::TextureView| {
+                            #[cfg(feature = "editor")]
                             if let Some(ui) = self.editor_ui.as_mut() {
-                                ui.paint_on(device, queue, encoder, view);
+                                ui.paint_on(_device, _queue, _encoder, _view);
                             }
                         };
                         draw_stats = renderer.draw_world(
@@ -1966,6 +2471,7 @@ impl ApplicationHandler for GameApp {
                     {
                         self.app_stage = AppStage::EditorReady;
                     }
+                    #[cfg(feature = "editor")]
                     if let Some(ui) = self.editor_ui.as_mut() {
                         // Snapshot weather condition before editor can modify it.
                         let prev_condition = self.env.weather.condition;
@@ -2004,11 +2510,12 @@ impl ApplicationHandler for GameApp {
                             time_of_day: &mut self.env.time_of_day,
                             weather: &mut self.env.weather,
                             audio: &mut self.audio,
+                            bake_requested: &mut self.bake_requested,
                         };
                         if self.app_stage == AppStage::EditorLoading {
-                            ui.begin_editor_loading(window, self.project_stage_started_at.elapsed().as_secs_f32());
+                            ui.begin_editor_loading(_window, self.project_stage_started_at.elapsed().as_secs_f32());
                         } else {
-                            ui.begin_and_build(window, &mut frame_args);
+                            ui.begin_and_build(_window, &mut frame_args);
                         }
                         // Emit WeatherChangedEvent if the editor changed weather.
                         if self.env.weather.condition != prev_condition
@@ -2020,22 +2527,39 @@ impl ApplicationHandler for GameApp {
                             });
                         }
                     }
+                    if self.bake_requested {
+                        self.bake_requested = false;
+                        let bake_start = std::time::Instant::now();
+                        let bake_result = renderer.bake_lighting(&self.world, &self.assets.meshes);
+                        match bake_result {
+                            Ok(_) => {
+                                let ms = bake_start.elapsed().as_millis();
+                                self.error_log.push(format!(
+                                    "[Lighting] Bake complete in {} ms — probes filled from {} meshes",
+                                    ms, self.assets.meshes_count_hint()
+                                ));
+                            }
+                            Err(e) => {
+                                self.error_log.push(format!("[Lighting] {}", e));
+                            }
+                        }
+                    }
                     if let Some(scene_path) = self.requested_scene_switch.take() {
                         // Instead of loading immediately, start a fade-to-black transition.
                         // The actual load happens when the screen is fully black (in transition.update).
                         if !self.transition.is_active() {
                             self.transition.start_transition(&scene_path);
                         } else {
-                            // A transition is already in progress — ignore the request.
+                            // A transition is already in progress â€” ignore the request.
                             self.error_log.push(format!("[Scene] Transition already in progress, ignoring switch to {}", scene_path));
                         }
                     }
-                    // ── Scene transition update ─────────────────────────────
+                    // â”€â”€ Scene transition update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     // Each frame, advance the fade-to-black effect. When the
                     // screen is fully black, transition.update() returns the
-                    // pending scene path — that's when we actually load it.
+                    // pending scene path â€” that's when we actually load it.
                     if let Some(pending_path) = self.transition.update(dt) {
-                        // Screen is fully black — perform the scene swap now.
+                        // Screen is fully black â€” perform the scene swap now.
                         self.scene_mgr.scene_path = pending_path.clone();
                         self.assets.mesh_cache.clear();
                         match self.scene_mgr.build(
@@ -2061,18 +2585,23 @@ impl ApplicationHandler for GameApp {
                                 ));
                             }
                         }
+                        // Reload this level's baked light probes after the swap.
+                        if let Err(e) = renderer.load_probes() {
+                            self.error_log.push(format!("[Lighting] {}", e));
+                        }
                     }
                     if self.request_return_to_hub {
                         self.request_return_to_hub = false;
                         return_to_hub_after_render = true;
                     }
 
-                    let mut draw_ui = |device: &wgpu::Device,
-                                       queue: &wgpu::Queue,
-                                       encoder: &mut wgpu::CommandEncoder,
-                                       view: &wgpu::TextureView| {
+                    let mut draw_ui = |_device: &wgpu::Device,
+                                       _queue: &wgpu::Queue,
+                                       _encoder: &mut wgpu::CommandEncoder,
+                                       _view: &wgpu::TextureView| {
+                        #[cfg(feature = "editor")]
                         if let Some(ui) = self.editor_ui.as_mut() {
-                            ui.paint_on(device, queue, encoder, view);
+                            ui.paint_on(_device, _queue, _encoder, _view);
                         }
                     };
                     draw_stats = renderer.draw_world(
@@ -2110,7 +2639,7 @@ impl ApplicationHandler for GameApp {
                     self.jobs.enabled(),
                 );
 
-                // ── Flush event bus ────────────────────────────────────────
+                // â”€â”€ Flush event bus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Process all events emitted this frame. This is the single
                 // point where events are dispatched. Systems should NOT call
                 // flush() themselves.
@@ -2126,6 +2655,7 @@ impl ApplicationHandler for GameApp {
                         window.set_title(title);
                     }
                 }
+                #[cfg(feature = "editor")]
                 self.editor_shell.render_snapshot(
                     &self.world,
                     &self.settings,
@@ -2151,20 +2681,23 @@ impl ApplicationHandler for GameApp {
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// â”€â”€ Entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn main() {
     // tracing MUST be initialised before any wgpu calls so GPU errors are visible.
     // RUST_LOG env var controls verbosity, e.g. RUST_LOG=info or RUST_LOG=Triengine=debug
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // In addition to the console, every line is mirrored to the user data dir's
+    // trinity-runtime.log so crashes/hangs survive a closed terminal.
+    robustness::install_panic_hook();
+    robustness::install_tracing();
 
     let event_loop = EventLoop::new().expect("Could not create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = GameApp::new();
     event_loop.run_app(&mut app).expect("Event loop error");
+
+    // Explicit drop BEFORE the process exits: the Renderer owns the wgpu
+    // device/surface, and dropping it here tears down GPU resources cleanly
+    // (this also silences wgpu's "not dropped" leak warnings in debug builds).
+    drop(app);
 }
