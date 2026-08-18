@@ -71,6 +71,7 @@ pub fn scripting_system(
     terrain_world: &mut TerrainWorld,
     meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
     weather: &mut crate::environment::weather::WeatherState,
+    sky: &mut crate::environment::sky::SkyParams,
     prefabs: &crate::scene::PrefabRegistry,
     particles: &mut crate::particles::ParticleSystem,
     levels: &mut crate::engine_subsystems::LevelState,
@@ -92,6 +93,7 @@ pub fn scripting_system(
     // Now run each script — world is free to borrow mutably.
     // Provide NavGrid and AiRegistry pointers for bt/nav Lua APIs.
     scripts.set_external_refs(nav_grid, ai_registry, terrain_world, meshes, weather, navmesh);
+    scripts.set_sky(sky);
     scripts.set_particles(particles);
     scripts.set_prefabs(prefabs);
     scripts.set_levels(levels);

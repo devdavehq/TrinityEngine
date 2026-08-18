@@ -15,6 +15,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub mod level;
+pub mod manifest;
 pub mod streaming;
 pub mod portal;
 pub mod state;
@@ -22,6 +23,7 @@ pub mod cross_ref;
 pub mod loading_screen;
 
 pub use level::*;
+pub use manifest::*;
 pub use streaming::*;
 pub use state::*;
 pub use loading_screen::*;

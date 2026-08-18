@@ -38,6 +38,17 @@ impl Vertex {
     }
 }
 
+/// Corner of a unit cube (half-extent 0.5) for the face whose normal runs
+/// along axis `a` with sign `sign`; `u`/`v` are ±1 offsets along the two
+/// in-plane axes.
+fn offset_cube_corner(a: usize, b: usize, cr: usize, sign: f32, u: f32, v: f32) -> [f32; 3] {
+    let mut p = [0.0; 3];
+    p[a] = sign * 0.5;
+    p[b] = u * 0.5;
+    p[cr] = v * 0.5;
+    p
+}
+
 /// Compute tangent and bitangent for all vertices using a simplified
 /// position-based approximation (no UVs needed).
 /// For each triangle, tangent aligns with the first edge direction
@@ -119,8 +130,17 @@ impl Mesh {
         if ext == "gltf" || ext == "glb" {
             return Self::load_gltf(path);
         }
-        let contents = crate::vfs::read_to_string(path)
-            .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+        let contents = match crate::vfs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                // Missing asset: fall back to a built-in cube so scenes,
+                // prefabs and editor spawns keep working instead of failing
+                // the whole load. The scene scale on the Renderable usually
+                // stretches it into the intended shape (floor slabs etc.).
+                tracing::warn!("[Mesh] {} not found ({}); using built-in cube", path, e);
+                return Ok(Self::make_cube());
+            }
+        };
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut normals:   Vec<[f32; 3]> = Vec::new();
@@ -185,7 +205,8 @@ impl Mesh {
         }
 
         if vertices.is_empty() {
-            return Err(format!("No geometry in {}", path));
+            tracing::warn!("[Mesh] No geometry in {}; using built-in cube", path);
+            return Ok(Self::make_cube());
         }
         Ok(Mesh { vertices })
     }
@@ -232,6 +253,37 @@ impl Mesh {
             return Err(format!("No mesh primitives found in {}", path));
         }
         Ok(Mesh { vertices: out })
+    }
+
+    pub fn make_cube() -> Mesh {
+        let c = [1.0, 1.0, 1.0];
+        let mut vertices = Vec::with_capacity(36);
+        // Six faces: normal axis + sign, corner offsets along the two in-plane axes.
+        let axes: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        for a in 0..3 {
+            for sign in [1.0, -1.0] {
+                let b = (a + 1) % 3;
+                let cr = (a + 2) % 3;
+                let mut normal = axes[a];
+                for n in &mut normal {
+                    *n *= sign;
+                }
+                // Quad corners (winding CCW when viewed from +normal).
+                let p00 = offset_cube_corner(a, b, cr, sign, -1.0, -1.0);
+                let p10 = offset_cube_corner(a, b, cr, sign, 1.0, -1.0);
+                let p11 = offset_cube_corner(a, b, cr, sign, 1.0, 1.0);
+                let p01 = offset_cube_corner(a, b, cr, sign, -1.0, 1.0);
+                vertices.extend_from_slice(&[
+                    Vertex::new(p00, normal, c),
+                    Vertex::new(p10, normal, c),
+                    Vertex::new(p11, normal, c),
+                    Vertex::new(p00, normal, c),
+                    Vertex::new(p11, normal, c),
+                    Vertex::new(p01, normal, c),
+                ]);
+            }
+        }
+        Mesh { vertices }
     }
 
     pub fn make_plane(size_x: f32, size_z: f32) -> Mesh {

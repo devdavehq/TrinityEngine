@@ -57,11 +57,36 @@ pub fn render_viewport_panel(
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
     let p = ui.painter();
 
+    // ── Aspect-fit the render into the panel ────────────────────────────────
+    // The renderer produces a window-sized texture; we show it centred and
+    // undistorted inside the panel. Picking, probes, volumes and gizmos all
+    // use `view_rect` (not the panel rect) so overlays line up with pixels.
+    let (rw, rh) = args.renderer.render_size();
+    let view_rect = if rw > 0 && rh > 0 {
+        let tex_aspect = rw as f32 / rh as f32;
+        let panel_aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { tex_aspect };
+        if tex_aspect > panel_aspect {
+            let h = rect.width() / tex_aspect;
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.center().y - h * 0.5),
+                egui::pos2(rect.right(), rect.center().y + h * 0.5),
+            )
+        } else {
+            let w = rect.height() * tex_aspect;
+            egui::Rect::from_min_max(
+                egui::pos2(rect.center().x - w * 0.5, rect.top()),
+                egui::pos2(rect.center().x + w * 0.5, rect.bottom()),
+            )
+        }
+    } else {
+        rect
+    };
+
     p.rect_filled(rect, 8.0, egui::Color32::from_rgb(7, 9, 13));
     if let Some(texture_id) = scene_texture_id {
         p.image(
             texture_id,
-            rect.shrink(1.0),
+            view_rect,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
@@ -180,7 +205,7 @@ pub fn render_viewport_panel(
     if response.drag_started() {
         if let Some(pointer) = response.interact_pointer_pos() {
             if !probes_hidden(ui) && !*args.game_preview_mode {
-                if let Some(idx) = probe_hit_index(args, rect, pointer) {
+                if let Some(idx) = probe_hit_index(args, view_rect, pointer) {
                     ui.data_mut(|d| d.insert_temp(KEY_PROBE_SELECTED.into(), Some(idx)));
                     *args.selected_renderable = None;
                     // Record drag start so we move this probe (or its whole
@@ -194,7 +219,7 @@ pub fn render_viewport_panel(
                     return;
                 }
             }
-            if let Some(hit) = pick_entity_in_viewport(args.world, args.camera, rect, pointer) {
+            if let Some(hit) = pick_entity_in_viewport(args.world, args.camera, view_rect, pointer) {
                 *args.selected_renderable = Some(hit);
             }
         }
@@ -212,8 +237,8 @@ pub fn render_viewport_panel(
                         let plane_n = glam::Vec3::new(forward.x, forward.y, forward.z);
                         // Project both pointers onto the plane through the probe.
                         if let (Some(prev_w), Some(cur_w)) = (
-                            screen_to_plane_world(args.camera, rect, prev_pointer, probe_pos, plane_n),
-                            screen_to_plane_world(args.camera, rect, pointer, probe_pos, plane_n),
+                            screen_to_plane_world(args.camera, view_rect, prev_pointer, probe_pos, plane_n),
+                            screen_to_plane_world(args.camera, view_rect, pointer, probe_pos, plane_n),
                         ) {
                             let delta = cur_w - prev_w;
                             let new_world = start + delta;
@@ -236,14 +261,14 @@ pub fn render_viewport_panel(
     } else if response.clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
             if !probes_hidden(ui) && !*args.game_preview_mode {
-                if let Some(idx) = probe_hit_index(args, rect, pointer) {
+                if let Some(idx) = probe_hit_index(args, view_rect, pointer) {
                     ui.data_mut(|d| d.insert_temp(KEY_PROBE_SELECTED.into(), Some(idx)));
                     // Selection belongs to a probe now, not an entity.
                     *args.selected_renderable = None;
                     return;
                 }
             }
-            if let Some(hit) = pick_entity_in_viewport(args.world, args.camera, rect, pointer) {
+            if let Some(hit) = pick_entity_in_viewport(args.world, args.camera, view_rect, pointer) {
                 *args.selected_renderable = Some(hit);
             }
         }
@@ -253,8 +278,8 @@ pub fn render_viewport_panel(
     }
 
     if !probes_hidden(ui) && !*args.game_preview_mode {
-        draw_volume_gizmos(ui, args, rect);
-        draw_probe_gizmos(ui, args, rect);
+        draw_volume_gizmos(ui, args, view_rect);
+        draw_probe_gizmos(ui, args, view_rect);
     }
 
     if let Some(entity) = args.selected_renderable.as_ref().copied() {
@@ -262,7 +287,7 @@ pub fn render_viewport_panel(
             ui,
             args,
             entity,
-            rect,
+            view_rect,
             response.interact_pointer_pos(),
             gizmo_mode,
             gizmo_drag,

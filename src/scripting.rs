@@ -192,6 +192,15 @@ pub const NAMESPACED_API: &[(&str, &[&str])] = &[
     ),
     ("fs", &["read", "write", "exists", "list"]),
     (
+        "sky",
+        &[
+            "set_stars", "set_star_intensity", "set_star_density",
+            "set_moon", "set_moon_intensity", "set_moon_direction",
+            "get_stars", "get_moon",
+            "set_stars_auto", "set_moon_auto",
+        ],
+    ),
+    (
         "ui",
         &[
             "create", "add_widget", "set_text", "set_visible", "set_value",
@@ -206,6 +215,15 @@ pub const NAMESPACED_API: &[(&str, &[&str])] = &[
             "get_flag", "clear_level", "clear", "write", "read",
         ],
     ),
+];
+
+/// Component names understood by `has_component` / `get_component` /
+/// `set_component`. Exposed for editor autocomplete so scripts can introspect
+/// and mutate every component the engine exposes.
+pub const COMPONENT_NAMES: &[&str] = &[
+    "Position", "Rotation", "RigidBody", "Collider", "OrientedBoxCollider",
+    "Renderable", "MaterialTexture", "Health", "HingeJoint", "FixedJoint",
+    "SpringJoint", "RopeConstraint",
 ];
 
 // ── BTBuilder: deferred behavior tree construction ─────────────────────────
@@ -467,6 +485,10 @@ pub struct ScriptEngine {
     meshes_ptr: usize,
     // Raw pointer to the environment WeatherState for set_weather().
     weather_ptr: usize,
+    // Raw pointer to the environment SkyParams for the sky.* Lua API. Uses an
+    // Arc<AtomicUsize> so the closures registered at startup always read the
+    // *current* pointer each call instead of a stale zero captured at init.
+    sky_ptr: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     // Raw pointer to the PrefabRegistry for spawn_prefab(). Set via
     // set_prefabs() before each run_update() call.
     prefabs_ptr: usize,
@@ -623,6 +645,7 @@ impl ScriptEngine {
             terrain_world_ptr: 0,
             meshes_ptr: 0,
             weather_ptr: 0,
+            sky_ptr: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             prefabs_ptr: 0,
             particles_ptr: 0,
             levels_ptr: 0,
@@ -689,7 +712,10 @@ impl ScriptEngine {
     }
 
     /// Returns the full scripting API catalogue — flat globals plus every
-    /// namespaced function — for editor autocomplete / doc generation.
+    /// namespaced function plus component names — for editor autocomplete /
+    /// doc generation. Also merges in whatever is actually mounted in the live
+    /// Lua global scope (covering plugin-registered namespaces and any API
+    /// added outside the static lists), minus the sandbox deny stubs.
     pub fn api_catalogue(&self) -> Vec<String> {
         let mut names: Vec<String> = FLAT_API_NAMES.iter().map(|s| s.to_string()).collect();
         for (ns, fns) in NAMESPACED_API {
@@ -698,11 +724,40 @@ impl ScriptEngine {
                 names.push(format!("{}.{}", ns, f));
             }
         }
+        for c in COMPONENT_NAMES {
+            names.push((*c).to_string());
+        }
+        let globals = self.lua.globals();
+        for pair in globals.pairs::<String, mlua::Value>() {
+            let Ok((k, v)) = pair else { continue };
+                let k = k.trim().to_string();
+                if k.is_empty() || k.starts_with('_') {
+                    continue;
+                }
+                if matches!(
+                    k.as_str(),
+                    "load" | "loadstring" | "loadfile" | "dofile" | "package" | "io" | "os"
+                ) {
+                    continue;
+                }
+                names.push(k.clone());
+                // Surface namespaced-table members (`bt.*`, `nav.*`, ...) that
+                // may have been registered dynamically.
+                if let Some(table) = v.as_table() {
+                    for inner in table.pairs::<String, mlua::Value>() {
+                        let Ok((member, _)) = inner else { continue };
+                        let member = member.trim().to_string();
+                        if member.is_empty() || member.starts_with('_') {
+                            continue;
+                        }
+names.push(format!("{}.{}", k, member));
+                    }
+                }
+            }
         names.sort();
         names.dedup();
         names
     }
-
     pub fn consume_camera_request(&mut self) -> Option<([f32; 3], [f32; 3])> {
         let slot = unsafe { &mut *self.pending_camera_set.get() };
         slot.take()
@@ -927,11 +982,19 @@ impl ScriptEngine {
         self.navmesh_ptr = navmesh as *const crate::navmesh::NavMesh as usize;
     }
 
-    /// Store the raw pointer to the engine ParticleSystem so the `particles.*`
+    /// Store the raw pointer to the environment ParticleSystem so the `particles.*`
     /// Lua API can drive emitters and fire sources.  Must be called before
     /// run_update() each frame (ParticleSystem lives in the game loop).
     pub fn set_particles(&mut self, particles: &mut crate::particles::ParticleSystem) {
         self.particles_ptr = particles as *mut crate::particles::ParticleSystem as usize;
+    }
+
+    /// Store the raw pointer to the environment SkyParams so the `sky.*` Lua
+    /// API can toggle stars/moon and tune their intensity.  Called before
+    /// run_update() each frame.
+    pub fn set_sky(&mut self, sky: &mut crate::environment::sky::SkyParams) {
+        self.sky_ptr
+            .store(sky as *mut crate::environment::sky::SkyParams as usize, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Store the raw pointer to the engine PrefabRegistry so the `spawn_prefab`
@@ -3173,6 +3236,168 @@ impl ScriptEngine {
         )?;
         globals.set("set_weather", set_weather)?;
 
+        // ── Sky / night-sky controls ─────────────────────────────────────
+        // sky.set_stars(true|false) — master toggle for stars + Milky Way.
+        // sky.set_star_intensity(v) — 0..1 brightness.
+        // sky.set_star_density(v)   — 0..1 how many stars (and clustering).
+        // sky.set_moon(true|false)  — master toggle for the moon disc.
+        // sky.set_moon_intensity(v) — 0..1 brightness.
+        // sky.set_moon_direction(x,y,z) — point the moon in world space.
+        // sky.get_stars() → { visible, intensity, density }
+        // sky.get_moon()  → { visible, intensity, direction={x,y,z} }
+        //
+        // Uses an Arc<AtomicUsize> pointer so every call reads the CURRENT
+        // SkyParams (updated each frame), not a stale value captured at boot.
+        let sky_arc = self.sky_ptr.clone();
+        let sky_ns = self.lua.create_table()?;
+        let set_stars = self.lua.create_function(move |_, visible: bool| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_stars: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.stars_enabled = visible;
+            if !visible {
+                sky.star_intensity = 0.0;
+            }
+            Ok(())
+        })?;
+        sky_ns.set("set_stars", set_stars)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let set_star_intensity = self.lua.create_function(move |_, v: f32| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_star_intensity: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.star_intensity = v.clamp(0.0, 1.0);
+            sky.stars_enabled = sky.star_intensity > 0.001;
+            sky.stars_auto = false;
+            Ok(())
+        })?;
+        sky_ns.set("set_star_intensity", set_star_intensity)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let set_star_density = self.lua.create_function(move |_, v: f32| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_star_density: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.star_density = v.clamp(0.0, 2.0);
+            Ok(())
+        })?;
+        sky_ns.set("set_star_density", set_star_density)?;
+
+        // sky.set_stars_auto(true) restores time-of-day driven star brightness.
+        let sky_arc = self.sky_ptr.clone();
+        let set_stars_auto = self.lua.create_function(move |_, auto: bool| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_stars_auto: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.stars_auto = auto;
+            Ok(())
+        })?;
+        sky_ns.set("set_stars_auto", set_stars_auto)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let set_moon = self.lua.create_function(move |_, visible: bool| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_moon: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.moon_enabled = visible;
+            if !visible {
+                sky.moon_intensity = 0.0;
+            }
+            Ok(())
+        })?;
+        sky_ns.set("set_moon", set_moon)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let set_moon_intensity = self.lua.create_function(move |_, v: f32| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_moon_intensity: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.moon_intensity = v.clamp(0.0, 2.0);
+            sky.moon_enabled = sky.moon_intensity > 0.001;
+            sky.moon_auto = false;
+            Ok(())
+        })?;
+        sky_ns.set("set_moon_intensity", set_moon_intensity)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let set_moon_direction = self.lua.create_function(
+            move |_, (x, y, z): (f32, f32, f32)| {
+                let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+                if ptr == 0 {
+                    return Err(mlua::Error::RuntimeError("sky.set_moon_direction: sky not available".into()));
+                }
+                let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+                let d = glam::Vec3::new(x, y, z).normalize_or_zero();
+                if d.length_squared() > 0.0 {
+                    sky.moon_direction = d;
+                    sky.moon_auto = false;
+                }
+                Ok(())
+            },
+        )?;
+        sky_ns.set("set_moon_direction", set_moon_direction)?;
+
+        // sky.set_moon_auto(true) restores time-of-day driven moon.
+        let sky_arc = self.sky_ptr.clone();
+        let set_moon_auto = self.lua.create_function(move |_, auto: bool| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.set_moon_auto: sky not available".into()));
+            }
+            let sky = unsafe { &mut *(ptr as *mut crate::environment::sky::SkyParams) };
+            sky.moon_auto = auto;
+            Ok(())
+        })?;
+        sky_ns.set("set_moon_auto", set_moon_auto)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let get_stars = self.lua.create_function(move |lua, ()| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.get_stars: sky not available".into()));
+            }
+            let sky = unsafe { &*(ptr as *const crate::environment::sky::SkyParams) };
+            let t = lua.create_table()?;
+            t.set("visible", sky.stars_enabled)?;
+            t.set("intensity", sky.star_intensity)?;
+            t.set("density", sky.star_density)?;
+            Ok(t)
+        })?;
+        sky_ns.set("get_stars", get_stars)?;
+
+        let sky_arc = self.sky_ptr.clone();
+        let get_moon = self.lua.create_function(move |lua, ()| {
+            let ptr = sky_arc.load(std::sync::atomic::Ordering::Relaxed);
+            if ptr == 0 {
+                return Err(mlua::Error::RuntimeError("sky.get_moon: sky not available".into()));
+            }
+            let sky = unsafe { &*(ptr as *const crate::environment::sky::SkyParams) };
+            let t = lua.create_table()?;
+            t.set("visible", sky.moon_enabled)?;
+            t.set("intensity", sky.moon_intensity)?;
+            let dir = lua.create_table()?;
+            dir.set("x", sky.moon_direction.x)?;
+            dir.set("y", sky.moon_direction.y)?;
+            dir.set("z", sky.moon_direction.z)?;
+            t.set("direction", dir)?;
+            Ok(t)
+        })?;
+        sky_ns.set("get_moon", get_moon)?;
+        globals.set("sky", sky_ns)?;
+
         // ── Input ─────────────────────────────────────────────────────────
         // is_key_held("W") → bool
         let kh = self.lua.create_function(move |_, key: String| {
@@ -4577,14 +4802,46 @@ impl ScriptEngine {
             level_table.set("register", register)?;
 
             // levels.load(id) → bool  /  levels.unload(id) → bool
+            // load() parses the level's .scene file and spawns its entities;
+            // unload() despawns exactly the entities that level owns.
+            let level_meshes_ptr = self.meshes_ptr;
+            let level_cache_ptr = self.mesh_cache_ptr();
+            let level_prefabs_ptr = self.prefabs_ptr;
             let load = self.lua.create_function(move |_, id: u32| {
                 let Some(lv) = level_mut() else { return Ok(false); };
-                Ok(lv.level_manager.load_level(id))
+                if lv.level_manager.is_loaded(id) {
+                    return Ok(true);
+                }
+                if lv.level_manager.load_level(id) {
+                    let world = unsafe { &mut *(world_ptr as *mut World) };
+                    let meshes = unsafe { &mut *(level_meshes_ptr as *mut crate::assets::AssetStore<crate::assets::Mesh>) };
+                    let cache = unsafe { &mut *(level_cache_ptr as *mut HashMap<String, crate::assets::Handle<crate::assets::Mesh>>) };
+                    let prefabs = if level_prefabs_ptr == 0 {
+                        None
+                    } else {
+                        Some(unsafe { &*(level_prefabs_ptr as *const crate::scene::PrefabRegistry) })
+                    };
+                    match lv.level_manager.spawn_level(id, world, meshes, cache, prefabs) {
+                        Ok(true) => Ok(true),
+                        Ok(false) => {
+                            let _ = lv.level_manager.unload_level(id);
+                            Ok(false)
+                        }
+                        Err(e) => {
+                            tracing::error!("[Scripting] levels.load({}) failed: {}", id, e);
+                            let _ = lv.level_manager.unload_level(id);
+                            Ok(false)
+                        }
+                    }
+                } else {
+                    Ok(false)
+                }
             })?;
             level_table.set("load", load)?;
             let unload = self.lua.create_function(move |_, id: u32| {
                 let Some(lv) = level_mut() else { return Ok(false); };
-                Ok(lv.level_manager.unload_level(id))
+                let world = unsafe { &mut *(world_ptr as *mut World) };
+                Ok(lv.level_manager.despawn_level(id, world) || lv.level_manager.unload_level(id))
             })?;
             level_table.set("unload", unload)?;
 

@@ -138,15 +138,18 @@ impl TimeOfDay {
     }
 
     /// 0.0 = full night, 1.0 = full day.
-    /// Ramps up smoothly during twilight (±1 hour around sunrise/sunset).
+    /// Ramps up smoothly over a long twilight (±2.6 game-hours around
+    /// sunrise/sunset) so dusk/dawn are gradual — the scene darkens gently as
+    /// the sun goes down instead of snapping to night.
     pub fn daylight_factor(&self) -> f32 {
         let range = self.sunset_hour - self.sunrise_hour;
         if range <= 0.0 {
             return 0.0;
         }
         let t = (self.hour - self.sunrise_hour) / range;
-        // Smooth ramp: 0 at t=0, 1 at t=1, with ±0.1 twilight zones.
-        smoothstep(-0.05, 0.05, t) * (1.0 - smoothstep(0.95, 1.05, t))
+        // Wide smooth ramps: day holds at 1.0 between ~8.6h and ~15.4h, then
+        // fades over a long twilight on either side.
+        smoothstep(-0.22, 0.22, t) * (1.0 - smoothstep(0.78, 1.22, t))
     }
 
     /// Sun color. Warm orange at sunrise/sunset, white at noon, dark at night.
@@ -183,11 +186,12 @@ impl TimeOfDay {
         night_fog.lerp(day_fog, daylight) + twilight_fog * twilight
     }
 
-    /// Star visibility. 0.0 during day, ramps up after sunset, 1.0 at midnight.
+    /// Star visibility. 0.0 during day, rises gradually through twilight so the
+    /// stars are revealed "little by little" as the sky darkens, 1.0 at night.
     pub fn star_intensity(&self) -> f32 {
         let daylight = self.daylight_factor();
         let nightness = 1.0 - daylight;
-        (nightness * 2.0 - 0.3).clamp(0.0, 1.0)
+        (nightness * 1.8 - 0.4).clamp(0.0, 1.0)
     }
 
     /// Whether the sun is currently above the horizon.

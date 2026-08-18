@@ -69,6 +69,10 @@ pub struct LevelState {
     pub world_state: std::sync::Arc<std::sync::Mutex<WorldStateManager>>,
     pub loading_screen: LoadingScreen,
     pub flood: FloodSystem,
+    /// Trigger portals (from the level manifest) that load/unload levels.
+    pub portals: Vec<crate::levels::portal::LevelPortal>,
+    /// Cross-level entity reference resolver.
+    pub cross_refs: crate::levels::cross_ref::CrossRefManager,
 }
 
 impl LevelState {
@@ -79,6 +83,8 @@ impl LevelState {
             world_state: std::sync::Arc::new(std::sync::Mutex::new(WorldStateManager::new())),
             loading_screen: LoadingScreen::new(),
             flood: FloodSystem::new(),
+            portals: Vec::new(),
+            cross_refs: crate::levels::cross_ref::CrossRefManager::new(),
         }
     }
 }
@@ -144,6 +150,8 @@ pub struct CameraInputState {
     pub camera: Camera3D,
     pub mouse_look_active: bool,
     pub mouse_look_latched: bool,
+    /// Middle-mouse drag pans the camera (moves position + target together).
+    pub mouse_pan_active: bool,
     pub last_cursor_pos: Option<PhysicalPosition<f64>>,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
@@ -171,12 +179,13 @@ impl CameraInputState {
             camera,
             mouse_look_active: false,
             mouse_look_latched: false,
+            mouse_pan_active: false,
             last_cursor_pos: None,
             camera_yaw,
             camera_pitch,
             camera_move_velocity: Vec3::ZERO,
             nav_speed_scalar: 6.0,
-            look_sensitivity: 0.0035,
+            look_sensitivity: 0.005,
             orbit_mode: false,
             orbit_distance: 8.0,
         }
@@ -441,7 +450,7 @@ mod tests {
         assert!(!cis.orbit_mode);
         assert!((cis.orbit_distance - 8.0).abs() < 0.01);
         assert!((cis.nav_speed_scalar - 6.0).abs() < 0.01);
-        assert!((cis.look_sensitivity - 0.0035).abs() < 1e-6);
+        assert!((cis.look_sensitivity - 0.005).abs() < 1e-6);
     }
 
     #[test]

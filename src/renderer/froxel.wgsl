@@ -58,7 +58,7 @@ fn cloud_density(p: vec3<f32>) -> f32 {
     return froxel.fog.x * (height * 0.12 + 0.25) * (0.6 + 0.4 * noise);
 }
 
-@compute @workgroup_size(8, 8, 8)
+@compute @workgroup_size(8, 8, 4)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = vec3<u32>(textureDimensions(t_froxel_out));
     if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= dims.z) { return; }

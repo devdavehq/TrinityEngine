@@ -32,7 +32,9 @@ struct Uniforms {
 
 struct WeatherData {
     snow_coverage: f32,
-    _pad: vec3<f32>,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 @group(0) @binding(13) var<uniform> weather: WeatherData;
 
@@ -88,7 +90,9 @@ struct ShadowData {
 // ── Baked light probes ──────────────────────────────────────────────────────
 struct ProbeControl {
     count: u32,
-    _pad: vec3<u32>,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 @group(0) @binding(14) var<uniform> probe_control: ProbeControl;
 // Probe layout: 10 × vec4 each = position/r + 9 SH coeffs (rgb).
@@ -133,7 +137,8 @@ struct VsOut {
 
 // Evaluate baked L2 SH irradiance for a surface normal direction.
 // Reads the module-scope `probe_data` storage array. Layout per probe
-// (base = index*10 + n): n=0 position.xyz+range, n=1..9 coeffs rgb.
+// (base = index*11 + n): n=0 position.xyz+range, n=1..9 coeffs rgb,
+// n=10 sky occlusion (x = baked AO, 0 open / 1 enclosed).
 fn eval_sh(base: u32, normal: vec3<f32>) -> vec3<f32> {
     let d = normalize(normal);
     var result: vec3<f32> = vec3<f32>(0.0);
@@ -605,7 +610,7 @@ fn fs_deferred(in: VsOut) -> DeferredOutput {
         ao *= 1.0 - approx;
         ao = max(ao, 0.18);
     }
-    let ambient = (kD_ibl * diffuse_ibl + spec_ibl) * ao;
+    var ambient = (kD_ibl * diffuse_ibl + spec_ibl) * ao;
 
     var color = ambient + total_lighting + emissive;
 
@@ -630,7 +635,7 @@ fn fs_deferred(in: VsOut) -> DeferredOutput {
         var best_w = -1.0;
         var best_i = 0u;
         for (var i = 0u; i < min(probe_control.count, 32u); i = i + 1u) {
-            let p = probe_data[i * 10u + 0u];
+            let p = probe_data[i * 11u + 0u];
             let d = distance(p.xyz, world_pos);
             if d < p.w {
                 let w = 1.0 / (d * d + 0.01);
@@ -641,26 +646,38 @@ fn fs_deferred(in: VsOut) -> DeferredOutput {
             }
         }
         var probe_irr = vec3<f32>(0.0);
+        var probe_ao = 0.0;
         if best_w >= 0.0 {
-            probe_irr = eval_sh(best_i * 10u, N);
+            probe_irr = eval_sh(best_i * 11u, N);
+            probe_ao = probe_data[best_i * 11u + 10u].x;
         } else {
             // Fall back to the nearest probe globally if none is in range.
             var nd = 1e9;
             var ni = 0u;
             for (var i = 0u; i < min(probe_control.count, 32u); i = i + 1u) {
-                let d = distance(probe_data[i * 10u + 0u].xyz, world_pos);
+                let d = distance(probe_data[i * 11u + 0u].xyz, world_pos);
                 if d < nd {
                     nd = d;
                     ni = i;
                 }
             }
-            probe_irr = eval_sh(ni * 10u, N);
+            probe_irr = eval_sh(ni * 11u, N);
+            probe_ao = probe_data[ni * 11u + 10u].x;
         }
         let bake_strength = select(
             0.25, uniforms.post_params1.w,
             uniforms.post_params1.z > 0.5,
         );
-        gi += probe_irr * albedo * bake_strength;
+        // Baked sky occlusion (Decima-style): enclosed probes darken the
+        // ambient + baked GI that screen-space GTAO can't reach. 0.7 caps the
+        // effect so fully-enclosed rooms never go pitch black.
+        let ao_fade = 1.0 - clamp(probe_ao, 0.0, 1.0) * 0.7;
+        gi += probe_irr * albedo * bake_strength * ao_fade;
+        // `ambient` was computed above (line ~612) before this block; damp it
+        // now so rooms aren't still lit by unobstructed sky IBL. The final
+        // color is recomposed from `ambient_blended` below.
+        ambient *= ao_fade;
+        ao = max(ao * ao_fade, 0.15);
     }
 
     // Snow accumulation: blend snow albedo/roughness on upward-facing surfaces.

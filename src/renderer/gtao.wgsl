@@ -106,7 +106,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             horizon_sin = max(horizon_sin, elev);
         }
         // Clamp to the visible hemisphere and integrate the visible sky wedge.
-        let horizon_sin = clamp(horizon_sin, 0.0, 1.0);
+        horizon_sin = clamp(horizon_sin, 0.0, 1.0);
         // Visibility ≈ sqrt(1 - h²) integrated over the wedge (simplified GTAO).
         let vis = sqrt(1.0 - horizon_sin * horizon_sin);
         total += vis;

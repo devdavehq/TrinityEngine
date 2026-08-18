@@ -164,7 +164,14 @@ pub trait Camera {
     fn forward(&self) -> glam::Vec3 {
         let vp = self.view_projection_matrix();
         let far_center = (vp.inverse() * glam::Vec4::new(0.0, 0.0, -1.0, 1.0)).truncate();
-        (far_center - self.position()).normalize()
+        let f = (far_center - self.position()).normalize_or_zero();
+        // Guard against NaN cameras (e.g. a script posted an invalid pose): a
+        // NaN forward poisons the whole frame's frustum culling and rendering.
+        if f.is_finite() {
+            f
+        } else {
+            glam::Vec3::new(0.0, 0.0, -1.0)
+        }
     }
 }
 

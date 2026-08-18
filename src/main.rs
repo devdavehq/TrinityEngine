@@ -199,6 +199,9 @@ const CONTENT_MESHES_DIR: &str = "Content/Meshes";
 const CONTENT_TEXTURES_DIR: &str = "Content/Textures";
 const CONTENT_MATERIALS_DIR: &str = "Content/Materials";
 const CONTENT_PREFABS_DIR: &str = "Content/Prefabs";
+/// Level streaming manifest — which .scene files stream in/out around the
+/// player, with per-level persistent flag + streaming distances.
+const LEVEL_MANIFEST_PATH: &str = "Content/levels.json";
 const APP_ICON_PATH: &str = "assets/trinity_icon.png";
 pub const TRINITY_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -311,6 +314,10 @@ struct GameApp {
     /// True when launched with `--game [scene]` → skip the editor/hub entirely
     /// and boot straight into Play mode. This is the shippable runtime path.
     runtime_mode: bool,
+
+    /// When set via TRINITY_AUTO_OPEN=1, the hub auto-opens the most recent
+    /// project after a short delay (dev/test convenience, skips the click).
+    auto_open_last_project: bool,
 
     /// Per-profile save slots (#4). Lives outside the game folder so repackaging
     /// never wipes player saves.
@@ -464,6 +471,7 @@ impl GameApp {
             sub_scene_mgr:  SubSceneManager::new(),
             transition:     SceneTransition::new(),
             runtime_mode,
+            auto_open_last_project: std::env::var("TRINITY_AUTO_OPEN").map(|v| v == "1").unwrap_or(false),
             settings,
             save_slots: save_slots::SaveSlots::new(),
             next_autosave_at: std::time::Instant::now(),
@@ -814,7 +822,7 @@ impl GameApp {
                 dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
             }
             self.input_state.camera_yaw = dir.z.atan2(dir.x);
-            self.input_state.camera_pitch = dir.y.asin();
+            self.input_state.camera_pitch = dir.y.clamp(-1.0, 1.0).asin();
             tracing::info!("[Camera] Snapped to selected entity: {:?}", entity);
         } else {
             tracing::info!("[Camera] Selected entity has no Position component.");
@@ -848,7 +856,7 @@ impl GameApp {
             view_dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
         }
         self.input_state.camera_yaw = view_dir.z.atan2(view_dir.x);
-        self.input_state.camera_pitch = view_dir.y.asin();
+        self.input_state.camera_pitch = view_dir.y.clamp(-1.0, 1.0).asin();
     }
 
     fn spawn_scene_watcher(&mut self) {
@@ -926,6 +934,44 @@ impl GameApp {
             if let Err(e) = r.load_probes() {
                 self.error_log.push(format!("[Lighting] {}", e));
             }
+        }
+        // ── Level streaming manifest ──────────────────────────────────────────
+        // Register every level from Content/levels.json and spawn the
+        // persistent ones so the always-loaded base world exists. Levels are
+        // additive: the primary scene above is untouched, and these are extra
+        // chunks that stream in/out around the player (see main loop).
+        self.levels.level_manager.clear_all();
+        let manifest = crate::levels::LevelManifest::load(LEVEL_MANIFEST_PATH)
+            .map_err(|e| self.error_log.push(format!("[Streaming] {}", e)))
+            .unwrap_or_default();
+        self.levels.level_manager.register_manifest(&manifest);
+        let registered = self.levels.level_manager.levels.len();
+        if registered > 0 {
+            tracing::info!("[Streaming] registered {} level(s) from {}", registered, LEVEL_MANIFEST_PATH);
+        }
+        // Resolve manifest portals into live portal triggers (names -> IDs).
+        // Portals whose target level is missing are disabled by from_entry.
+        self.levels.portals = manifest
+            .portals
+            .iter()
+            .map(|e| crate::levels::portal::LevelPortal::from_entry(e, &self.levels.level_manager))
+            .collect();
+        if !self.levels.portals.is_empty() {
+            tracing::info!("[Streaming] registered {} portal(s)", self.levels.portals.len());
+        }
+        self.levels.cross_refs.clear();
+        match self.levels.level_manager.spawn_persistent_levels(
+            &mut self.world,
+            &mut self.assets.meshes,
+            &mut self.assets.mesh_cache,
+            Some(&self.assets.prefab_registry),
+        ) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!("[Streaming] spawned {} persistent level(s)", n);
+                }
+            }
+            Err(e) => self.error_log.push(format!("[Streaming] persistent level failed: {}", e)),
         }
 self.nav_grid.rebuild_from_heights(&self.terrain_world);
                                         self.navmesh = navmesh::NavMesh::from_terrain(&self.nav_grid, &self.terrain_world);
@@ -1586,14 +1632,21 @@ impl ApplicationHandler for GameApp {
                     self.input_state.mouse_look_active = state == ElementState::Pressed;
                     self.input_state.last_cursor_pos = None;
                 }
+                // Middle-mouse drag = pan (UE5-style). Moves the camera and its
+                // look target together so you can slide anywhere in the scene
+                // without orbiting or touching the right button.
+                if button == MouseButton::Middle {
+                    self.input_state.mouse_pan_active = state == ElementState::Pressed;
+                    self.input_state.last_cursor_pos = None;
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 0.7,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
+                    MouseScrollDelta::LineDelta(_, y) => y * 1.8,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
                 };
                 if self.input_state.orbit_mode && self.selected_renderable.is_some() {
-                    self.input_state.orbit_distance = (self.input_state.orbit_distance - amount * 0.75).clamp(0.8, 120.0);
+                    self.input_state.orbit_distance = (self.input_state.orbit_distance - amount * 1.25).clamp(0.05, 2000.0);
                     let dir = (self.input_state.camera.position - self.input_state.camera.target).normalize_or_zero();
                     if dir.length_squared() > 1e-6 {
                         self.input_state.camera.position = self.input_state.camera.target + dir * self.input_state.orbit_distance;
@@ -1605,6 +1658,25 @@ impl ApplicationHandler for GameApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Middle-mouse pan: slide the camera (position + target) along
+                // the view-right / view-up plane, scaled by distance so close
+                // views pan slowly and far views pan fast.
+                if self.input_state.mouse_pan_active {
+                    if let Some(prev) = self.input_state.last_cursor_pos {
+                        let dx = (position.x - prev.x) as f32;
+                        let dy = (position.y - prev.y) as f32;
+                        let dist = (self.input_state.camera.position - self.input_state.camera.target).length().max(0.1);
+                        let pan_scale = dist * 0.0016;
+                        let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                        let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
+                        let up = right.cross(forward).normalize_or_zero();
+                        let delta = (-right * dx + up * dy) * pan_scale;
+                        self.input_state.camera.position += delta;
+                        self.input_state.camera.target += delta;
+                    }
+                    self.input_state.last_cursor_pos = Some(position);
+                    return;
+                }
                 if self.input_state.mouse_look_active || self.input_state.mouse_look_latched {
                     if let Some(prev) = self.input_state.last_cursor_pos {
                         let dx = (position.x - prev.x) as f32;
@@ -1709,15 +1781,24 @@ impl ApplicationHandler for GameApp {
                     delta_time: dt,
                 });
 
+                // Editor Scene = authoring mode (no gameplay simulation).
+                // Game Preview = runs scripts/physics/animation, like Unreal PIE.
+                // Computed here (before the environment block) so time-of-day,
+                // particles, fire, and level streaming can be gated behind it too.
+                let run_sim = self.game_preview_mode && (!self.sim_paused || self.sim_step_once);
+
                 // â”€â”€ Environment update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                // Advance time of day, update sky/weather/clouds from new state.
-                // This runs every frame (even in editor mode) so the sky preview
-                // stays live. The time speed can be set to 0 to pause.
+                // Time of day advances only while the game is simulating. In
+                // edit mode the sun stays put (drag the Hour slider to preview
+                // any moment of the day) — the world should not be updating
+                // when it isn't playing.
                 let prev_hour = self.env.time_of_day.hour;
-                self.env.time_of_day.advance(dt);
+                if run_sim {
+                    self.env.time_of_day.advance(dt);
+                    self.env.clouds.update(&self.env.weather, &self.env.time_of_day, dt);
+                    self.env.lightning.update(&self.env.weather, dt);
+                }
                 self.env.sky.update_from_time(&self.env.time_of_day);
-                self.env.clouds.update(&self.env.weather, &self.env.time_of_day, dt);
-                self.env.lightning.update(&self.env.weather, dt);
 
                 // Play thunder sound + emit event when lightning strikes.
                 if self.env.lightning.thunder_just_fired {
@@ -1735,29 +1816,33 @@ impl ApplicationHandler for GameApp {
                 // â”€â”€ Weather Zone evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Check if any WeatherZone entity is near the camera and
                 // override the global weather accordingly.
-                {
-                    use crate::environment::weather_zone::evaluate_weather_at;
-                    let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
-                    let zone_weather = evaluate_weather_at(&self.world, &self.env.weather, cam);
-                    self.env.weather.condition = zone_weather.condition;
-                    self.env.weather.intensity = zone_weather.intensity;
+                if run_sim {
+                    {
+                        use crate::environment::weather_zone::evaluate_weather_at;
+                        let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
+                        let zone_weather = evaluate_weather_at(&self.world, &self.env.weather, cam);
+                        self.env.weather.condition = zone_weather.condition;
+                        self.env.weather.intensity = zone_weather.intensity;
+                    }
                 }
 
                 // â”€â”€ Wind Zone evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Check if any WindZone entity is near the camera and override
                 // the global wind accordingly.
-                {
-                    use crate::environment::wind_zone::evaluate_wind_at;
-                    let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
-                    let global_dir = [self.env.weather.wind_direction.x, 0.0, self.env.weather.wind_direction.y];
-                    let (dir, str) = evaluate_wind_at(
-                        &self.world,
-                        global_dir,
-                        self.env.weather.wind_strength,
-                        cam,
-                    );
-                    self.env.weather.wind_direction = glam::Vec2::new(dir[0], dir[2]);
-                    self.env.weather.wind_strength = str;
+                if run_sim {
+                    {
+                        use crate::environment::wind_zone::evaluate_wind_at;
+                        let cam = [self.input_state.camera.position.x, self.input_state.camera.position.y, self.input_state.camera.position.z];
+                        let global_dir = [self.env.weather.wind_direction.x, 0.0, self.env.weather.wind_direction.y];
+                        let (dir, str) = evaluate_wind_at(
+                            &self.world,
+                            global_dir,
+                            self.env.weather.wind_strength,
+                            cam,
+                        );
+                        self.env.weather.wind_direction = glam::Vec2::new(dir[0], dir[2]);
+                        self.env.weather.wind_strength = str;
+                    }
                 }
 
                 // Emit environment events through the event bus.
@@ -1942,8 +2027,10 @@ impl ApplicationHandler for GameApp {
                 // â”€â”€ Reset physics ground flag â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Must happen before physics_system so entities that walk off
                 // edges fall correctly on the next frame.
-                for body in self.world.query_mut::<&mut RigidBody>() {
-                    body.on_ground = false;
+                if run_sim {
+                    for body in self.world.query_mut::<&mut RigidBody>() {
+                        body.on_ground = false;
+                    }
                 }
 
                 // â”€â”€ Systems â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1957,7 +2044,7 @@ impl ApplicationHandler for GameApp {
                 //   - animation_blending_system
                 // Editor Scene = authoring mode (no gameplay simulation).
                 // Game Preview = runs scripts/physics/animation, like Unreal PIE.
-                let run_sim = self.game_preview_mode && (!self.sim_paused || self.sim_step_once);
+                // (run_sim is computed earlier, above the environment block.)
 
                 // â”€â”€ Snapshot capture on Play â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Save all entity state before the simulation starts so we
@@ -2014,6 +2101,7 @@ impl ApplicationHandler for GameApp {
                                 &mut self.terrain_world,
                                 &mut self.assets.meshes,
                                 &mut self.env.weather,
+                                &mut self.env.sky,
                                 &self.assets.prefab_registry,
                                 &mut self.particles,
                                 &mut self.levels,
@@ -2028,15 +2116,22 @@ impl ApplicationHandler for GameApp {
                             let _ = self.scripts.tick_plugins(dt);
                             self.scripts.tick_cinematics(dt);
                             if let Some((pos, target)) = self.scripts.consume_camera_request() {
-                                self.input_state.camera.position = glam::Vec3::from_array(pos);
-                                self.input_state.camera.target = glam::Vec3::from_array(target);
-                                let mut dir =
-                                    (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
-                                if dir.length_squared() < 1e-6 {
-                                    dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+                                // Reject NaN/inf poses so a bad script can never
+                                // NaN the editor camera (which made everything
+                                // invisible — a known crash-adjacent bug).
+                                if pos.iter().all(|v| v.is_finite())
+                                    && target.iter().all(|v| v.is_finite())
+                                {
+                                    self.input_state.camera.position = glam::Vec3::from_array(pos);
+                                    self.input_state.camera.target = glam::Vec3::from_array(target);
+                                    let mut dir =
+                                        (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                                    if dir.length_squared() < 1e-6 {
+                                        dir = glam::Vec3::new(0.0, -0.2, -1.0).normalize();
+                                    }
+                                    self.input_state.camera_yaw = dir.z.atan2(dir.x);
+                                    self.input_state.camera_pitch = dir.y.clamp(-1.0, 1.0).asin();
                                 }
-                                self.input_state.camera_yaw = dir.z.atan2(dir.x);
-                                self.input_state.camera_pitch = dir.y.asin();
                             }
                             let skip_n = self.scripts.consume_frame_skip_request();
                             if skip_n > 0 {
@@ -2165,17 +2260,21 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                // Seamless free-fly camera: RMB look + WASD move, Shift sprint, Space/Ctrl up/down.
-                {
-                    let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
-                    let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
-                    let up = glam::Vec3::Y;
-                    let mut move_dir = glam::Vec3::ZERO;
-                    if self.input_state.input.is_held(KeyCode::KeyW) { move_dir += forward; }
-                    if self.input_state.input.is_held(KeyCode::KeyS) { move_dir -= forward; }
-                    if self.input_state.input.is_held(KeyCode::KeyD) { move_dir += right; }
-                    if self.input_state.input.is_held(KeyCode::KeyA) { move_dir -= right; }
-                    if self.input_state.input.is_held(KeyCode::Space) { move_dir += up; }
+                // Seamless free-fly camera: RMB look + WASD move, Q/E up/down, Shift sprint,
+                    // Space/Ctrl also up/down, middle-mouse pan.
+                    {
+                        let forward = (self.input_state.camera.target - self.input_state.camera.position).normalize_or_zero();
+                        let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
+                        let up = glam::Vec3::Y;
+                        let mut move_dir = glam::Vec3::ZERO;
+                        if self.input_state.input.is_held(KeyCode::KeyW) { move_dir += forward; }
+                        if self.input_state.input.is_held(KeyCode::KeyS) { move_dir -= forward; }
+                        if self.input_state.input.is_held(KeyCode::KeyD) { move_dir += right; }
+                        if self.input_state.input.is_held(KeyCode::KeyA) { move_dir -= right; }
+                        // UE5-style: Q/E move straight up/down.
+                        if self.input_state.input.is_held(KeyCode::KeyQ) { move_dir -= up; }
+                        if self.input_state.input.is_held(KeyCode::KeyE) { move_dir += up; }
+                        if self.input_state.input.is_held(KeyCode::Space) { move_dir += up; }
                     if self.input_state.input.is_held(KeyCode::ControlLeft) || self.input_state.input.is_held(KeyCode::ControlRight) {
                         move_dir -= up;
                     }
@@ -2191,7 +2290,7 @@ impl ApplicationHandler for GameApp {
                     } else {
                         glam::Vec3::ZERO
                     };
-                    let accel_blend = (1.0 - (-dt * 10.0).exp()).clamp(0.0, 1.0);
+                    let accel_blend = (1.0 - (-dt * 18.0).exp()).clamp(0.0, 1.0);
                     self.input_state.camera_move_velocity =
                         self.input_state.camera_move_velocity.lerp(desired_velocity, accel_blend);
                     if self.input_state.camera_move_velocity.length_squared() < 1e-5 {
@@ -2219,6 +2318,7 @@ impl ApplicationHandler for GameApp {
                 // queue load/unload operations. This is the core of the
                 // streaming level system â€” levels load when the player is
                 // nearby and unload when far away.
+                if run_sim {
                 {
                     let player_pos = self.input_state.camera.position.to_array();
                     if let Some(streaming_result) = levels::check_streaming(
@@ -2227,10 +2327,27 @@ impl ApplicationHandler for GameApp {
                         dt,
                         &mut self.levels.streaming_config,
                     ) {
-                        // Unload levels first (free memory/entity slots).
+                        // Unload levels first (free memory/entity slots). Their
+                        // runtime state is captured so reloads restore it.
                         for level_id in &streaming_result.levels_to_unload {
-                            if self.levels.level_manager.unload_level(*level_id) {
+                            if let Some(name) = self.levels.level_manager.get(*level_id).map(|l| l.name.clone()) {
+                                if let Ok(mut wsm) = self.levels.world_state.lock() {
+                                    wsm.capture_world(&self.world, &name);
+                                }
+                                self.levels.cross_refs.on_level_unloaded(&name);
+                            }
+                            if self.levels.level_manager.despawn_level(*level_id, &mut self.world) {
                                 tracing::info!("[Streaming] Unloaded level {}", level_id);
+                            } else if self.levels.level_manager.unload_level(*level_id) {
+                                tracing::info!("[Streaming] Unloaded level {}", level_id);
+                            }
+                            let evicted = self.levels.level_manager.release_level_meshes(
+                                *level_id,
+                                &mut self.assets.meshes,
+                                &self.assets.mesh_cache,
+                            );
+                            if evicted > 0 {
+                                tracing::info!("[Streaming] Evicted {} mesh(es) for level {}", evicted, level_id);
                             }
                         }
                         // Show loading screen before loading new levels so the
@@ -2238,20 +2355,119 @@ impl ApplicationHandler for GameApp {
                         if !streaming_result.levels_to_load.is_empty() {
                             self.levels.loading_screen.show("Loading level...");
                         }
-                        // Load levels (mark as loaded; entities are spawned
-                        // by the scene system when needed).
-                        for level_id in &streaming_result.levels_to_load {
+                        // Load levels: spawn their entities into the world.
+                        let total = streaming_result.levels_to_load.len();
+                        for (idx, level_id) in streaming_result.levels_to_load.iter().enumerate() {
+                            self.levels.loading_screen.update_progress(
+                                if total > 0 { idx as f32 / total as f32 } else { 1.0 },
+                            );
                             if self.levels.level_manager.load_level(*level_id) {
-                                tracing::info!("[Streaming] Loaded level {}", level_id);
+                                match self.levels.level_manager.spawn_level(
+                                    *level_id,
+                                    &mut self.world,
+                                    &mut self.assets.meshes,
+                                    &mut self.assets.mesh_cache,
+                                    Some(&self.assets.prefab_registry),
+                                ) {
+                                    Ok(true) => {
+                                        // Restore gameplay state + resolve any
+                                        // cross-level references into this level.
+                                        if let Some(name) = self.levels.level_manager.get(*level_id).map(|l| l.name.clone()) {
+                                            if let Ok(wsm) = self.levels.world_state.lock() {
+                                                wsm.apply_to_world(&mut self.world, &name);
+                                            }
+                                            self.levels.cross_refs.on_level_loaded(&name, &self.world);
+                                        }
+                                        tracing::info!("[Streaming] Loaded level {}", level_id)
+                                    }
+                                    Ok(false) => tracing::warn!("[Streaming] Level {} not found", level_id),
+                                    Err(e) => {
+                                        self.error_log
+                                            .push(format!("[Streaming] Level {} failed: {}", level_id, e));
+                                        tracing::error!("[Streaming] Level {} failed: {}", level_id, e);
+                                    }
+                                }
                             }
                         }
                         // Hide loading screen once all levels have been loaded.
                         // The fade-out is animated by loading_screen.update(dt)
                         // which runs every frame above.
                         if !streaming_result.levels_to_load.is_empty() {
+                            self.levels.loading_screen.update_progress(1.0);
                             self.levels.loading_screen.hide();
                         }
                     }
+                }
+                }
+
+                // ── Portal triggers ───────────────────────────────────────────────
+                // Check the player's position against every portal in the manifest.
+                // On enter: load the target level and (optionally) unload the
+                // source — a Decima-style one-way transition for doorways, cave
+                // entrances, etc.
+                if run_sim && !self.levels.portals.is_empty() {
+                {
+                    let player_pos = self.input_state.camera.position.to_array();
+                    let mut fired: Vec<(u32, u32)> = Vec::new();
+                    for portal in &mut self.levels.portals {
+                        if portal.target_level_id == 0 {
+                            continue; // Disabled / unresolved target.
+                        }
+                        match crate::levels::portal::check_portal_trigger(portal, player_pos) {
+                            crate::levels::portal::PortalEvent::Entered => {
+                                fired.push((portal.target_level_id, portal.source_level_id));
+                            }
+                            _ => {}
+                        }
+                    }
+                    for (target_id, source_id) in fired {
+                        // Load the target level (additive — nothing is cleared).
+                        match self.levels.level_manager.spawn_level(
+                            target_id,
+                            &mut self.world,
+                            &mut self.assets.meshes,
+                            &mut self.assets.mesh_cache,
+                            Some(&self.assets.prefab_registry),
+                        ) {
+                            Ok(true) => {
+                                if let Some(name) = self.levels.level_manager.get(target_id).map(|l| l.name.clone()) {
+                                    if let Ok(wsm) = self.levels.world_state.lock() {
+                                        wsm.apply_to_world(&mut self.world, &name);
+                                    }
+                                    self.levels.cross_refs.on_level_loaded(&name, &self.world);
+                                }
+                                tracing::info!("[Portal] loaded level {}", target_id);
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                self.error_log
+                                    .push(format!("[Portal] target level failed: {}", e));
+                                tracing::error!("[Portal] target level failed: {}", e);
+                            }
+                        }
+                        // One-way transition: capture + unload the source level.
+                        if source_id != 0 {
+                            if let Some(name) = self.levels.level_manager.get(source_id).map(|l| l.name.clone()) {
+                                if let Ok(mut wsm) = self.levels.world_state.lock() {
+                                    wsm.capture_world(&self.world, &name);
+                                }
+                                self.levels.cross_refs.on_level_unloaded(&name);
+                            }
+                            if self.levels.level_manager.despawn_level(source_id, &mut self.world) {
+                                let evicted = self.levels.level_manager.release_level_meshes(
+                                    source_id,
+                                    &mut self.assets.meshes,
+                                    &self.assets.mesh_cache,
+                                );
+                                tracing::info!(
+                                    "[Portal] unloaded source level {} (evicted {} mesh(es))",
+                                    source_id,
+                                    evicted
+                                );
+                            }
+                        }
+                    }
+                }
                 }
 
                 // â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2264,6 +2480,8 @@ impl ApplicationHandler for GameApp {
                 // â”€â”€ Particle system update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Sync weather â†’ emitters (enable rain/snow/mist, adjust intensity).
                 // Then advance particle physics. Particles are passed to draw_world as GpuParticle slice.
+                // Gated behind run_sim so the world doesn't animate in edit mode.
+                if run_sim {
                 self.particles.apply_weather(
                     self.particle_indices,
                     self.env.weather.condition,
@@ -2368,6 +2586,7 @@ impl ApplicationHandler for GameApp {
                         }
                     }
                 }
+                }
                 let gpu_particles = self.particles.gpu_instances();
                 #[cfg(feature = "editor")]
                 if self.app_stage == AppStage::ProjectHub {
@@ -2385,6 +2604,27 @@ impl ApplicationHandler for GameApp {
                         self.app_stage = AppStage::EditorLoading;
                         self.project_stage_started_at =
                             std::time::Instant::now();
+                    } else if self.auto_open_last_project
+                        && self.project_stage_started_at.elapsed().as_secs() > 2
+                    {
+                        // Dev/test convenience: open the most recent project
+                        // instead of waiting for a hub click.
+                        self.auto_open_last_project = false;
+                        if let Some(last) =
+                            crate::project_registry::ProjectRegistry::load()
+                                .projects
+                                .into_iter()
+                                .next()
+                        {
+                            let proj =
+                                std::path::PathBuf::from(&last.path);
+                            let proj =
+                                std::fs::canonicalize(&proj).unwrap_or(proj);
+                            self.switch_to_project(proj);
+                            self.app_stage = AppStage::EditorLoading;
+                            self.project_stage_started_at =
+                                std::time::Instant::now();
+                        }
                     }
                 }
                 self.refresh_available_scenes_if_needed();
@@ -2509,13 +2749,27 @@ impl ApplicationHandler for GameApp {
                             camera_nav_speed: self.input_state.nav_speed_scalar,
                             time_of_day: &mut self.env.time_of_day,
                             weather: &mut self.env.weather,
+                            sky: &mut self.env.sky,
                             audio: &mut self.audio,
                             bake_requested: &mut self.bake_requested,
+                            levels: &mut self.levels,
                         };
                         if self.app_stage == AppStage::EditorLoading {
                             ui.begin_editor_loading(_window, self.project_stage_started_at.elapsed().as_secs_f32());
                         } else {
-                            ui.begin_and_build(_window, &mut frame_args);
+                            // Guard the whole editor build so a single bad asset /
+                            // panel can never take the editor down. Panics are
+                            // logged and the frame continues.
+                            let frame_result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    ui.begin_and_build(_window, &mut frame_args);
+                                }),
+                            );
+                            if frame_result.is_err() {
+                                tracing::error!(
+                                    "[Editor] Editor UI build panicked — recovered to keep the editor alive."
+                                );
+                            }
                         }
                         // Emit WeatherChangedEvent if the editor changed weather.
                         if self.env.weather.condition != prev_condition
@@ -2595,16 +2849,35 @@ impl ApplicationHandler for GameApp {
                         return_to_hub_after_render = true;
                     }
 
-                    let mut draw_ui = |_device: &wgpu::Device,
-                                       _queue: &wgpu::Queue,
-                                       _encoder: &mut wgpu::CommandEncoder,
-                                       _view: &wgpu::TextureView| {
-                        #[cfg(feature = "editor")]
-                        if let Some(ui) = self.editor_ui.as_mut() {
-                            ui.paint_on(_device, _queue, _encoder, _view);
+let mut draw_ui = |_device: &wgpu::Device,
+                                           _queue: &wgpu::Queue,
+                                           _encoder: &mut wgpu::CommandEncoder,
+                                           _view: &wgpu::TextureView| {
+                            #[cfg(feature = "editor")]
+                            if let Some(ui) = self.editor_ui.as_mut() {
+                                ui.paint_on(_device, _queue, _encoder, _view);
+                            }
+                        };
+                        {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static CD: AtomicU32 = AtomicU32::new(0);
+                            let n = CD.fetch_add(1, Ordering::SeqCst);
+                            if n < 6 {
+                                tracing::warn!(
+                                    "[CamSrc] f={} pos=({:.3},{:.3},{:.3}) target=({:.3},{:.3},{:.3}) yaw={:.3} pitch={:.3}",
+                                    n,
+                                    self.input_state.camera.position.x,
+                                    self.input_state.camera.position.y,
+                                    self.input_state.camera.position.z,
+                                    self.input_state.camera.target.x,
+                                    self.input_state.camera.target.y,
+                                    self.input_state.camera.target.z,
+                                    self.input_state.camera_yaw,
+                                    self.input_state.camera_pitch,
+                                );
+                            }
                         }
-                    };
-                    draw_stats = renderer.draw_world(
+                        draw_stats = renderer.draw_world(
                         &self.world,
                         &self.assets.meshes,
                         &self.input_state.camera,

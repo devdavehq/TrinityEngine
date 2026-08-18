@@ -30,6 +30,7 @@ struct SkyUniforms {
     sky_moon_dir:     vec4<f32>,  // xyz = moon direction, w = moon intensity
     sky_atmosphere:   vec4<f32>,  // x = rayleigh_density, y = mie_scatter, z = mie_density, w = mie_direction
     sky_stars:        vec4<f32>,  // x = star_intensity, y = star_density, z = sun_disc_radius_deg, w = sun_halo_falloff
+    sky_visibility:   vec4<f32>,  // x = stars_enabled, y = moon_enabled, z = unused, w = unused
 
     // Cloud parameters (from environment::clouds)
     cloud_params:     vec4<f32>,  // x = coverage, y = base_altitude, z = thickness, w = type_scale
@@ -142,15 +143,19 @@ fn atmospheric_scattering(ray_dir: vec3<f32>) -> vec3<f32> {
     let mie_scatter = sky.sky_atmosphere.y;
     let mie_direction = sky.sky_atmosphere.w;
 
-    let sun_elevation = max(sun_dir.y, 0.0);
+    let sun_elevation = sun_dir.y;
     let cos_theta = dot(ray_dir, sun_dir);
     let rayleigh_phase = 3.0 / (16.0 * 3.14159265) * (1.0 + cos_theta * cos_theta);
     let g2 = mie_direction * mie_direction;
     let mie_phase = (1.0 - g2) / (4.0 * 3.14159265 * pow(1.0 + g2 - 2.0 * mie_direction * cos_theta, 1.5));
-    let scatter_intensity = pow(sun_elevation, 0.4);
+    // Daylight scattering while the sun is up, plus a lingering warm afterglow
+    // that fades through the "blue hour" once the sun drops below the horizon —
+    // no more hard cutoff the instant sun_dir.y <= 0.
+    let scatter_intensity = pow(max(sun_elevation, 0.0), 0.4);
+    let twilight_glow = smoothstep(-0.18, 0.0, sun_elevation);
 
-    let rayleigh_color = vec3<f32>(0.15, 0.35, 0.75) * rayleigh_phase * rayleigh_density * scatter_intensity;
-    let mie_color = vec3<f32>(0.8, 0.6, 0.3) * mie_phase * mie_scatter * scatter_intensity;
+    let rayleigh_color = vec3<f32>(0.15, 0.35, 0.75) * rayleigh_phase * rayleigh_density * (scatter_intensity + twilight_glow * 0.18);
+    let mie_color = vec3<f32>(0.8, 0.6, 0.3) * mie_phase * mie_scatter * (scatter_intensity + twilight_glow * 0.55);
 
     return rayleigh_color + mie_color;
 }
@@ -170,47 +175,89 @@ fn sun_disc(ray_dir: vec3<f32>) -> vec3<f32> {
 }
 
 // ── Moon ─────────────────────────────────────────────────────────────────────
+// Renders the moon as a textured disc with subtle maria (dark basalt plains)
+// plus a soft atmospheric glow. The whole thing can be toggled via the
+// `sky_visibility.y` master switch (editor or Lua `sky.set_moon`).
 fn moon_render(ray_dir: vec3<f32>) -> vec3<f32> {
+    let visible = sky.sky_visibility.y;
+    if visible < 0.5 { return vec3<f32>(0.0); }
     let moon_dir = normalize(sky.sky_moon_dir.xyz);
     let moon_intensity = sky.sky_moon_dir.w;
     if moon_intensity < 0.01 { return vec3<f32>(0.0); }
     let cos_angle = dot(ray_dir, moon_dir);
     let disc = smoothstep(0.999, 0.9995, cos_angle);
     let glow = pow(clamp(cos_angle, 0.0, 1.0), 32.0) * 0.3;
-    let moon_color = vec3<f32>(0.8, 0.85, 1.0) * moon_intensity;
-    return moon_color * (disc + glow);
+
+    // Tangent-frame coordinates over the moon disc for surface detail.
+    let tangent = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), moon_dir));
+    let bitangent = cross(moon_dir, tangent);
+    let p = ray_dir - moon_dir * dot(ray_dir, moon_dir);
+    let u = dot(p, tangent) * 46.0;
+    let v = dot(p, bitangent) * 46.0;
+
+    // Low-frequency maria + higher-frequency crater speckle.
+    var maria = noise3d(vec3<f32>(u, v, 11.7)) * 0.5 + 0.5;
+    maria = smoothstep(0.30, 0.72, maria);
+    var crater = noise3d(vec3<f32>(u * 4.0, v * 4.0, 3.1)) * 0.5 + 0.5;
+    crater = smoothstep(0.48, 0.78, crater);
+
+    let base = vec3<f32>(0.82, 0.85, 0.92);
+    let dark  = vec3<f32>(0.44, 0.47, 0.52);
+    let moon_color = mix(base, dark, maria * 0.6 + crater * 0.25);
+
+    return moon_color * moon_intensity * (disc * 2.0 + glow * 0.6);
 }
 
 // ── Stars ────────────────────────────────────────────────────────────────────
-fn star_field(ray_dir: vec3<f32>) -> f32 {
+// Night-sky star field that mirrors the real world: the Milky Way appears as a
+// hazy band of unresolved stars crossing the dome (which reads as "clouds"),
+// with bright individual stars clustered along it. A slow twinkle is applied.
+// `sky.sky_stars.x` = intensity (0 = day), `.y` = density,
+// `sky.sky_visibility.x` = master on/off switch (editor or Lua `sky.set_stars`).
+fn star_field(ray_dir: vec3<f32>) -> vec3<f32> {
     let intensity = sky.sky_stars.x;
-    if intensity < 0.01 { return 0.0; }
+    let visible = sky.sky_visibility.x;
+    if intensity < 0.01 || visible < 0.5 { return vec3<f32>(0.0); }
     let density = sky.sky_stars.y;
-    var star_val = 0.0;
 
-    let cell_large = floor(ray_dir.xz * density * 30.0);
-    let h_large = hash21(cell_large);
-    if h_large > 0.97 {
-        let center = (cell_large + 0.5) / (density * 30.0);
-        let dist = length(ray_dir.xz - center);
-        star_val += smoothstep(0.02, 0.0, dist) * 1.5;
+    // Galactic band: a tilted great circle on the sky (like the real Milky Way).
+    let pole = normalize(vec3<f32>(0.35, 0.62, 0.28));
+    let band = abs(dot(ray_dir, pole));
+    let band_mask = pow(1.0 - band, 1.8);
+
+    // Dusty glow along the band — unresolved stars read as soft "clouds".
+    var dust = 0.0;
+    var amp = 1.0;
+    var freq = 4.0;
+    for (var o = 0u; o < 4u; o++) {
+        dust += amp * noise3d(ray_dir * freq + vec3<f32>(31.7, 12.9, 78.3));
+        freq *= 2.2;
+        amp *= 0.5;
     }
-    let cell_med = floor(ray_dir.xz * density * 60.0);
-    let h_med = hash21(cell_med);
-    if h_med > 0.95 {
-        let center = (cell_med + 0.5) / (density * 60.0);
-        let dist = length(ray_dir.xz - center);
-        star_val += smoothstep(0.015, 0.0, dist) * 0.8;
+    dust = dust * 0.5 + 0.5;
+    let milky_way = band_mask * dust * dust * 0.55;
+
+    // Individual stars across the whole dome, denser near the band.
+    var stars = 0.0;
+    let base = density * 70.0;
+    for (var oct = 0u; oct < 4u; oct++) {
+        let scale = base * (1.0 + f32(oct) * 0.75);
+        let cell = floor(ray_dir * scale);
+        let h = hash31(cell);
+        let star_chance = mix(0.965, 0.985, f32(oct) / 3.0) - 0.02 * band_mask;
+        if (h > star_chance) {
+            let center = (cell + 0.5) / scale;
+            let dist = length(ray_dir - center);
+            let radius = mix(0.006, 0.014, f32(oct) / 3.0);
+            let glow = smoothstep(radius, 0.0, dist);
+            let mag = mix(1.4, 0.4, f32(oct) / 3.0) * (0.6 + 0.6 * band_mask);
+            stars += glow * mag;
+        }
     }
-    let cell_small = floor(ray_dir.xz * density * 120.0);
-    let h_small = hash21(cell_small);
-    if h_small > 0.92 {
-        let center = (cell_small + 0.5) / (density * 120.0);
-        let dist = length(ray_dir.xz - center);
-        star_val += smoothstep(0.01, 0.0, dist) * 0.4;
-    }
-    let twinkle = sin(hash21(floor(ray_dir.xz * density * 50.0)) * 6.28 + sky.camera_pos_time.w * 2.0) * 0.3 + 0.7;
-    return star_val * intensity * twinkle;
+
+    // Slow organic twinkle.
+    let twinkle = sin(hash31(floor(ray_dir * density * 24.0)) * 6.283 + sky.camera_pos_time.w * 1.6) * 0.2 + 0.8;
+    return vec3<f32>((milky_way + stars) * intensity * twinkle);
 }
 
 // ── Volumetric cloud layer ───────────────────────────────────────────────────
@@ -357,8 +404,7 @@ fn fs_sky(in: SkyVertOut) -> SkyOutput {
     color += atmospheric_scattering(ray_dir);
     color += sun_disc(ray_dir);
     color += moon_render(ray_dir);
-    let stars = star_field(ray_dir);
-    color += vec3<f32>(stars);
+    color += star_field(ray_dir);
 
     // ── Volumetric cloud layer ─────────────────────────────────────────────
     let cloud = cloud_layer(ray_dir);

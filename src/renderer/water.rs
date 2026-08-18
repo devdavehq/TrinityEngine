@@ -112,7 +112,7 @@ impl WaterRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -309,7 +309,6 @@ impl WaterRenderer {
 
         // Depth sampler for the depth buffer
         let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            compare: Some(wgpu::CompareFunction::Always),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()

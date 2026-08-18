@@ -103,10 +103,9 @@ impl CrossRefManager {
             if self.resolved.contains_key(&(level.to_string(), target_name.clone())) {
                 continue; // Already resolved.
             }
-            // Try to find an entity with a &String component matching the name.
-            // We use hecs' built-in iteration with a (&String,) query.
-            for (entity, name) in world.query::<(Entity, &String)>().iter() {
-                if name.as_str() == target_name.as_str() {
+            // Match against the engine's entity name component (SceneMeta).
+            for (entity, meta) in world.query::<(Entity, &crate::components::SceneMeta)>().iter() {
+                if meta.name == target_name.as_str() {
                     self.resolved.insert(
                         (level.to_string(), target_name.clone()),
                         entity,
@@ -150,7 +149,10 @@ mod tests {
         let mut mgr = CrossRefManager::new();
         let mut world = hecs::World::new();
 
-        let entity = world.spawn(("Player".to_string(),));
+        let entity = world.spawn((crate::components::SceneMeta {
+            name: "Player".to_string(),
+            mesh_path: String::new(),
+        },));
         let source_entity = world.spawn(());
 
         mgr.register_ref(CrossLevelRef {
@@ -172,7 +174,10 @@ mod tests {
     fn test_unload_clears_resolved() {
         let mut mgr = CrossRefManager::new();
         let mut world = hecs::World::new();
-        let entity = world.spawn(("NPC".to_string(),));
+        let entity = world.spawn((crate::components::SceneMeta {
+            name: "NPC".to_string(),
+            mesh_path: String::new(),
+        },));
         let source_entity = world.spawn(());
 
         mgr.register_ref(CrossLevelRef {
@@ -193,7 +198,10 @@ mod tests {
     fn test_clear() {
         let mut mgr = CrossRefManager::new();
         let mut world = hecs::World::new();
-        let entity = world.spawn(("X".to_string(),));
+        let entity = world.spawn((crate::components::SceneMeta {
+            name: "X".to_string(),
+            mesh_path: String::new(),
+        },));
         let source_entity = world.spawn(());
 
         mgr.register_ref(CrossLevelRef {

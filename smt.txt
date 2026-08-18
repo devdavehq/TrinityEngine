@@ -854,7 +854,7 @@ Want me to start with the bundle script (fast, gets you to Steam-ready folders) 
 
 
 
-now run the editor lemme see
+now run the editor lemme see and fix
 
 also hope  the night sky cluster of stars athat it looks like clouds like in thereal world and i should be able to toggle them even toggle th stars no and of and the moon too so i can controll them fully and i think lua should be able to controll it right
 
@@ -870,3 +870,91 @@ also add a script editor which acan auto save and recommends things as we type a
 7. No material node system — just 3 fixed material instances (matte_black, silver_brushed, foliage_leaf). are they done 
 also do my engine has all necessary to achieve the graphical fidelity of horizon forbidden west and what do istill need to be able to do so if not
 and my lightning system how exactly do i use them to achieve how horizon does theirs and is the engine and editor as capable as the decima engine or what am i missing
+
+
+
+
+also hope it(script editor) recommends even the functions all of the components it has access to so we have full power that is the engine also the editor doesnt stay long fix that pls
+
+also how does the engine handle the world does it do it like decima the rules im asking so that levels would be treated smartly and efficiently so as to manage memory well
+
+hope i controll th time of day speed and wy doesnt it shift to night gradualy as the sun goes down u know like in real life as the sun goes down the scene gers darker some parts fthe sky drakens revealing the stars little by kittle till we can see all
+and noting should update the scene when its not even playing but we should be able to move things in the scene while its playing and it wont affect the runtime or crash the system also the scene is always whiteuntil sun moves please make it look like real world sky please
+
+update the controls for moving to feel like ue5 cause currently i cand move well enen pan my mouse around the scene view so trl moves the view down which is bad but how do i move around the scene view without using the right btn what if i want to move anyewhere not rotating around please fix the movement user experience
+
+Horizon Forbidden West / Decima — honest gap list
+Good news: you're closer than a first glance suggests. You already have a deferred renderer, shadow maps, GTAO, voxel GI (128³ camera-aligned grid, 8 mip pyramid in voxel_gi*.wgsl), volumetric froxel fog, bloom, motion blur, decals, and a ray-traced SH2 light-probe baker (light_baker.rs) that auto-places a grid, raycasts the scene BVH, and bakes sky+sun+lights.
+What HFW/Decima has that this doesn't:
+1. Multi-bounce GI & probe fidelity — your baker does exactly one bounce and stores 9 SH coefficients per probe; HFW uses a temporal, multi-bounce light simulation plus sky visibility for occlusion-aware ambient. Gaps: more bounces, sky-occlusion term per probe, and probe placement/editing in the viewport (currently auto-grid only).
+2. Temporal accumulation — HFW's RT/AO/GI all use temporal reprojection + denoising (like Decima's SVM). You have no temporal pass, so everything shimmers at low sample counts.
+3. Per-pixel sky GI — HFW computes sky occlusion per-pixel; you rely on probe interpolation, so interiors under canopies go flat.
+4. Character/simulation rendering — no hair strands, no detail tessellation, no skin SS, no cloth. HFW's Aloy is largely a character-rendering flex.
+5. Atmospheric scattering — Decima has a full aerial-perspective/volumetric-sun-shaft model tuned for photoreal landscapes; your volumetrics are a single-scattering approximation, and fog is a uniform density pass.
+6. Lighting tools/UX — Decima ships with a cinematic light setup, IBL exposure tooling, and a material node graph. You have no material editor graph (there's a basic editor), no IBL, and no light types beyond point/spot/directional + sun.
+To close the biggest gap with your existing system (cheapest→biggest): (1) enable/tune Voxel GI + GTAO + fog in the viewport toggles and crank your baker's samples; (2) add a sky-occlusion scalar and 2–3 bounces to bake_probe_grid; (3) add a temporal reprojection/denoise pass on the voxel GI + GTAO; (4) per-pixel sky visibility in the deferred pass using a heightfield SDF. That's the Decima-style "cheap-but-cleanish" path and gets you 70–80% of the HFW look without RT hardware.
+1. Real GI / bounced light. Decima's signature is ray-traced GI hybridized with baked irradiance volumes. Your only bounce source is baked SH probes (see below) + a "voxel GI" hash hack (deferred.wgsl:523). No real-time GI, no RTX, no voxel cone tracing.
+2. Light baking is non-functional end-to-end. This is the critical finding for you:
+- The baker exists and works (light_baker.rs:350), but there is no editor UI to place Light Probe volumes — add_probe is only ever called by load_probes, and load_probes is never called anywhere. The grid is always empty, so clicking "Bake Lighting" hits "bake aborted: no probes placed" (light_baker.rs:358). No bake button placement UI + no load on level start = the entire indirect-light system is effectively dead code.
+3. SSAO is an in-shader approximation (view-dependent horizon term, deferred.wgsl:508), not real depth/normal SSAO.
+4. Bloom is a single Gaussian pair (postprocess.wgsl:54), not a proper multi-stage chain — Horizon's bloom is far softer/more filmic.
+5. Volumetric lighting is a cheap 20-step raymarch (deferred.wgsl:336), not real volumetric lighting.
+6. No hair/strand rendering (HFW's signature character hair), no tessellation/displacement, no decals, no RT reflections/denoiser.
+7. No material node system — just 3 fixed material instances (matte_black, silver_brushed, foliage_leaf). are they done 
+also do my engine has all necessary to achieve the graphical fidelity of horizon forbidden west and what do istill need to be able to do so if not
+and my lightning system how exactly do i use them to achieve how horizon does theirs and is the engine and editor as capable as the decima engine or what am i missing
+
+hope the engine is optimized effeciently for  games and which games is it best for
+
+
+
+
+
+
+How close is this to Decima's model? (Gaps assessment)
+Decima concept	TrinityEngine equivalent	Status
+Data-driven world / subscenes	.scene files, SubSceneManager, prefab override	✅ Format exists; SubSceneManager is dead code (instantiated main.rs:468, never called)
+Streaming chunks/world sectors	LevelManager + check_streaming distance-based, hysteresis	✅ Logic real & wired to main loop; ❌ manager starts empty — no level ever registered outside Lua, no sector metadata on disk
+Additive levels coexisting	spawn_scene into shared hecs::World, per-level entity lists	✅ Solid, works
+Portals	LevelPortal sphere trigger	❌ Pure dead code — never instantiated or polled anywhere
+Cross-level references	CrossRefManager name-based	❌ Dead code + internally acknowledged as heuristic
+Memory-managed assets	mesh_cache dedup	⚠️ Dedup yes; ❌ no refcount, no LRU, no eviction; ResourceTracker not enforced
+Streaming asset loading	MeshStreamingQueue async thread	✅ Real but only pre-warms primary scene; level loads are synchronous
+Persistent world state	WorldStateManager + save slots	⚠️ Full save/load round-trip exists; ❌ not hooked into streaming unload/reload
+Loading screens	LoadingScreen + SceneTransition	✅ Both exist; progress never reported during streaming
+Packed shipping (pak)	PakFile VFS, PakFirstVfs	✅ Exists and VFS-integrated (vfs.rs:366-446, pak.rs); no .pak shipped yet
+Level manifest / world config	—	❌ Completely absent — the single biggest gap vs Decima. No serialized world definition listing level paths, origins, streaming radii, portal targets, or sector bounds
+
+
+
+
+
+
+
+
+Decima famously has a full animation pipeline (its AnimGraph tool drives Aloy's movement). Your gap vs Decima: clips are code-built, not imported — skeletal.rs has BoneHierarchy/AnimationClip/SkeletalAnimator but no FBX/GLTF keyframe importer, and GPU skinning is "left for renderer integration" per its header. The architecture is there; the content pipeline is the missing piece.
+Best fit: third-person/open-ish world exploration, survival-craft, building, stylized terrain games — exactly what the streaming + portals + persistent-state work targets. Weak spots: crowded AI-heavy sims (no tuned LOD/agent systems), cinematic skeletal characters (no imported clips), unproven large-scale multiplayer. fix cus i nwant crowds
+
+the architectural vocabulary of a Decima-style streaming world — additive levels, distance streaming with hysteresis, portals, cross-level references, persistent world state, loading screens, meaning? also loading screen doesnt actually mean that the player has to wait?
+whats lvl portal for and how
+
+
+
+
+
+
+
+
+Is it like Decima?
+Design-wise it's clearly aimed at Decima — persistent level, per-level entity tracking, streaming_distance/unloading_distance hysteresis, persistent-never-unload, origin offsets, loading screen. But Decima's runtime streams chunk files async, spawns/despawns by distance, and refcounts+evicts assets. TrinityEngine has the scaffold with the plumbing missing: today the only thing that spawns entities is SceneManager::build(), which nukes the world. So: no, not yet — it's Decima's skeleton, not its brain.
+Rules for levels to be memory-efficient on this engine today
+Until the level loader is finished, treat every .scene load as a full world wipe + rebuild:
+1. One scene per "area", keep them small. Since loading a scene rebuilds everything, split your game into separate .scene files of ~200-500 entities, not one mega-level. This is your only real unload mechanism right now — switching scenes clears the world and the mesh_cache.
+2. Reuse meshes aggressively. Entities sharing a path share one mesh (handle dedup) — an instanced forest of 1000 trees is ~1 tree mesh. Never copy unique meshes per entity.
+3. Mind the LOD + culling defaults — culling_distance = 80, LOD bands at 48/95/180/300. Put big props (buildings, cliffs) inside that radius per playable area; anything beyond won't be drawn but will still occupy GPU memory once loaded.
+4. No unload happens on streaming or subscenes today — don't design around them; they don't free anything yet. A distant level that "streams out" still costs the same memory until the whole world is rebuilt.
+5. Keep asset_streaming_enabled on — it's the only thing that stops mesh load spikes from freezing the frame.
+6. Keep textures low-res — texture cache never evicts; every .png you reference stays in VRAM (Intel UHD 620, ~shared 8GB). Prefer one atlas over 50 unique materials.
+The good news: all the Decima-style machinery (LevelManager, streaming, hysteresis, persistent flag) is already scaffolded. The single highest-value next step is wiring load_level()/unload_level() to actually despawn/spawn the file_path entities — that turns "levels" from bookkeeping into real memory management. Want me to do that?
+Also: the editor is still running (PID 22020) and survived the resize gauntlet with zero validation errors — crash fixed and autocomplete now covers the full engine API (components + live Lua globals).
+

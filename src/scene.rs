@@ -112,179 +112,12 @@ impl SceneManager {
                 tracing::info!("[Scene]   Skipping (not alive): {}", desc.name);
                 continue;
             }
-
-            // ── Prefab Resolution ──────────────────────────────────────────
-            // If this entity references a prefab, load it and merge defaults.
-            // Scene fields override prefab defaults (only non-default values win).
-            let resolved = if let Some(prefab_path) = &desc.prefab {
-                if let Some(registry) = prefabs {
-                    if let Some(pf) = registry.get_by_path(prefab_path)
-                        .or_else(|| registry.get_by_name(prefab_path))
-                    {
-                        // Merge: scene desc overrides prefab defaults.
-                        // Only override fields that differ from EntityDesc defaults.
-                        let mut merged = desc.clone();
-                        let default_desc = EntityDesc::default();
-
-                        // Mesh comes from prefab if scene didn't specify a different one
-                        if merged.mesh == default_desc.mesh && merged.mesh != pf.mesh {
-                            merged.mesh = pf.mesh.clone();
-                        }
-                        // Name comes from prefab if scene used default
-                        if merged.name == default_desc.name {
-                            merged.name = pf.name.clone();
-                        }
-                        // Material comes from prefab if scene didn't specify one
-                        if merged.material.is_none() {
-                            merged.material = pf.material.clone();
-                        }
-                        // Color/metallic/roughness: only override if prefab has non-default values
-                        if pf.color != [1.0, 1.0, 1.0] && merged.color == default_desc.color {
-                            merged.color = pf.color;
-                        }
-                        if (pf.metallic - 0.0).abs() > 0.001 && (merged.metallic - 0.0).abs() < 0.001 {
-                            merged.metallic = pf.metallic;
-                        }
-                        if (pf.roughness - 0.5).abs() > 0.001 && (merged.roughness - 0.5).abs() < 0.001 {
-                            merged.roughness = pf.roughness;
-                        }
-                        if (pf.ao - 1.0).abs() > 0.001 && (merged.ao - 1.0).abs() < 0.001 {
-                            merged.ao = pf.ao;
-                        }
-                        // Rigidbody from prefab if scene didn't specify
-                        if merged.rigidbody.is_none() {
-                            merged.rigidbody = pf.rigidbody;
-                        }
-                        // Light from prefab if scene didn't specify
-                        if merged.light.is_none() {
-                            if let Some((ref ltype, color, intensity, range)) = pf.light {
-                                merged.light = Some(loader::LightDesc {
-                                    light_type: ltype.clone(),
-                                    color,
-                                    intensity,
-                                    range,
-                                    spot_angle: 45.0,
-                                });
-                            }
-                        }
-                        // Script from prefab if scene didn't specify
-                        if merged.script.is_none() {
-                            merged.script = pf.script.clone();
-                        }
-                        merged
-                    } else {
-                        tracing::error!("[Scene] Prefab not found: {}", prefab_path);
-                        desc
-                    }
-                } else {
-                    desc
-                }
-            } else {
-                desc
-            };
-            // Load (or reuse) the mesh for this entity.
-            // mesh_cache maps file path → Handle so we don't load the
-            // same .obj twice. Meshes are shared — entities just hold handles.
-            let mesh_handle = if let Some(handle) = mesh_cache.get(&resolved.mesh) {
-                *handle // Dereference because Handle is Copy
-            } else {
-                let mesh =
-                    Mesh::load(&resolved.mesh).map_err(|e| format!("Scene mesh error: {}", e))?;
-                let handle = meshes.add(mesh);
-                mesh_cache.insert(resolved.mesh.clone(), handle);
-                handle
-            };
-
-            // Build the Renderable component with PBR values from the scene file.
-            // If a material name is specified, the color/metallic/roughness values
-            // are ignored — the material library will fill them in later.
-            let renderable = Renderable {
-                mesh: mesh_handle,
-                color: resolved.color,
-                metallic: resolved.metallic,
-                roughness: resolved.roughness,
-                ao: resolved.ao,
-                scale: resolved.scale,
-            };
-
-            // Rotation — Euler angles converted from degrees to radians.
-            let rotation = Rotation {
-                pitch: resolved.rotation[0].to_radians(),
-                yaw:   resolved.rotation[1].to_radians(),
-                roll:  resolved.rotation[2].to_radians(),
-            };
-
-            // Spawn the entity with all applicable components.
-            // hecs doesn't support dynamic component lists, so we branch
-            // on which optional components are present.
-            if resolved.script.is_some() {
-                let mut body = resolved.rigidbody.map(|mass| {
-                    let mut b = RigidBody::dynamic();
-                    if mass <= 0.0 { b = RigidBody::static_body(); } else { b.mass = mass; }
-                    b
-                });
-                let mut light = resolved.light.map(|l| PointLight {
-                    color: l.color, intensity: l.intensity, range: l.range,
-                    light_type: match l.light_type.as_str() {
-                        "directional" => 0.0,
-                        "spot" => 2.0,
-                        _ => 1.0, // point (default)
-                    },
-                    spot_angle: l.spot_angle, shadow_casting: false,
-                });
-                let ent = world.spawn((
-                    Position { x: resolved.position[0], y: resolved.position[1], z: resolved.position[2] },
-                    renderable,
-                    rotation,
-                    SceneMeta { name: resolved.name.clone(), mesh_path: resolved.mesh.clone() },
-                    Script { path: resolved.script.unwrap() },
-                ));
-                if let Some(b) = body.take() {
-                    let _ = world.insert(ent, (b,));
-                }
-                if let Some(l) = light.take() {
-                    let _ = world.insert(ent, (l,));
-                }
-                if let Some((current, max)) = resolved.health {
-                    let _ = world.insert(ent, (crate::components::Health {
-                        current, max,
-                    },));
-                }
-            } else {
-                let mut body = resolved.rigidbody.map(|mass| {
-                    let mut b = RigidBody::dynamic();
-                    if mass <= 0.0 { b = RigidBody::static_body(); } else { b.mass = mass; }
-                    b
-                });
-                let mut light = resolved.light.map(|l| PointLight {
-                    color: l.color, intensity: l.intensity, range: l.range,
-                    light_type: match l.light_type.as_str() {
-                        "directional" => 0.0,
-                        "spot" => 2.0,
-                        _ => 1.0, // point (default)
-                    },
-                    spot_angle: l.spot_angle, shadow_casting: false,
-                });
-                let ent = world.spawn((
-                    Position { x: resolved.position[0], y: resolved.position[1], z: resolved.position[2] },
-                    renderable,
-                    rotation,
-                    SceneMeta { name: resolved.name.clone(), mesh_path: resolved.mesh.clone() },
-                ));
-                if let Some(b) = body.take() {
-                    let _ = world.insert(ent, (b,));
-                }
-                if let Some(l) = light.take() {
-                    let _ = world.insert(ent, (l,));
-                }
-                if let Some((current, max)) = resolved.health {
-                    let _ = world.insert(ent, (crate::components::Health {
-                        current, max,
-                    },));
-                }
+            let resolved = resolve_prefab(desc, prefabs);
+            let name = resolved.name.clone();
+            match spawn_entity(world, meshes, mesh_cache, resolved, [0.0; 3]) {
+                Ok(_) => tracing::info!("[Scene]   Spawned: {}", name),
+                Err(e) => return Err(e),
             }
-
-            tracing::info!("[Scene]   Spawned: {}", resolved.name);
         }
 
         Ok(())
@@ -435,6 +268,182 @@ pub enum SceneAction {
     LoadScene(String),
     /// No action needed.
     None,
+}
+
+/// Resolve a scene entity descriptor against its prefab (if any).
+/// Scene fields override prefab defaults — only non-default values win.
+fn resolve_prefab(desc: EntityDesc, prefabs: Option<&prefab::PrefabRegistry>) -> EntityDesc {
+    let Some(prefab_path) = &desc.prefab else {
+        return desc;
+    };
+    let Some(registry) = prefabs else {
+        return desc;
+    };
+    let Some(pf) = registry
+        .get_by_path(prefab_path)
+        .or_else(|| registry.get_by_name(prefab_path))
+    else {
+        tracing::error!("[Scene] Prefab not found: {}", prefab_path);
+        return desc;
+    };
+
+    let mut merged = desc.clone();
+    let default_desc = EntityDesc::default();
+
+    if merged.mesh == default_desc.mesh && merged.mesh != pf.mesh {
+        merged.mesh = pf.mesh.clone();
+    }
+    if merged.name == default_desc.name {
+        merged.name = pf.name.clone();
+    }
+    if merged.material.is_none() {
+        merged.material = pf.material.clone();
+    }
+    if pf.color != [1.0, 1.0, 1.0] && merged.color == default_desc.color {
+        merged.color = pf.color;
+    }
+    if (pf.metallic - 0.0).abs() > 0.001 && (merged.metallic - 0.0).abs() < 0.001 {
+        merged.metallic = pf.metallic;
+    }
+    if (pf.roughness - 0.5).abs() > 0.001 && (merged.roughness - 0.5).abs() < 0.001 {
+        merged.roughness = pf.roughness;
+    }
+    if (pf.ao - 1.0).abs() > 0.001 && (merged.ao - 1.0).abs() < 0.001 {
+        merged.ao = pf.ao;
+    }
+    if merged.rigidbody.is_none() {
+        merged.rigidbody = pf.rigidbody;
+    }
+    if merged.light.is_none() {
+        if let Some((ref ltype, color, intensity, range)) = pf.light {
+            merged.light = Some(loader::LightDesc {
+                light_type: ltype.clone(),
+                color,
+                intensity,
+                range,
+                spot_angle: 45.0,
+            });
+        }
+    }
+    if merged.script.is_none() {
+        merged.script = pf.script.clone();
+    }
+    merged
+}
+
+/// Spawn a single resolved entity descriptor into the world, offset by
+/// `origin`. Loads (or reuses) the mesh via the shared mesh cache.
+fn spawn_entity(
+    world: &mut World,
+    meshes: &mut AssetStore<Mesh>,
+    mesh_cache: &mut std::collections::HashMap<String, Handle<Mesh>>,
+    resolved: EntityDesc,
+    origin: [f32; 3],
+) -> Result<hecs::Entity, String> {
+    let mesh_handle = if let Some(handle) = mesh_cache.get(&resolved.mesh) {
+        *handle
+    } else {
+        let mesh = Mesh::load(&resolved.mesh).map_err(|e| format!("Scene mesh error: {}", e))?;
+        let handle = meshes.add(mesh);
+        mesh_cache.insert(resolved.mesh.clone(), handle);
+        handle
+    };
+
+    let renderable = Renderable {
+        mesh: mesh_handle,
+        color: resolved.color,
+        metallic: resolved.metallic,
+        roughness: resolved.roughness,
+        ao: resolved.ao,
+        scale: resolved.scale,
+    };
+    let rotation = Rotation {
+        pitch: resolved.rotation[0].to_radians(),
+        yaw: resolved.rotation[1].to_radians(),
+        roll: resolved.rotation[2].to_radians(),
+    };
+    let position = Position {
+        x: resolved.position[0] + origin[0],
+        y: resolved.position[1] + origin[1],
+        z: resolved.position[2] + origin[2],
+    };
+    let body = resolved.rigidbody.map(|mass| {
+        let mut b = RigidBody::dynamic();
+        if mass <= 0.0 {
+            b = RigidBody::static_body();
+        } else {
+            b.mass = mass;
+        }
+        b
+    });
+    let light = resolved.light.map(|l| PointLight {
+        color: l.color,
+        intensity: l.intensity,
+        range: l.range,
+        light_type: match l.light_type.as_str() {
+            "directional" => 0.0,
+            "spot" => 2.0,
+            _ => 1.0,
+        },
+        spot_angle: l.spot_angle,
+        shadow_casting: false,
+    });
+
+    let ent = if let Some(path) = resolved.script.clone() {
+        world.spawn((
+            position,
+            renderable,
+            rotation,
+            SceneMeta {
+                name: resolved.name.clone(),
+                mesh_path: resolved.mesh.clone(),
+            },
+            Script { path },
+        ))
+    } else {
+        world.spawn((
+            position,
+            renderable,
+            rotation,
+            SceneMeta {
+                name: resolved.name.clone(),
+                mesh_path: resolved.mesh.clone(),
+            },
+        ))
+    };
+    if let Some(b) = body {
+        let _ = world.insert(ent, (b,));
+    }
+    if let Some(l) = light {
+        let _ = world.insert(ent, (l,));
+    }
+    if let Some((current, max)) = resolved.health {
+        let _ = world.insert(ent, (crate::components::Health { current, max },));
+    }
+    Ok(ent)
+}
+
+/// Parse a `.scene` file and spawn all of its entities into the world at an
+/// origin offset. Returns the spawned entity IDs so callers can despawn them
+/// selectively later (used by the streaming level system). Does NOT clear the
+/// world — callers (level loading) manage coexistence.
+pub fn spawn_scene(
+    world: &mut World,
+    meshes: &mut AssetStore<Mesh>,
+    mesh_cache: &mut std::collections::HashMap<String, Handle<Mesh>>,
+    prefabs: Option<&prefab::PrefabRegistry>,
+    path: &str,
+    origin: [f32; 3],
+) -> Result<Vec<hecs::Entity>, String> {
+    let mut spawned = Vec::new();
+    for desc in parse_scene(path)? {
+        if !desc.alive {
+            continue;
+        }
+        let resolved = resolve_prefab(desc, prefabs);
+        spawned.push(spawn_entity(world, meshes, mesh_cache, resolved, origin)?);
+    }
+    Ok(spawned)
 }
 
 /// Save all entities in the world back to a .scene file.

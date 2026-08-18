@@ -141,6 +141,15 @@ fn detect_gpu_tier(
     }
 
     // ── Map score to tier name ─────────────────────────────────────────────
+    // Weak integrated Intel GPUs (UHD/HD series, not Arc) are never fast
+    // enough for the balanced preset — cap them at "low" so expensive
+    // full-screen effects (god rays etc.) stay off on this machine.
+    if name_lower.contains("intel")
+        && !name_lower.contains("arc")
+        && (name_lower.contains("uhd") || name_lower.contains(" hd ") || name_lower.contains("hd-"))
+    {
+        return "low".to_string();
+    }
     let tier = if score >= 80 {
         "high"
     } else if score >= 50 {
@@ -324,7 +333,8 @@ struct GpuLightUniforms {
 }
 
 // ── GpuMaterialExtras ──────────────────────────────────────────────────────
-// Per-object material extras (SSS, clearcoat, etc.).  Total size: 32 bytes.
+// Per-object material extras (SSS, clearcoat, etc.).  Total size: 48 bytes
+// (matches the WGSL MaterialExtras struct in shader.wgsl).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuMaterialExtras {
@@ -333,7 +343,10 @@ struct GpuMaterialExtras {
     clearcoat_roughness: f32,
     anisotropy:          f32,
     emissive_strength:   f32,
-    _pad:                [f32; 3],
+    // WGSL `_pad: vec3<f32>` has 16-byte alignment, so the shader struct is
+    // 48 bytes (fields at 0-20, vec3 aligned to offset 32, size 44 → 48).
+    // Keep the CPU-side struct at exactly 48 bytes to match.
+    _pad:                [f32; 7],
 }
 
 // ── GpuWeatherData ────────────────────────────────────────────────────────
@@ -765,11 +778,13 @@ pub struct Renderer {
     post_bgl:      wgpu::BindGroupLayout,
     post2_bgl:     wgpu::BindGroupLayout,
     post_copy_pipeline: wgpu::RenderPipeline,
+    post_copy_rgba16_pipeline: wgpu::RenderPipeline,
     bloom_extract_pipeline: wgpu::RenderPipeline,
     bloom_downsample_pipeline: wgpu::RenderPipeline,
     bloom_blur_h_pipeline: wgpu::RenderPipeline,
     bloom_blur_v_pipeline: wgpu::RenderPipeline,
     bloom_composite_pipeline: wgpu::RenderPipeline,
+    bloom_composite_rgba16_pipeline: wgpu::RenderPipeline,
     /// Pyramid bloom working set: two extra half/quarter-resolution targets so
     /// we can build a real multi-level pyramid (extract → downsample → blur → upsample-add).
     bloom_c_texture: wgpu::Texture,
@@ -784,6 +799,13 @@ pub struct Renderer {
     /// Full-res temp texture: bloom composite writes here, tonemap reads from here.
     tonemap_temp:       wgpu::Texture,
     tonemap_temp_view:  wgpu::TextureView,
+    /// ── Final output texture ────────────────────────────────────────────────
+    /// The tonemap pass writes the final sRGB image here instead of straight to
+    /// the swapchain, then a blit copies it to the surface. The editor shows
+    /// this texture in the viewport (bright, tone-mapped) rather than the raw
+    /// linear HDR scene buffer.
+    final_texture:      wgpu::Texture,
+    final_view:         wgpu::TextureView,
     tonemap_uniform_buf: wgpu::Buffer,
     tonemap_bgl:        wgpu::BindGroupLayout,
     tonemap_pipeline:   wgpu::RenderPipeline,
@@ -992,6 +1014,17 @@ pub struct Renderer {
     skinning_bg:  wgpu::BindGroup,
     /// Software occlusion culler: rejects meshes hidden behind Occluders.
     pub occlusion_culler: crate::render::occlusion::OcclusionCuller,
+    /// ── Procedural sky IBL ────────────────────────────────────────────────
+    /// Image-based lighting generated from the procedural sky when no HDR map
+    /// is configured. Rebuilt lazily whenever the sun moves far enough, so the
+    /// scene's ambient matches the sky instead of a flat white fallback.
+    proc_ibl: Option<crate::renderer::ibl::IblMaps>,
+    /// Fingerprint of the params the current procedural IBL was built from.
+    /// When the sun/atmosphere drift past this, `refresh_procedural_ibl_if_needed`
+    /// regenerates it.
+    proc_ibl_key: Option<[f32; 8]>,
+    /// True when a custom HDR sky map is bound (skip procedural IBL refresh).
+    using_hdr_ibl: bool,
 }
 
 impl Renderer {
@@ -1053,6 +1086,9 @@ impl Renderer {
         // Cache sky/cloud params for the sky renderer.
         self.sky_params = sky_params.clone();
         self.cloud_params = cloud_params.clone();
+
+        // Keep the scene's image-based ambient in sync with the moving sun.
+        self.refresh_procedural_ibl_if_needed();
     }
 
     // new() is async because requesting the adapter and device is async.
@@ -1096,6 +1132,14 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .expect("Failed to open GPU device");
+        // Log GPU errors instead of letting wgpu's default fatal handler panic
+        // the whole editor. Transient validation errors (e.g. a texture briefly
+        // out of sync during a resize) must not kill the tool — they are logged
+        // and the frame just gets skipped.
+        let err_device = device.clone();
+        err_device.on_uncaptured_error(Arc::new(|err| {
+            tracing::error!("[wgpu] {}", err);
+        }));
 
         // ── Surface configuration ─────────────────────────────────────────
         let size     = window.inner_size();
@@ -1161,6 +1205,26 @@ impl Renderer {
         // Full-res texture for the bloom composite output → tonemap input.
         // Same format as scene_color (surface format) so the pipeline works.
         let (tonemap_temp, tonemap_temp_view) = make_scene_color_texture(&device, &config);
+
+        // ── Final output texture ─────────────────────────────────────────────
+        // Rgba8UnormSrgb so the tonemapped result matches the swapchain format.
+        // Rendered to by the tonemap pass, blitted to the surface, and exposed
+        // to the editor viewport via scene_color_view().
+        let final_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Final Output"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let final_view = final_texture.create_view(&Default::default());
 
         // ── Velocity buffer (placeholder) ──────────────────────────────────
         // Rg16Float: per-pixel motion vectors (x, y).  Zero-filled until the
@@ -1246,7 +1310,7 @@ impl Renderer {
             clearcoat_roughness: 0.0,
             anisotropy: 0.0,
             emissive_strength: 0.0,
-            _pad: [0.0; 3],
+            _pad: [0.0; 7],
         };
         let default_material_extras_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("Default Material Extras"),
@@ -1278,9 +1342,10 @@ let default_weather = GpuWeatherData {
 
         // ── Baked probe buffers (bindings 14/15) ──────────────────────────
         // Binding 14: count scalar (u32 + pad to 16B).
-        // Binding 15: per-probe data — 10 × vec4 per probe (pos+radius, 9 SH).
+        // Binding 15: per-probe data — 11 × vec4 per probe (pos+radius, 9 SH,
+        // sky occlusion).
         const MAX_PROBES: usize = 32;
-        const PROBE_STRIDE: usize = 10; // vec4s per probe
+        const PROBE_STRIDE: usize = 11; // vec4s per probe
         let probe_control_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("Probe Control"),
             size:               16,
@@ -1676,12 +1741,19 @@ let default_weather = GpuWeatherData {
             ],
         });
         let post_copy_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_copy");
-        let bloom_extract_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_bloom_extract");
-        let bloom_downsample_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_downsample");
-        let bloom_blur_h_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_blur_h");
-        let bloom_blur_v_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, surf_fmt, "fs_blur_v");
+        let bloom_extract_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, wgpu::TextureFormat::Rgba16Float, "fs_bloom_extract");
+        let bloom_downsample_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, wgpu::TextureFormat::Rgba16Float, "fs_downsample");
+        let bloom_blur_h_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, wgpu::TextureFormat::Rgba16Float, "fs_blur_h");
+        let bloom_blur_v_pipeline = create_post_pipeline(&device, &post_shader, &post_bgl, None, wgpu::TextureFormat::Rgba16Float, "fs_blur_v");
         let bloom_composite_pipeline =
             create_post_pipeline(&device, &post_shader, &post_bgl, Some(&post2_bgl), surf_fmt, "fs_composite");
+        // Composite pipeline targeting the Rgba16Float bloom pyramid levels
+        // (used by the upsample-add passes that write into bloom_b / bloom_e).
+        let bloom_composite_rgba16_pipeline =
+            create_post_pipeline(&device, &post_shader, &post_bgl, Some(&post2_bgl), wgpu::TextureFormat::Rgba16Float, "fs_composite");
+        // Copy pipeline targeting Rgba16Float textures (TAA history, etc.).
+        let post_copy_rgba16_pipeline =
+            create_post_pipeline(&device, &post_shader, &post_bgl, None, wgpu::TextureFormat::Rgba16Float, "fs_copy");
 
         // ── Tone mapping pipeline ──────────────────────────────────────────
         // Bind group layout: group(0) = texture+sampler, group(1) = TonemapUniforms.
@@ -1772,7 +1844,10 @@ let default_weather = GpuWeatherData {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rg16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let heat_distortion_view = heat_distortion_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2493,13 +2568,17 @@ let default_weather = GpuWeatherData {
             post_bgl,
             post2_bgl,
             post_copy_pipeline,
+            post_copy_rgba16_pipeline,
             bloom_extract_pipeline,
             bloom_downsample_pipeline,
             bloom_blur_h_pipeline,
             bloom_blur_v_pipeline,
             bloom_composite_pipeline,
+            bloom_composite_rgba16_pipeline,
             tonemap_temp,
             tonemap_temp_view,
+            final_texture,
+            final_view,
             tonemap_uniform_buf,
             tonemap_bgl,
             tonemap_pipeline,
@@ -2631,6 +2710,9 @@ let default_weather = GpuWeatherData {
             lightning_bolt_renderer,
             lightning_state: crate::environment::lightning::LightningState::default(),
             occlusion_culler: crate::render::occlusion::OcclusionCuller::default(),
+            proc_ibl: None,
+            proc_ibl_key: None,
+            using_hdr_ibl: false,
         }
     }
 
@@ -2690,6 +2772,22 @@ let default_weather = GpuWeatherData {
         let (tt, ttv) = make_scene_color_texture(&self.device, &self.config);
         self.tonemap_temp = tt;
         self.tonemap_temp_view = ttv;
+        let ft = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Final Output"),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.final_texture = ft;
+        self.final_view = self.final_texture.create_view(&Default::default());
         let (nt, nv) = make_normals_texture(&self.device, &self.config);
         self.normals_texture = nt;
         self.normals_view = nv;
@@ -2726,6 +2824,49 @@ let default_weather = GpuWeatherData {
         let (pt, ptv) = make_scene_color_texture(&self.device, &self.config);
         self.postprocess_temp_texture = pt;
         self.postprocess_temp_view = ptv;
+        // Recreate the cloud-history MRT target (sky pass attachment 1) at the
+        // new size. Missing this used to desync it from sky_color_view and make
+        // wgpu's fatal error handler kill the whole editor on any resize.
+        let chc = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Cloud History Current"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.cloud_history_current_view = chc.create_view(&Default::default());
+        self.cloud_history_current = chc;
+        // Keep the sky renderer's own history texture in sync so the
+        // cloud-history copy target matches the new size too.
+        self.sky_renderer.resize(&self.device, self.config.width, self.config.height);
+        // Same for the heat-distortion field target (rendered during the
+        // transparent pass for fire/lava).
+        let hd = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Heat Distortion"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.heat_distortion_view = hd.create_view(&Default::default());
+        self.heat_distortion_texture = hd;
         // Recreate the half-res AO mask at the new size.
         let at = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("GTAO AO Texture"),
@@ -2813,6 +2954,24 @@ let default_weather = GpuWeatherData {
         self.view_proj = vp;
         let cam_pos = camera.position();
 
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CAM_NAN_COUNT: AtomicU32 = AtomicU32::new(0);
+            let vp_has_nan = vp.x_axis.is_nan() || vp.y_axis.is_nan() || vp.z_axis.is_nan() || vp.w_axis.is_nan();
+            let cnt = CAM_NAN_COUNT.fetch_add(1, Ordering::SeqCst);
+            if cnt < 4 || (vp_has_nan && cnt < 90) {
+                let fwd = camera.forward();
+                tracing::warn!(
+                    "[CamDiag] f={} vp_nan={} pos=({:.3},{:.3},{:.3}) fwd=({:.3},{:.3},{:.3}) vp_w=({:.3},{:.3},{:.3},{:.3}) vp_z=({:.3},{:.3},{:.3},{:.3})",
+                    cnt, vp_has_nan,
+                    cam_pos.x, cam_pos.y, cam_pos.z,
+                    fwd.x, fwd.y, fwd.z,
+                    vp.w_axis.x, vp.w_axis.y, vp.w_axis.z, vp.w_axis.w,
+                    vp.z_axis.x, vp.z_axis.y, vp.z_axis.z, vp.z_axis.w,
+                );
+            }
+        }
+
         // ── TAA sub-pixel jitter (Halton(2,3) sequence) ─────────────────────
         // Jitters the projection matrix by sub-pixel amounts each frame so TAA
         // can accumulate detail from multiple samples over time.
@@ -2841,7 +3000,14 @@ let default_weather = GpuWeatherData {
                 .normalize()
                 .to_array()
         };
-        let light_color_arr = [self.features.sun_intensity, self.features.sun_intensity, self.features.sun_intensity];
+        // Sun light color: warm at sunrise/sunset, white at noon (from the sky
+        // system) instead of hard-coded white — dusk now actually looks warm.
+        let sun_tint = self.sky_params.sun_color;
+        let light_color_arr = [
+            sun_tint.x * self.features.sun_intensity,
+            sun_tint.y * self.features.sun_intensity,
+            sun_tint.z * self.features.sun_intensity,
+        ];
         let uniforms = GpuUniforms {
             view_proj:   vp_jittered.to_cols_array_2d(),
             camera_pos:  cam_pos.to_array(),
@@ -3026,11 +3192,12 @@ let default_weather = GpuWeatherData {
         }
 
         // ── Upload baked light probes (bindings 14/15) ─────────────────────
-        // Probe layout (10 × vec4 per probe = 160 bytes):
+        // Probe layout (11 × vec4 per probe = 176 bytes):
         //   0: position.xyz + radius
         //   1..9: 9 SH coefficients (rgb, w unused)
+        //   10: sky occlusion (0 = open sky, 1 = enclosed) + padding
         const MAX_PROBES: usize = 32;
-        const PROBE_STRIDE_VEC4: usize = 10;
+        const PROBE_STRIDE_VEC4: usize = 11;
         let probes = &self.light_probes.probes;
         let count = probes.len().min(32);
         self.queue.write_buffer(
@@ -3049,6 +3216,10 @@ let default_weather = GpuWeatherData {
                 probe_bytes[off..off + 12]
                     .copy_from_slice(&bytemuck::cast_slice(&[coeff[0], coeff[1], coeff[2]]));
             }
+            // Slot 10: sky occlusion (baked AO) + unused padding.
+            let ao_off = base + 16 + 9 * 16;
+            probe_bytes[ao_off..ao_off + 4]
+                .copy_from_slice(&bytemuck::cast_slice(&[probe.sky_occlusion]));
         }
         self.queue.write_buffer(&self.probe_data_buf, 0, &probe_bytes);
 
@@ -3199,6 +3370,8 @@ let default_weather = GpuWeatherData {
             .collect();
         stats.total += skinned_candidates.len();
 
+        let first_cand_info: Option<(glam::Vec3, [f32; 3])> =
+            candidates.first().map(|c| (glam::Vec3::new(c.pos.x, c.pos.y, c.pos.z), c.renderable.scale));
         let visible: Vec<DrawCandidate> = if self.features.culling_enabled {
             let cam_pos = camera.position();
             let vp = camera.view_projection_matrix();
@@ -3266,6 +3439,21 @@ let default_weather = GpuWeatherData {
             candidates
         };
         stats.visible = visible.len();
+
+        if visible.is_empty() && stats.total > 0 {
+            let fwd = camera.forward();
+            tracing::warn!(
+                "[CullDebug] visible=0 cam=({:.2},{:.2},{:.2}) fwd=({:.2},{:.2},{:.2})",
+                cam_pos.x, cam_pos.y, cam_pos.z, fwd.x, fwd.y, fwd.z
+            );
+            if let Some((pp, sc)) = first_cand_info {
+                let clip = vp * glam::Vec4::new(pp.x, pp.y, pp.z, 1.0);
+                tracing::warn!(
+                    "[CullDebug] first cand pos=({:.2},{:.2},{:.2}) clip=({:.2},{:.2},{:.2},{:.2}) scale={:?}",
+                    pp.x, pp.y, pp.z, clip.x, clip.y, clip.z, clip.w, sc
+                );
+            }
+        }
 
         // ── GPU Instanced Drawing via InstancingManager ────────────────────
         // Group visible entities by (mesh_id, material_id). Each unique
@@ -3857,7 +4045,7 @@ let default_weather = GpuWeatherData {
             });
             cpass.set_pipeline(&self.froxel_pipeline);
             cpass.set_bind_group(0, &froxel_bg, &[]);
-            cpass.dispatch_workgroups(64u32.div_ceil(8), 36u32.div_ceil(8), 32u32.div_ceil(8));
+            cpass.dispatch_workgroups(64u32.div_ceil(8), 36u32.div_ceil(8), 32u32.div_ceil(4));
         }
         // ── Voxel GI: injection ──────────────────────────────────────────────
         // Voxelizes the visible scene by stamping the previous frame's lit
@@ -4682,8 +4870,7 @@ let default_weather = GpuWeatherData {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("TAA History Copy"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.taa_history_view,
-                    resolve_target: None,
+                    view: &self.taa_history_view,                    resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -4692,7 +4879,7 @@ let default_weather = GpuWeatherData {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.post_copy_pipeline);
+            pass.set_pipeline(&self.post_copy_rgba16_pipeline);
             pass.set_bind_group(0, &copy_bg, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -4937,7 +5124,7 @@ let default_weather = GpuWeatherData {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.bloom_composite_pipeline);
+            pass.set_pipeline(&self.bloom_composite_rgba16_pipeline);
             pass.set_bind_group(0, &bloom_c_bg, &[]);
             pass.set_bind_group(1, &composite_d_bg, &[]);
             pass.draw(0..3, 0..1);
@@ -4956,7 +5143,7 @@ let default_weather = GpuWeatherData {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.bloom_composite_pipeline);
+            pass.set_pipeline(&self.bloom_composite_rgba16_pipeline);
             pass.set_bind_group(0, &bloom_a_bg, &[]);
             pass.set_bind_group(1, &composite_e_bg, &[]);
             pass.draw(0..3, 0..1);
@@ -5296,7 +5483,7 @@ let default_weather = GpuWeatherData {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Tonemap"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.final_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -5312,12 +5499,171 @@ let default_weather = GpuWeatherData {
             pass.draw(0..3, 0..1);
         }
 
+        // ── Blit final output to the swapchain surface ───────────────────────
+        // The tonemapped sRGB image lives in final_view (also the editor's
+        // viewport texture); copy it onto the surface before egui overlays.
+        {
+            let final_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Final Blit BG"),
+                layout: &self.post_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.final_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Final Blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.post_copy_pipeline);
+            pass.set_bind_group(0, &final_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
         if let Some(draw_overlay) = overlay_pass.as_mut() {
             draw_overlay(&self.device, &self.queue, &mut enc, &view);
         }
 
         self.queue.submit([enc.finish()]);
         frame.present();
+
+        // Temporary one-shot diagnostic: read back final_view and log a few
+        // pixels + average so we can see what the scene actually contains.
+        {
+            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            use std::sync::OnceLock;
+            static COUNT: OnceLock<AtomicU32> = OnceLock::new();
+            let c = COUNT.get_or_init(|| AtomicU32::new(0));
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            let targets = [600u32, 1500, 2400, 3300];
+            if targets.contains(&n) && self.config.width > 0 && self.config.height > 0 {
+                tracing::info!("[FinalViewReadback] frame {} ...", n);
+                let w = self.config.width;
+                let h = self.config.height;
+                let read_tex = |tex: &wgpu::Texture, label: &str, bpp: usize| {
+                    let bpr = ((w as usize) * bpp + 255) & !255;
+                    let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: (bpr * (h as usize)) as u64,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    let mut enc3 = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Rb Enc3") });
+                    enc3.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &buf,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bpr as u32),
+                                rows_per_image: Some(h),
+                            },
+                        },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                    self.queue.submit([enc3.finish()]);
+                    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                    let _ = buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                        let _ = tx.send(r.is_ok());
+                    });
+                    let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_millis(3000)) });
+                    let ok = rx.recv_timeout(std::time::Duration::from_millis(3000)).unwrap_or(false);
+                    if !ok {
+                        tracing::warn!("[Rb] map failed for {}", label);
+                        return;
+                    }
+                    let data = buf.slice(..).get_mapped_range();
+                    let mut sum = [0.0f64; 3];
+                    let mut cnt = 0u64;
+                    for y in 0..h {
+                        let row = (y as usize) * bpr;
+                        for x in 0..w {
+                            let o = row + (x as usize) * bpp;
+                            if bpp == 8 {
+                                // Rgba16Float halfs — read first 3 channels as f32.
+                                sum[0] += f16_le(&data, o) as f64;
+                                sum[1] += f16_le(&data, o + 2) as f64;
+                                sum[2] += f16_le(&data, o + 4) as f64;
+                            } else if bpp == 4 && label.contains("depth") {
+                                // Depth32Float
+                                sum[0] += f32_le(&data, o) as f64;
+                            } else {
+                                sum[0] += data[o] as f64;
+                                sum[1] += data[o + 1] as f64;
+                                sum[2] += data[o + 2] as f64;
+                            }
+                            cnt += 1;
+                        }
+                    }
+                    let samples = [(w / 2, h / 8), (w / 2, h / 2), (w / 5, h / 2), ((w * 4) / 5, h / 2)];
+                    let mut sv = Vec::new();
+                    for &(px, py) in &samples {
+                        let off = (py as usize) * bpr + (px as usize) * bpp;
+                        if bpp == 8 {
+                            sv.push([f16_le(&data, off) as i32, f16_le(&data, off + 2) as i32, f16_le(&data, off + 4) as i32]);
+                        } else if bpp == 4 && label.contains("depth") {
+                            sv.push([f32_le(&data, off) as i32, 0, 0]);
+                        } else {
+                            sv.push([data[off] as i32, data[off + 1] as i32, data[off + 2] as i32]);
+                        }
+                    }
+                    let avg = [
+                        (sum[0] / cnt as f64) as i64,
+                        (sum[1] / cnt as f64) as i64,
+                        (sum[2] / cnt as f64) as i64,
+                    ];
+                    tracing::info!(
+                        "[Rb] {} avg=({},{},{}) samples=({:?})",
+                        label, avg[0], avg[1], avg[2], sv
+                    );
+                };
+                fn f16_le(d: &[u8], o: usize) -> f32 {
+                    let lo = d[o] as u16;
+                    let hi = d[o + 1] as u16;
+                    half_to_f32(lo | (hi << 8))
+                }
+                fn f32_le(d: &[u8], o: usize) -> f32 {
+                    let v = u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+                    f32::from_bits(v)
+                }
+                fn half_to_f32(h: u16) -> f32 {
+                    let s = ((h >> 15) & 1) as u32;
+                    let e = ((h >> 10) & 0x1f) as u32;
+                    let m = (h & 0x3ff) as u32;
+                    if e == 0 && m == 0 { return f32::from_bits(s << 31); }
+                    if e == 0 {
+                        let mut e2 = 127 - 15 + 1;
+                        let mut m2 = m << 13;
+                        while m2 & 0x800000 != 0 { m2 <<= 1; e2 -= 1; }
+                        return f32::from_bits((s << 31) | (e2 << 23) | m2);
+                    }
+                    if e == 0x1f { return f32::from_bits((s << 31) | (0xff << 23) | (m << 13)); }
+                    f32::from_bits((s << 31) | ((e + 127 - 15) << 23) | (m << 13))
+                }
+                read_tex(&self.depth_texture, "depth", 4);
+                read_tex(&self.gb_albedo_texture, "gb_albedo", 8);
+                read_tex(&self.sky_color_texture, "sky_color", 8);
+                read_tex(&self.scene_color, "scene_view", 4);
+                read_tex(&self.tonemap_temp, "tonemap_temp", 4);
+                read_tex(&self.final_texture, "final_view", 4);
+            }
+        }
 
         // Advance TAA frame counter for next frame's jitter.
         self.taa_frame_index = self.taa_frame_index.wrapping_add(1);
@@ -5329,8 +5675,15 @@ let default_weather = GpuWeatherData {
         self.config.format
     }
 
+    /// Pixel size the renderer is currently rendering at (window size).
+    /// The editor uses this to aspect-fit the viewport texture into its panel
+    /// so the scene is never distorted and click-picking stays aligned.
+    pub fn render_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
     pub fn scene_color_view(&self) -> &wgpu::TextureView {
-        &self.scene_view
+        &self.final_view
     }
 
     pub fn invalidate_texture_path(&self, path: &str) {
@@ -5399,60 +5752,116 @@ let default_weather = GpuWeatherData {
 
     pub fn apply_sky_environment(&mut self, path: &str) -> Result<(), String> {
         let p = path.trim();
-        let make_bg = if p.is_empty() {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label:   Some("Global BG (fallback sky)"),
-                layout:  &self.global_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding:  0,
-                        resource: self.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.default_albedo_view)  },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.default_albedo_sampler)  },
-                    wgpu::BindGroupEntry { binding: 7, resource: self.shadow_uniform_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(0)) },
-                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(1)) },
-                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(2)) },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.shadow_system.sampler) },
-                    wgpu::BindGroupEntry { binding: 12, resource: self.light_uniform_buf.as_entire_binding() },
-                ],
-            })
+        self.using_hdr_ibl = !p.is_empty();
+        let bg = if p.is_empty() {
+            // Ensure a procedural IBL exists (generated from the procedural sky
+            // so the scene's ambient matches the sky instead of flat white).
+            if self.proc_ibl.is_none() {
+                self.proc_ibl = Some(ibl::IblMaps::from_procedural_sky(
+                    &self.device,
+                    &self.queue,
+                    &self.sky_params,
+                )?);
+            }
+            self.proc_ibl_key = Some(procedural_ibl_key(&self.sky_params));
+            let maps = self.proc_ibl.as_ref().expect("procedural IBL just built");
+            self.build_global_bind_group(maps)
         } else {
             let ibl_maps = ibl::IblMaps::from_hdr(&self.device, &self.queue, p)?;
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label:   Some("Global BG (custom sky hdr)"),
-                layout:  &self.global_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding:  0,
-                        resource: self.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&ibl_maps.irradiance_view)  },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&ibl_maps.irradiance_sampler)  },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ibl_maps.prefilter_view)  },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&ibl_maps.prefilter_sampler)  },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&ibl_maps.brdf_lut_view)  },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&ibl_maps.brdf_lut_sampler)  },
-                    wgpu::BindGroupEntry { binding: 7, resource: self.shadow_uniform_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(0)) },
-                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(1)) },
-                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(2)) },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.shadow_system.sampler) },
-                    wgpu::BindGroupEntry { binding: 12, resource: self.light_uniform_buf.as_entire_binding() },
-                ],
-            })
+            self.build_global_bind_group(&ibl_maps)
         };
-        self.bind_group = make_bg;
+        self.bind_group = bg;
         Ok(())
+    }
+
+    /// Assemble the global bind group around a set of IBL maps (irradiance,
+    /// prefilter, BRDF LUT). Shared by the procedural and HDR paths.
+    fn build_global_bind_group(&self, ibl_maps: &ibl::IblMaps) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("Global BG"),
+            layout:  &self.global_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&ibl_maps.irradiance_view)  },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&ibl_maps.irradiance_sampler)  },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ibl_maps.prefilter_view)  },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&ibl_maps.prefilter_sampler)  },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&ibl_maps.brdf_lut_view)  },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&ibl_maps.brdf_lut_sampler)  },
+                wgpu::BindGroupEntry { binding: 7, resource: self.shadow_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(0)) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(1)) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(self.shadow_system.cascade_view(2)) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.shadow_system.sampler) },
+                wgpu::BindGroupEntry { binding: 12, resource: self.light_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.weather_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.probe_control_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.probe_data_buf.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Build (or rebuild) the procedural IBL from the current sky params and
+    /// re-bind it into the global bind group. Called when the sky drifts enough
+    /// that a refresh is warranted, or when explicitly requested.
+    fn ensure_procedural_ibl(&mut self) -> Result<(), String> {
+        let maps = ibl::IblMaps::from_procedural_sky(&self.device, &self.queue, &self.sky_params)?;
+        self.proc_ibl = Some(maps);
+        self.proc_ibl_key = Some(procedural_ibl_key(&self.sky_params));
+        self.using_hdr_ibl = false;
+        self.rebind_global_bind_group();
+        Ok(())
+    }
+
+    fn rebind_global_bind_group(&mut self) {
+        if let Some(maps) = &self.proc_ibl {
+            let bg = self.build_global_bind_group(maps);
+            self.bind_group = bg;
+        }
+    }
+
+    /// Rebuild the procedural IBL when the sky has changed enough (sun moved,
+    /// darkness changed, atmosphere tint shifted). No-op when a custom HDR sky
+    /// is bound or nothing meaningful changed.
+    fn refresh_procedural_ibl_if_needed(&mut self) {
+        if self.using_hdr_ibl {
+            return;
+        }
+        let key = procedural_ibl_key(&self.sky_params);
+        let changed = match &self.proc_ibl_key {
+            None => true,
+            Some(prev) => {
+                const EPS: f32 = 1e-3;
+                key.iter()
+                    .zip(prev.iter())
+                    .any(|(a, b)| (a - b).abs() > EPS)
+            }
+        };
+        if changed {
+            let _ = self.ensure_procedural_ibl();
+        }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Fingerprint of the sky params that drive the procedural IBL. When any of these
+// drift past the refresh epsilon, the environment map is regenerated.
+fn procedural_ibl_key(sky: &crate::environment::sky::SkyParams) -> [f32; 8] {
+    [
+        sky.sun_direction.x,
+        sky.sun_direction.y,
+        sky.sun_direction.z,
+        sky.sun_intensity,
+        sky.star_intensity,
+        sky.zenith_color.x,
+        sky.zenith_color.y,
+        sky.zenith_color.z,
+    ]
+}
 
 // Halton radical inverse sequence for TAA sub-pixel jitter.
 // Returns a value in [0, 1) for the given index and base.
@@ -5488,7 +5897,8 @@ fn make_depth_texture(
         // TEXTURE_BINDING is required so the SSR post-process pass can read depth
         // to reconstruct view-space positions for ray marching.
         usage:           wgpu::TextureUsages::RENDER_ATTACHMENT
-                       | wgpu::TextureUsages::TEXTURE_BINDING,
+                       | wgpu::TextureUsages::TEXTURE_BINDING
+                       | wgpu::TextureUsages::COPY_SRC,
         view_formats:    &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -5515,7 +5925,10 @@ fn make_scene_color_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: config.format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -5539,7 +5952,9 @@ fn make_normals_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -5565,7 +5980,9 @@ fn make_gbuffer_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());

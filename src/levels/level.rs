@@ -54,6 +54,9 @@ pub struct Level {
     /// Must be >= streaming_distance to create a hysteresis band that
     /// prevents load/unload oscillation at the boundary.
     pub unloading_distance: f32,
+    /// Mesh store IDs this level's entities reference. Kept so unloading can
+    /// release the refcounts (see AssetStore::retain/release/evict_unused).
+    pub mesh_refs: Vec<u32>,
 }
 
 impl Level {
@@ -71,6 +74,7 @@ impl Level {
             origin: [0.0; 3],
             streaming_distance: 100.0,
             unloading_distance: 200.0,
+            mesh_refs: Vec::new(),
         }
     }
 
@@ -136,6 +140,28 @@ impl LevelManager {
         }
     }
 
+    /// Unset the persistent flag (the level becomes streamable again).
+    pub fn set_non_persistent(&mut self, level_id: u32) {
+        if let Some(level) = self.levels.iter_mut().find(|l| l.id == level_id) {
+            level.persistent = false;
+        }
+        self.persistent_index = self.levels.iter().position(|l| l.persistent);
+    }
+
+    /// Remove a level entirely (even persistent ones), despawning its
+    /// entities from the world. Returns whether the level was found.
+    pub fn remove_level(&mut self, id: u32, world: &mut hecs::World) -> bool {
+        let Some(idx) = self.levels.iter().position(|l| l.id == id) else {
+            return false;
+        };
+        let level = self.levels.remove(idx);
+        for e in level.entities {
+            let _ = world.despawn(e);
+        }
+        self.persistent_index = self.levels.iter().position(|l| l.persistent);
+        true
+    }
+
     /// Get a level by ID (immutable borrow).
     pub fn get(&self, id: u32) -> Option<&Level> {
         self.levels.iter().find(|l| l.id == id)
@@ -185,6 +211,135 @@ impl LevelManager {
         } else {
             false
         }
+    }
+
+    /// Actually spawn this level's entities from its `.scene` file into the
+    /// world, recording the spawned IDs so `despawn_level` can remove exactly
+    /// them on unload. Uses the shared mesh cache so meshes are reused across
+    /// levels. Marks the level loaded on success.
+    pub fn spawn_level(
+        &mut self,
+        id: u32,
+        world: &mut hecs::World,
+        meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
+        mesh_cache: &mut std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
+        prefabs: Option<&crate::scene::prefab::PrefabRegistry>,
+    ) -> Result<bool, String> {
+        let Some(level) = self.levels.iter().find(|l| l.id == id) else {
+            return Ok(false);
+        };
+        let path = level.file_path.to_string_lossy().to_string();
+        let origin = level.origin;
+        let entities =
+            crate::scene::spawn_scene(world, meshes, mesh_cache, prefabs, &path, origin)?;
+        if let Some(level) = self.levels.iter_mut().find(|l| l.id == id) {
+            level.entities = entities.clone();
+            level.loaded = true;
+            // Claim one reference per distinct mesh the level spawned so the
+            // eviction pass never frees them while the level is loaded.
+            let mut seen: Vec<u32> = Vec::new();
+            for e in &entities {
+                let Ok(renderable) = world.get::<&crate::components::Renderable>(*e) else {
+                    continue;
+                };
+                let mesh_id = renderable.mesh.id;
+                if !seen.contains(&mesh_id) {
+                    seen.push(mesh_id);
+                    meshes.retain(&renderable.mesh);
+                }
+            }
+            level.mesh_refs = seen;
+        }
+        Ok(true)
+    }
+
+    /// Despawn the entities belonging to this level and mark it unloaded.
+    /// The persistent level cannot be unloaded.
+    pub fn despawn_level(&mut self, id: u32, world: &mut hecs::World) -> bool {
+        let Some(level) = self.levels.iter_mut().find(|l| l.id == id) else {
+            return false;
+        };
+        if level.persistent {
+            return false; // Can't unload the persistent level.
+        }
+        for e in level.entities.drain(..) {
+            let _ = world.despawn(e);
+        }
+        level.loaded = false;
+        true
+    }
+
+    /// Release the mesh references a level claimed at spawn, and evict any
+    /// mesh whose refcount dropped to zero and that isn't pinned by the
+    /// mesh cache. Call this right after `despawn_level`. Returns how many
+    /// meshes were freed from the store.
+    pub fn release_level_meshes(
+        &mut self,
+        id: u32,
+        meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
+        mesh_cache: &std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
+    ) -> usize {
+        let Some(level) = self.levels.iter_mut().find(|l| l.id == id) else {
+            return 0;
+        };
+        let refs = std::mem::take(&mut level.mesh_refs);
+        for mesh_id in refs {
+            meshes.release(&crate::assets::Handle::new(mesh_id));
+        }
+        let protected: std::collections::HashSet<u32> =
+            mesh_cache.values().map(|h| h.id).collect();
+        meshes.evict_unused(&protected)
+    }
+
+    /// Register every level from a manifest (appending to any levels that were
+    /// registered already — e.g. by scripts). Persistent entries are marked
+    /// always-loaded; streamed entries keep their load/unload distances.
+    pub fn register_manifest(&mut self, manifest: &crate::levels::manifest::LevelManifest) {
+        for entry in &manifest.levels {
+            // Re-registering the same scene under a new name is allowed (each
+            // registration is an independent level instance).
+            let id = self.register_level(&entry.name, &entry.file);
+            if let Some(level) = self.levels.iter_mut().find(|l| l.id == id) {
+                level.origin = entry.origin;
+                level.streaming_distance = entry.streaming_distance;
+                level.unloading_distance = entry.unloading_distance;
+                if entry.persistent {
+                    self.set_persistent(id);
+                }
+            }
+        }
+    }
+
+    /// Spawn the entities of every persistent level. Call once at project load
+    /// so the always-loaded base world is in the scene. Levels whose entities
+    /// were already spawned are skipped. Returns the number spawned.
+    pub fn spawn_persistent_levels(
+        &mut self,
+        world: &mut hecs::World,
+        meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
+        mesh_cache: &mut std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
+        prefabs: Option<&crate::scene::prefab::PrefabRegistry>,
+    ) -> Result<usize, String> {
+        let ids: Vec<u32> = self
+            .levels
+            .iter()
+            .filter(|l| l.persistent)
+            .map(|l| l.id)
+            .collect();
+        let mut spawned = 0;
+        for id in ids {
+            let already_spawned = self
+                .levels
+                .iter()
+                .find(|l| l.id == id)
+                .map_or(false, |l| l.loaded && !l.entities.is_empty());
+            if already_spawned {
+                continue;
+            }
+            self.spawn_level(id, world, meshes, mesh_cache, prefabs)?;
+            spawned += 1;
+        }
+        Ok(spawned)
     }
 
     /// Toggle level visibility without unloading its entities.

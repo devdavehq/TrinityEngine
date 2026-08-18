@@ -407,10 +407,22 @@ pub fn bake_probe_grid(
         let mut coeffs = [[0.0f32; 3]; 9];
         let inv_n = 1.0 / settings.samples as f32;
 
+        // Sky-hemisphere occlusion: how much of the upper hemisphere's
+        // geometry blocks the sky at this probe. Only rays above the horizon
+        // count, so an open field reads ~0 and a room/underhang reads ~1.
+        let mut up_rays = 0usize;
+        let mut up_blocked = 0usize;
+
         for _ in 0..settings.samples {
             let dir = rng.sphere();
+            if dir.y > 0.0 {
+                up_rays += 1;
+            }
             // Skip rays grazing the probe — they contribute ~nothing.
             let hit = raycast(&root, &scene.tris, &scene.albedo, &indices, origin, dir);
+            if dir.y > 0.0 && hit.is_some() {
+                up_blocked += 1;
+            }
             let radiance: Vec3 = match hit {
                 Some((_, alb)) => {
                     // Surface bounce: ambient sky albedo + direct lights.
@@ -472,6 +484,11 @@ pub fn bake_probe_grid(
             sh.coeffs[k][2] = c[2] * scale;
         }
         probe.irradiance = sh;
+        probe.sky_occlusion = if up_rays > 0 {
+            up_blocked as f32 / up_rays as f32
+        } else {
+            1.0
+        };
     }
 
     // Deterministic result: number of boxes folded (debug value).
@@ -488,8 +505,8 @@ pub fn save_probes(path: &Path, grid: &LightProbeGrid) -> Result<(), String> {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"x\":{},\"y\":{},\"z\":{},\"r\":{},\"w\":{},\"g\":{},",
-            p.position.x, p.position.y, p.position.z, p.radius, p.weight, p.group
+            "{{\"x\":{},\"y\":{},\"z\":{},\"r\":{},\"w\":{},\"g\":{},\"o\":{},",
+            p.position.x, p.position.y, p.position.z, p.radius, p.weight, p.group, p.sky_occlusion
         ));
         out.push_str("\"c\":[");
         for (k, c) in p.irradiance.coeffs.iter().enumerate() {
@@ -537,6 +554,7 @@ pub fn load_probes(path: &Path, grid: &mut LightProbeGrid) -> Result<(), String>
         let last = grid.probes.last_mut().unwrap();
         last.weight = weight;
         last.group = group;
+        last.sky_occlusion = item.get("o").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         if let Some(c) = item.get("c").and_then(|v| v.as_array()) {
             for (k, coeff) in c.iter().enumerate().take(9) {
                 if let Some(vals) = coeff.as_array() {

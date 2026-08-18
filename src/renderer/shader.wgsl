@@ -21,7 +21,9 @@ struct Uniforms {
 // Weather uniform â€” drives snow accumulation blending.
 struct WeatherData {
     snow_coverage: f32,  // 0 = no snow, 1 = full accumulation
-    _pad: vec3<f32>,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 @group(0) @binding(13) var<uniform> weather: WeatherData;
 
@@ -99,14 +101,14 @@ struct VertIn {
 }
 
 // â”€â”€ Per-instance data (matches InstanceData in instancing.rs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Two buffers: slot 1 = per-instance (locations 14-19).
+// Two buffers: slot 1 = per-instance (locations 10-15).
 struct InstanceIn {
-    @location(14) model_row0:     vec4<f32>,
-    @location(15) model_row1:     vec4<f32>,
-    @location(16) model_row2:     vec4<f32>,
-    @location(17) model_row3:     vec4<f32>,
-    @location(18) color_metallic: vec4<f32>,
-    @location(19) roughness_ao:   vec4<f32>,
+    @location(10) model_row0:     vec4<f32>,
+    @location(11) model_row1:     vec4<f32>,
+    @location(12) model_row2:     vec4<f32>,
+    @location(13) model_row3:     vec4<f32>,
+    @location(14) color_metallic: vec4<f32>,
+    @location(15) roughness_ao:   vec4<f32>,
 }
 
 struct VertOut {

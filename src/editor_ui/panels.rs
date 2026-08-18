@@ -21,8 +21,14 @@ pub mod viewport;
 pub mod bt_editor;
 #[path = "panels/anim_graph_editor.rs"]
 pub mod anim_graph_editor;
+#[path = "panels/script_editor.rs"]
+pub mod script_editor;
+#[path = "panels/levels.rs"]
+pub mod levels;
 
 pub use content_browser::render_content_browser_panel;
 pub use details::render_details_panel;
 pub use outliner::render_outliner_panel;
 pub use viewport::render_viewport_panel;
+pub use levels::render_levels_panel;
+pub use script_editor::render_script_editor_panel;

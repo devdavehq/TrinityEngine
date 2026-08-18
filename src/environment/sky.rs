@@ -72,12 +72,24 @@ pub struct SkyParams {
     pub moon_color: Vec3,
     pub moon_intensity: f32,
     pub moon_radius_deg: f32,
+    /// Master toggle for the moon disc.
+    pub moon_enabled: bool,
+    /// When true, `update_from_time` re-derives moon position + brightness from
+    /// the clock each frame. When false (script/editor took manual control),
+    /// the stored `moon_direction` / `moon_intensity` are left untouched.
+    pub moon_auto: bool,
 
     // ── Stars ───────────────────────────────────────────────────────────
     /// Star brightness (0 = invisible, 1 = full brightness).
     pub star_intensity: f32,
     /// Star density (0 = none, 1 = many).
     pub star_density: f32,
+    /// Master toggle for the entire star field (Milky Way + individual stars).
+    pub stars_enabled: bool,
+    /// When true, `update_from_time` re-derives star intensity from the clock
+    /// each frame. When false (script/editor took manual control), the stored
+    /// `star_intensity` is left untouched.
+    pub stars_auto: bool,
 
     // ── Atmosphere ──────────────────────────────────────────────────────
     /// Rayleigh scattering coefficient. Controls how much blue light scatters.
@@ -114,9 +126,13 @@ impl Default for SkyParams {
             moon_color: Vec3::new(0.7, 0.75, 0.85),
             moon_intensity: 0.15,
             moon_radius_deg: 0.3,
+            moon_enabled: true,
+            moon_auto: true,
 
             star_intensity: 0.0,
             star_density: 0.8,
+            stars_enabled: true,
+            stars_auto: true,
 
             rayleigh_scatter: Vec3::new(5.5e-6, 13.0e-6, 22.4e-6),
             rayleigh_density: 1.0,
@@ -159,11 +175,21 @@ impl SkyParams {
         self.sun_intensity = daylight;
 
         // ── Moon ────────────────────────────────────────────────────────
-        self.moon_direction = time.moon_direction();
-        self.moon_intensity = time.star_intensity() * 0.15;
+        if self.moon_auto {
+            self.moon_direction = time.moon_direction();
+            self.moon_intensity = time.star_intensity() * 0.15;
+        }
+        if !self.moon_enabled {
+            self.moon_intensity = 0.0;
+        }
 
         // ── Stars ───────────────────────────────────────────────────────
-        self.star_intensity = time.star_intensity();
+        if self.stars_auto {
+            self.star_intensity = time.star_intensity();
+        }
+        if !self.stars_enabled {
+            self.star_intensity = 0.0;
+        }
 
         // ── Atmosphere ──────────────────────────────────────────────────
         // Increase rayleigh density at sunset for warm scattering.
@@ -199,12 +225,18 @@ impl SkyParams {
                 self.sun_disc_radius_deg,
                 self.sun_halo_falloff,
             ],
+            sky_visibility: [
+                if self.stars_enabled { 1.0 } else { 0.0 },
+                if self.moon_enabled { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         }
     }
 }
 
 /// GPU-ready uniform data for the sky shader.
-/// Layout: 8 × vec4 = 128 bytes. Must be a multiple of 16.
+/// Layout: 9 × vec4 = 144 bytes. Must be a multiple of 16.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyUniformData {
@@ -216,6 +248,7 @@ pub struct SkyUniformData {
     pub moon_direction: [f32; 4],
     pub atmosphere: [f32; 4],
     pub stars_params: [f32; 4],
+    pub sky_visibility: [f32; 4],
 }
 
 #[cfg(test)]
@@ -258,6 +291,6 @@ mod tests {
         let sky = SkyParams::default();
         let data = sky.to_uniform_data();
         let bytes = std::mem::size_of::<SkyUniformData>();
-        assert_eq!(bytes, 128); // 8 vec4s × 16 bytes
+        assert_eq!(bytes, 144); // 9 vec4s × 16 bytes
     }
 }

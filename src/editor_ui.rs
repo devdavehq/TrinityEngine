@@ -115,6 +115,8 @@ enum EditorDockTab {
     ContentBrowser,
     Profiler,
     Console,
+    ScriptEditor,
+    Levels,
 }
 
 pub struct EditorUi {
@@ -248,9 +250,12 @@ pub struct UiFrameArgs<'a> {
     pub camera_nav_speed: f32,
     pub time_of_day: &'a mut crate::environment::time_of_day::TimeOfDay,
     pub weather: &'a mut crate::environment::weather::WeatherState,
+    pub sky: &'a mut crate::environment::sky::SkyParams,
     pub audio: &'a mut Option<crate::audio::AudioSystem>,
     /// Set true by the "Bake Lighting" button; main loop performs the bake.
     pub bake_requested: &'a mut bool,
+    /// Level manager + streaming config, edited by the Levels panel.
+    pub levels: &'a mut crate::engine_subsystems::LevelState,
 }
 
 fn nearly_eq(a: f32, b: f32) -> bool {
@@ -450,7 +455,7 @@ impl EditorUi {
             .split_right(main, 0.26, vec![EditorDockTab::Details]);
         dock_state
             .main_surface_mut()
-            .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler]);
+            .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler, EditorDockTab::ScriptEditor, EditorDockTab::Levels]);
         let mut workspace_preset = "Default".to_string();
         if let Some((p, st)) = load_saved_dock_layout() {
             workspace_preset = p;
@@ -1656,6 +1661,24 @@ fn build_ui(
         }
     });
 
+    // If the Content Browser double-clicked a Lua script, open the Script
+    // Editor tab and hand the file path over to it.
+    let script_open_request: Option<String> = ctx
+        .data_mut(|d| d.get_temp(egui::Id::new("script_editor_open")));
+    if let Some(path) = script_open_request {
+        ctx.data_mut(|d| d.remove_temp::<String>(egui::Id::new("script_editor_open")));
+        match dock_state.find_tab_from(|t| *t == EditorDockTab::ScriptEditor) {
+            Some(tab_path) => {
+                let _ = dock_state.set_active_tab(tab_path);
+                dock_state.set_focused_node_and_surface(tab_path.node_path());
+            }
+            None => {
+                dock_state.push_to_first_leaf(EditorDockTab::ScriptEditor);
+            }
+        }
+        let _ = path;
+    }
+
     if !(args.settings.runtime.legacy_editor_ui || std::env::var("TRINITY_LEGACY_UI").is_ok()) {
         if args.available_scene_paths.iter().all(|p| p != scene_picker_choice) || scene_picker_choice.is_empty() {
             *scene_picker_choice = args.scene_path.clone();
@@ -1706,11 +1729,13 @@ fn build_ui(
             fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
                 match tab {
                     EditorDockTab::Viewport => "VIEWPORT".into(),
-                    EditorDockTab::Outliner => "OUTLINER".into(),
+                    EditorDockTab::Outliner => "HIERARCHY".into(),
                     EditorDockTab::Details => "DETAILS".into(),
-                    EditorDockTab::ContentBrowser => "CONTENT".into(),
+                    EditorDockTab::ContentBrowser => "CONTENT BROWSER".into(),
                     EditorDockTab::Profiler => "PROFILER".into(),
                     EditorDockTab::Console => "OUTPUT".into(),
+                    EditorDockTab::ScriptEditor => "SCRIPT EDITOR".into(),
+                    EditorDockTab::Levels => "LEVELS".into(),
                 }
             }
 
@@ -1806,6 +1831,12 @@ fn build_ui(
                                 ui.label(RichText::new("No messages.").italics().weak());
                             }
                         });
+                    }
+                    EditorDockTab::ScriptEditor => {
+                        panels::render_script_editor_panel(ui, self.args, self.icon_texture_cache);
+                    }
+                    EditorDockTab::Levels => {
+                        panels::render_levels_panel(ui, self.args);
                     }
                 }
             }
@@ -3114,6 +3145,8 @@ UiWidgetKind::Slider => {
                 EditorDockTab::ContentBrowser => "[cb] Content Browser".into(),
                 EditorDockTab::Profiler => "[pf] Profiler".into(),
                 EditorDockTab::Console => "[log] Console".into(),
+                EditorDockTab::ScriptEditor => "[sc] Script Editor".into(),
+                EditorDockTab::Levels => "[lv] Levels".into(),
             }
         }
         fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
@@ -3215,6 +3248,12 @@ UiWidgetKind::Slider => {
                             ui.label(RichText::new("No messages.").italics().weak());
                         }
                     });
+                }
+                EditorDockTab::ScriptEditor => {
+                    panels::render_script_editor_panel(ui, self.args, self.icon_texture_cache);
+                }
+                EditorDockTab::Levels => {
+                    panels::render_levels_panel(ui, self.args);
                 }
             }
         }
@@ -3546,6 +3585,63 @@ UiWidgetKind::Slider => {
                 ui.checkbox(&mut args.renderer.features.lava_enabled, "");
             });
             ui.separator();
+            // ── Rendering Features ────────────────────────────────────────────
+            ui.collapsing("Rendering Features", |ui| {
+                ui.label("Shadows");
+                ui.checkbox(&mut args.renderer.features.shadows_enabled, "Directional Shadows");
+                ui.checkbox(&mut args.renderer.features.pcf_enabled, "PCF Softening");
+                ui.checkbox(&mut args.renderer.features.pcss_enabled, "Contact Shadows (PCSS)");
+                ui.add(egui::Slider::new(&mut args.renderer.features.shadow_resolution, 512..=8192).logarithmic(true).text("Shadow Resolution"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.pcf_samples, 1..=32).text("PCF Samples"));
+                ui.separator();
+                ui.label("Global Illumination");
+                ui.checkbox(&mut args.renderer.features.ibl_enabled, "Sky Light (IBL)");
+                ui.checkbox(&mut args.renderer.features.probes_enabled, "Baked Light Probes");
+                ui.checkbox(&mut args.renderer.features.voxel_gi_enabled, "Voxel GI (128³)");
+                ui.add(egui::Slider::new(&mut args.renderer.features.voxel_gi_strength, 0.0..=1.0).text("Voxel GI Strength"));
+                ui.separator();
+                ui.label("Post-Processing");
+                ui.checkbox(&mut args.renderer.features.bloom_enabled, "Bloom");
+                ui.checkbox(&mut args.renderer.features.ssao_enabled, "SSAO");
+                ui.checkbox(&mut args.renderer.features.volumetric_fog_enabled, "Volumetric Fog");
+                ui.checkbox(&mut args.renderer.features.volumetric_enabled, "Volumetric Light Scatter");
+                ui.checkbox(&mut args.renderer.features.tonemap_enabled, "Tone Mapping");
+                ui.checkbox(&mut args.renderer.features.taa_enabled, "TAA");
+                ui.checkbox(&mut args.renderer.features.motion_blur_enabled, "Motion Blur");
+                ui.checkbox(&mut args.renderer.features.god_rays_enabled, "God Rays");
+                ui.checkbox(&mut args.renderer.features.dof_enabled, "Depth of Field");
+                ui.separator();
+                ui.label("Screen-Space & Reflections");
+                ui.checkbox(&mut args.renderer.features.ssr_enabled, "Screen-Space Reflections");
+                ui.separator();
+                ui.label("FX Surfaces");
+                ui.checkbox(&mut args.renderer.features.water_enabled, "Water");
+                ui.checkbox(&mut args.renderer.features.lava_enabled, "Lava");
+                ui.checkbox(&mut args.renderer.features.fire_enabled, "Fire");
+                ui.checkbox(&mut args.renderer.features.heat_distortion_enabled, "Heat Distortion");
+                ui.checkbox(&mut args.renderer.features.underwater_enabled, "Underwater Post-FX");
+                if args.renderer.features.underwater_enabled {
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_fog_density, 0.0..=1.0).text("Fog Density"));
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_caustics, 0.0..=2.0).text("Caustics"));
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_god_rays, 0.0..=2.0).text("God Rays"));
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_distortion, 0.0..=1.0).text("Distortion"));
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_vignette, 0.0..=1.0).text("Vignette"));
+                    ui.add(egui::Slider::new(&mut args.renderer.features.underwater_bloom, 0.0..=2.0).text("Bloom Boost"));
+                }
+                ui.separator();
+                ui.label("Culling");
+                ui.checkbox(&mut args.renderer.features.culling_enabled, "Culling");
+                ui.checkbox(&mut args.renderer.features.frustum_culling_enabled, "Frustum Culling");
+                ui.checkbox(&mut args.renderer.features.occlusion_culling_enabled, "Occlusion Culling");
+                ui.add(egui::Slider::new(&mut args.renderer.features.culling_distance, 10.0..=500.0).text("Cull Distance"));
+                ui.separator();
+                ui.label("LOD Thresholds");
+                ui.add(egui::Slider::new(&mut args.renderer.features.mesh_lod_threshold_1, 10.0..=400.0).text("LOD 0→1"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.mesh_lod_threshold_2, 10.0..=400.0).text("LOD 1→2"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.mesh_lod_threshold_3, 10.0..=400.0).text("LOD 2→3"));
+                ui.add(egui::Slider::new(&mut args.renderer.features.mesh_lod_threshold_4, 10.0..=400.0).text("LOD 3→4"));
+            });
+            ui.separator();
             ui.label("Sun Direction (real-time day cycle)");
             ui.horizontal(|ui| {
                 ui.label("Hour:");
@@ -3566,6 +3662,28 @@ UiWidgetKind::Slider => {
             });
             let daylight = args.time_of_day.daylight_factor();
             ui.label(format!("Daylight: {:.0}%", daylight * 100.0));
+            ui.separator();
+            ui.label("Night Sky");
+            ui.horizontal(|ui| {
+                ui.label("Stars");
+                ui.checkbox(&mut args.sky.stars_enabled, "");
+                let r = ui.add(egui::Slider::new(&mut args.sky.star_intensity, 0.0..=1.0).text("Brightness"));
+                if r.changed() { args.sky.stars_auto = false; }
+                let r2 = ui.add(egui::Slider::new(&mut args.sky.star_density, 0.0..=2.0).text("Density"));
+                if r2.changed() { args.sky.stars_auto = false; }
+                if ui.selectable_label(args.sky.stars_auto, "Auto").clicked() {
+                    args.sky.stars_auto = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Moon");
+                ui.checkbox(&mut args.sky.moon_enabled, "");
+                let r = ui.add(egui::Slider::new(&mut args.sky.moon_intensity, 0.0..=2.0).text("Brightness"));
+                if r.changed() { args.sky.moon_auto = false; }
+                if ui.selectable_label(args.sky.moon_auto, "Auto").clicked() {
+                    args.sky.moon_auto = true;
+                }
+            });
             ui.separator();
             ui.label("Weather");
             let conditions = [
@@ -4863,7 +4981,7 @@ fn apply_workspace_preset(dock_state: &mut DockState<EditorDockTab>, preset: &st
                 .split_right(main, 0.30, vec![EditorDockTab::Details, EditorDockTab::Profiler]);
             dock_state
                 .main_surface_mut()
-                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::ContentBrowser]);
+                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::ContentBrowser, EditorDockTab::Levels]);
         }
         "Scripting" => {
             *dock_state = DockState::new(vec![EditorDockTab::ContentBrowser, EditorDockTab::Console]);
@@ -4881,7 +4999,7 @@ fn apply_workspace_preset(dock_state: &mut DockState<EditorDockTab>, preset: &st
                 .split_right(main, 0.26, vec![EditorDockTab::Details]);
             dock_state
                 .main_surface_mut()
-                .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler]);
+                .split_below(left, 0.60, vec![EditorDockTab::ContentBrowser, EditorDockTab::Console, EditorDockTab::Profiler, EditorDockTab::Levels]);
         }
     }
 }
@@ -4905,8 +5023,22 @@ fn refresh_icon_textures(
             continue;
         };
         let rgba = img.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let pixels = rgba.into_raw();
+        // egui/wgpu panics if a texture exceeds the max texture side (2048 is
+        // the portable maximum — the small-but-portable atlas limit used across
+        // egui backends). Downscale oversized art (e.g. a 3000×2000 icon) so a
+        // single bad PNG can never kill the editor.
+        let max_side = 2048u32;
+        let (pixels, w, h) = if rgba.width().max(rgba.height()) > max_side {
+            let scale = max_side as f32 / rgba.width().max(rgba.height()) as f32;
+            let nw = ((rgba.width() as f32 * scale).max(1.0)) as u32;
+            let nh = ((rgba.height() as f32 * scale).max(1.0)) as u32;
+            let resized = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Lanczos3);
+            (resized.into_raw(), nw, nh)
+        } else {
+            let (w, h) = (rgba.width(), rgba.height());
+            (rgba.into_raw(), w, h)
+        };
+        let size = [w as usize, h as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
         let h = ctx.load_texture(format!("icon_{stem}"), color, egui::TextureOptions::LINEAR);
         cache.insert(stem.clone(), h);
@@ -4921,8 +5053,20 @@ fn ensure_splash_logo_texture(ctx: &egui::Context, slot: &mut Option<egui::Textu
         return;
     };
     let rgba = img.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
+    // Same portable 2048 cap as refresh_icon_textures; a splash art file larger
+    // than that must never take the editor down with a texture panic.
+    let max_side = 2048u32;
+    let (pixels, w, h) = if rgba.width().max(rgba.height()) > max_side {
+        let scale = max_side as f32 / rgba.width().max(rgba.height()) as f32;
+        let nw = ((rgba.width() as f32 * scale).max(1.0)) as u32;
+        let nh = ((rgba.height() as f32 * scale).max(1.0)) as u32;
+        let resized = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Lanczos3);
+        (resized.into_raw(), nw, nh)
+    } else {
+        let (w, h) = (rgba.width(), rgba.height());
+        (rgba.into_raw(), w, h)
+    };
+    let size = [w as usize, h as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
     let handle = ctx.load_texture("splash_logo", color, egui::TextureOptions::LINEAR);
     *slot = Some(handle);

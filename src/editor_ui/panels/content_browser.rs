@@ -29,7 +29,7 @@ pub fn render_content_browser_panel(
     _content_new_file: &mut String,
     texture_thumbnail_cache: &mut HashMap<String, egui::TextureHandle>,
     icon_texture_cache: &HashMap<String, egui::TextureHandle>,
-    preferred_script_editor: &str,
+    _preferred_script_editor: &str,
     show_material_editor: &mut bool,
     show_foliage_editor: &mut bool,
     error_log: &mut Vec<String>,
@@ -215,9 +215,12 @@ pub fn render_content_browser_panel(
                                     }
                                     if resp.double_clicked() {
                                         if e.kind == "script" {
-                                            if let Err(err) = open_external_editor(preferred_script_editor, &e.path) {
-                                                error_log.push(format!("[Content] Open script failed: {}", err));
-                                            }
+                                            ctx.data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new("script_editor_open"),
+                                                    e.path.clone(),
+                                                )
+                                            });
                                         } else if e.kind == "material" {
                                             *show_material_editor = true;
                                         } else if e.kind == "foliage" {
@@ -243,6 +246,14 @@ pub fn render_content_browser_panel(
                                                 Ok(()) => error_log.push(format!("[Content] Prefab created: {}", prefab_path)),
                                                 Err(err) => error_log.push(format!("[Content] Prefab create failed: {}", err)),
                                             }
+                                        }
+if ui.button("Edit").clicked() && e.kind == "script" {
+                                            ctx.data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new("script_editor_open"),
+                                                    e.path.clone(),
+                                                )
+                                            });
                                         }
                                         if ui.button("Delete").clicked() {
                                             match fs::remove_file(&e.path) {
@@ -281,7 +292,12 @@ pub fn render_content_browser_panel(
                                     ui.separator();
                                     if ui.button("Open").clicked() {
                                         if e.kind == "script" {
-                                            let _ = open_external_editor(preferred_script_editor, &e.path);
+                                            ctx.data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new("script_editor_open"),
+                                                    e.path.clone(),
+                                                )
+                                            });
                                         } else if e.kind == "material" {
                                             *show_material_editor = true;
                                         } else if e.kind == "foliage" {

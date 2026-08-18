@@ -199,8 +199,9 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
         color += grain_noise * tonemap.grain * 0.03;
     }
 
-    // 8) Gamma correction â€” linear â†’ sRGB for display.
-    color = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+    // The target is an sRGB format (final_view and the swapchain), so wgpu
+    // encodes linear -> sRGB on write. Do NOT gamma-correct here — applying
+    // pow(1/2.2) AND the sRGB encode would double-brighten the image.
 
     return vec4<f32>(color, 1.0);
 }

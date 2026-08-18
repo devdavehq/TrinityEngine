@@ -26,7 +26,7 @@ use crate::environment::sky::{SkyParams, SkyUniformData};
 use crate::environment::clouds::{CloudParams, CloudUniformData};
 
 /// GPU-side uniform data for the sky shader.
-/// Total: 368 bytes (23 × vec4).
+/// Total: 384 bytes (24 × vec4).
 ///
 /// Layout must match SkyUniforms in sky.wgsl exactly.
 /// repr(C) ensures field ordering matches the WGSL struct.
@@ -34,7 +34,7 @@ use crate::environment::clouds::{CloudParams, CloudUniformData};
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyUniforms {
     /// Sky gradient colors and sun/moon/atmosphere data.
-    pub sky: SkyUniformData,          // 128 bytes
+    pub sky: SkyUniformData,          // 144 bytes
     /// Cloud layer parameters.
     pub cloud: CloudUniformData,       //  64 bytes
     /// Inverse view-projection matrix for ray reconstruction.
@@ -61,6 +61,7 @@ impl Default for SkyUniforms {
                 moon_direction: [0.0, 0.0, 0.0, 0.0],
                 atmosphere:    [0.1, 0.001, 0.01, 0.76],
                 stars_params:  [0.0, 0.5, 0.5, 4.0],
+                sky_visibility: [1.0, 1.0, 0.0, 0.0],
             },
             cloud: CloudUniformData {
                 params: [0.0, 2.0, 1.0, 1.0],
@@ -273,6 +274,46 @@ impl SkyRenderer {
             cloud_history_sampler,
             last_sky_color: [0.3, 0.5, 0.8],
         }
+    }
+
+    /// Recreate the cloud-history texture and bind group at a new window size.
+    /// Must be called from the main renderer's resize path, otherwise the
+    /// cloud-history copy overruns after the window grows.
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let cloud_history_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Cloud History"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let cloud_history_view = cloud_history_tex.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Sky BG"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&cloud_history_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.cloud_history_sampler),
+                },
+            ],
+        });
+        self.cloud_history_tex = cloud_history_tex;
+        self.cloud_history_view = cloud_history_view;
+        self.bind_group = bind_group;
     }
 
     /// Best-known average sky colour. The CPU light baker falls back to this

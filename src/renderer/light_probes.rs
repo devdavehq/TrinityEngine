@@ -38,6 +38,12 @@ pub struct LightProbe {
     // Which probe volume generated this probe (None = placed by hand).
     // Used to rebuild only the probes owned by an edited volume.
     pub from_volume: Option<usize>,
+    // Baked sky occlusion (Decima-style): fraction of the upper sky
+    // hemisphere blocked by geometry at this probe (0 = open sky, 1 =
+    // fully enclosed). Sampled as long-range ambient occlusion so rooms
+    // and underhangs read darker than the open world, which screen-space
+    // GTAO can't do. Filled by the bake; defaults to 1.0 for hand probes.
+    pub sky_occlusion: f32,
 }
 
 /// A boxed probe volume (HFW-style placement). You place a box over a room
@@ -75,6 +81,7 @@ impl LightProbeGrid {
             weight: 1.0,
             group: 0,
             from_volume: None,
+            sky_occlusion: 1.0,
         });
     }
 
@@ -145,6 +152,7 @@ impl LightProbeGrid {
                         weight: 1.0,
                         group: 0,
                         from_volume: Some(idx),
+                        sky_occlusion: 1.0,
                     });
                     added += 1;
                 }
