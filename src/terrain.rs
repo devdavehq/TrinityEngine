@@ -20,6 +20,7 @@ pub mod csg;
 pub mod erosion;
 pub mod foliage;
 pub mod spline;
+pub mod streaming;
 
 use crate::assets::{Handle, Mesh};
 use crate::components::{Collider, FoliageWind, Position, Renderable, RigidBody};

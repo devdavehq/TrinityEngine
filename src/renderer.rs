@@ -29,7 +29,7 @@ use winit::window::Window;
 use crate::assets::{AssetStore, Mesh};
 use crate::camera::Camera;
 use crate::animation::blending::BlendedPose;
-use crate::components::{Decal, MaterialTexture, PointLight, Position, Renderable, Rotation};
+use crate::components::{Decal, MaterialExtras, MaterialTexture, PointLight, Position, Renderable, Rotation};
 use crate::jobs::JobSystem;
 use crate::render::instancing::{InstanceData, InstancingManager};
 use hecs::World;
@@ -343,10 +343,14 @@ struct GpuMaterialExtras {
     clearcoat_roughness: f32,
     anisotropy:          f32,
     emissive_strength:   f32,
+    // Procedural world-space checkerboard (0 = off, 1 = on) + tile size.
+    checker:             f32,
+    checker_scale:       f32,
     // WGSL `_pad: vec3<f32>` has 16-byte alignment, so the shader struct is
-    // 48 bytes (fields at 0-20, vec3 aligned to offset 32, size 44 → 48).
-    // Keep the CPU-side struct at exactly 48 bytes to match.
-    _pad:                [f32; 7],
+    // still 48 bytes (7 named fields at 0-28, vec3 aligned to offset 32,
+    // size 44 → rounds to 48). Keep the CPU-side struct at exactly 48 bytes
+    // to match — only the named-field offsets need to agree byte-for-byte.
+    _pad:                [f32; 5],
 }
 
 // ── GpuWeatherData ────────────────────────────────────────────────────────
@@ -935,9 +939,6 @@ pub struct Renderer {
     probe_data_buf: wgpu::Buffer,
     /// Snow coverage value (0 = none, 1 = full) — set from WeatherState.
     snow_coverage: f32,
-    /// ── Default material extras buffer (group 1, binding 6) ───────────────
-    /// Used for entities that don't override material extras.
-    default_material_extras_buf: wgpu::Buffer,
     /// ── Velocity buffer (placeholder — zero-filled until geometry pass writes motion vectors) ──
     velocity_texture:  wgpu::Texture,
     velocity_view:     wgpu::TextureView,
@@ -1301,27 +1302,6 @@ impl Renderer {
             usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        // ── Default material extras buffer ─────────────────────────────────
-        // 32 bytes: all zeros = no SSS, no clearcoat, no emissive.
-        let default_material_extras = GpuMaterialExtras {
-            subsurface: 0.0,
-            clearcoat: 0.0,
-            clearcoat_roughness: 0.0,
-            anisotropy: 0.0,
-            emissive_strength: 0.0,
-            _pad: [0.0; 7],
-        };
-        let default_material_extras_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("Default Material Extras"),
-            size:               std::mem::size_of::<GpuMaterialExtras>() as u64,
-            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(
-            &default_material_extras_buf, 0,
-            bytemuck::bytes_of(&default_material_extras),
-        );
 
         // ── Weather uniform buffer (binding 13) ───────────────────────────
         // 16 bytes: snow_coverage + pad.
@@ -2696,7 +2676,6 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             probe_control_buf,
             probe_data_buf,
             snow_coverage: 0.0,
-            default_material_extras_buf,
             sky_params: crate::environment::sky::SkyParams::default(),
             cloud_params: crate::environment::clouds::CloudParams::default(),
             storm_darken: 0.0,
@@ -3792,6 +3771,7 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 } else {
                     (self.default_mr_view.clone(), self.default_mr_sampler.clone())
                 };
+                let extras_buf = self.material_extras_buffer(world, *rep_entity);
                 let material_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Material BG"),
                     layout: &self.material_bgl,
@@ -3802,7 +3782,7 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&normal_sampler) },
                         wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mr_view) },
                         wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&mr_sampler) },
-                        wgpu::BindGroupEntry { binding: 6, resource: self.default_material_extras_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: extras_buf.as_entire_binding() },
                     ],
                 });
                 pass.set_bind_group(1, &material_bg, &[]);
@@ -3904,6 +3884,7 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     } else {
                         (self.default_mr_view.clone(), self.default_mr_sampler.clone())
                     };
+                    let extras_buf = self.material_extras_buffer(world, *sk_entity);
                     let material_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Skinned Material BG"),
                         layout: &self.material_bgl,
@@ -3914,7 +3895,7 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&normal_sampler) },
                             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mr_view) },
                             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&mr_sampler) },
-                            wgpu::BindGroupEntry { binding: 6, resource: self.default_material_extras_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 6, resource: extras_buf.as_entire_binding() },
                         ],
                     });
                     pass.set_bind_group(1, &material_bg, &[]);
@@ -5695,6 +5676,46 @@ usage: wgpu::TextureUsages::RENDER_ATTACHMENT
         cache.remove(&format!("lin|{}", path));
     }
 
+    /// Build a small per-draw uniform buffer from `entity`'s `MaterialExtras`
+    /// component (subsurface/clearcoat/emissive/checker), falling back to
+    /// all-zero engine defaults if the entity has none.
+    ///
+    /// This is recreated per batch rather than shared, because binding 6 has
+    /// no dynamic-offset path yet — each draw needs its own uniform buffer to
+    /// see its own entity's extras rather than whatever the last batch wrote.
+    fn material_extras_buffer(&self, world: &World, entity: hecs::Entity) -> wgpu::Buffer {
+        let extras = match world.get::<&MaterialExtras>(entity) {
+            Ok(mx) => GpuMaterialExtras {
+                subsurface:          mx.subsurface,
+                clearcoat:           mx.clearcoat,
+                clearcoat_roughness: mx.clearcoat_roughness,
+                anisotropy:          0.0,
+                emissive_strength:   mx.emissive_strength,
+                checker:             mx.checker,
+                checker_scale:       mx.checker_scale.max(0.01),
+                _pad:                [0.0; 5],
+            },
+            Err(_) => GpuMaterialExtras {
+                subsurface:          0.0,
+                clearcoat:           0.0,
+                clearcoat_roughness: 0.0,
+                anisotropy:          0.0,
+                emissive_strength:   0.0,
+                checker:             0.0,
+                checker_scale:       1.0,
+                _pad:                [0.0; 5],
+            },
+        };
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Per-Draw Material Extras"),
+            size:               std::mem::size_of::<GpuMaterialExtras>() as u64,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::bytes_of(&extras));
+        buf
+    }
+
     fn get_or_load_texture(&self, path: &str, srgb: bool) -> Option<(wgpu::TextureView, wgpu::Sampler)> {
         if path.is_empty() {
             return None;
@@ -6114,7 +6135,7 @@ fn create_post_pipeline(
     })
 }
 
-fn simplify_triangle_soup_preserve_shape(
+pub(crate) fn simplify_triangle_soup_preserve_shape(
     vertices: &[crate::assets::mesh::Vertex],
     keep_ratio: f32,
 ) -> Vec<crate::assets::mesh::Vertex> {

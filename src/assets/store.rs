@@ -95,24 +95,22 @@ impl<T> AssetStore<T> {
         self.refs.get(&handle.id).copied().unwrap_or(0)
     }
 
-    /// Remove every asset whose refcount reached zero. `protected` holds the
-    /// store IDs of assets still pinned by the primary scene or mesh cache —
-    /// those are never evicted even if a level released them, because the
-    /// cache dedups by path and other callers may hold them. Returns the
-    /// number of assets evicted.
-    pub fn evict_unused(&mut self, protected: &std::collections::HashSet<u32>) -> usize {
+    /// Remove every asset whose refcount reached zero AND that isn't
+    /// referenced by any live entity (the `live` set of mesh store IDs still
+    /// in use by the world — primary scene included). Returns the IDs that
+    /// were evicted so callers can also prune their dedup caches.
+    pub fn evict_unused(&mut self, live: &std::collections::HashSet<u32>) -> Vec<u32> {
         let to_remove: Vec<u32> = self
             .refs
             .iter()
-            .filter(|(id, r)| **r == 0 && !protected.contains(id))
+            .filter(|(id, r)| **r == 0 && !live.contains(id))
             .map(|(id, _)| *id)
             .collect();
-        let n = to_remove.len();
-        for id in to_remove {
-            self.assets.remove(&id);
-            self.refs.remove(&id);
+        for id in &to_remove {
+            self.assets.remove(id);
+            self.refs.remove(id);
         }
-        n
+        to_remove
     }
 
     /// Iterate the assets in the store (immutable).

@@ -172,6 +172,7 @@ pub fn render_levels_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs) {
                                         }
                                         let _ = args.levels.level_manager.release_level_meshes(
                                             id,
+                                            args.world,
                                             args.meshes,
                                             args.mesh_cache,
                                         );
@@ -557,6 +558,7 @@ pub fn render_levels_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs) {
                         let _ = args.levels.level_manager.despawn_level(id, args.world);
                         let _ = args.levels.level_manager.release_level_meshes(
                             id,
+                            args.world,
                             args.meshes,
                             args.mesh_cache,
                         );

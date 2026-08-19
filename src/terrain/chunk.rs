@@ -61,17 +61,7 @@ pub fn new_grid(
 
     for cz in 0..chunks_z as i32 {
         for cx in 0..chunks_x as i32 {
-            chunks.insert(
-                (cx, cz),
-                TerrainChunk {
-                    offset_x: cx,
-                    offset_z: cz,
-                    size: chunk_size,
-                    lod_level: 0,
-                    heights: vec![0.0; chunk_size * chunk_size],
-                    dirty: false,
-                },
-            );
+            chunks.insert((cx, cz), blank_chunk(cx, cz, chunk_size));
         }
     }
 
@@ -81,6 +71,46 @@ pub fn new_grid(
         total_width,
         total_depth,
         cell_size,
+    }
+}
+
+/// Creates a [`ChunkGrid`] with the same bounds as `new_grid` but with **no
+/// chunks populated** — the grid knows its full extent (for bounds-checking
+/// and streaming math) but starts empty, so nothing is resident in memory
+/// until `terrain::streaming` loads chunks in around the player.
+///
+/// Use `new_grid` for terrains small enough to just keep entirely resident
+/// (the common case); use this for open-world regions large enough that
+/// holding every chunk in memory forever stops being reasonable.
+pub fn new_grid_streamed(
+    total_width: usize,
+    total_depth: usize,
+    chunk_size: usize,
+    cell_size: f32,
+) -> ChunkGrid {
+    assert!(chunk_size > 0, "chunk_size must be > 0");
+    assert!(total_width % chunk_size == 0, "total_width must be divisible by chunk_size");
+    assert!(total_depth % chunk_size == 0, "total_depth must be divisible by chunk_size");
+    ChunkGrid {
+        chunk_size,
+        chunks: HashMap::new(),
+        total_width,
+        total_depth,
+        cell_size,
+    }
+}
+
+/// A freshly-generated chunk at LOD 0 with a flat zero heightmap — the same
+/// default `new_grid` populates every slot with, factored out so streaming
+/// can create the same thing on demand for a chunk with no saved edits yet.
+pub fn blank_chunk(chunk_x: i32, chunk_z: i32, chunk_size: usize) -> TerrainChunk {
+    TerrainChunk {
+        offset_x: chunk_x,
+        offset_z: chunk_z,
+        size: chunk_size,
+        lod_level: 0,
+        heights: vec![0.0; chunk_size * chunk_size],
+        dirty: false,
     }
 }
 

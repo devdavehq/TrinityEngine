@@ -97,7 +97,6 @@ impl RigidBody {
         body
     }
 
-    #[allow(dead_code)]
     pub fn static_body() -> Self {
         let mut body = Self::dynamic();
         body.body_type = BodyType::Static;
@@ -517,6 +516,12 @@ pub struct MaterialExtras {
     pub clearcoat_roughness: f32,
     /// Emissive intensity multiplier (0 = none, 10 = very bright).
     pub emissive_strength: f32,
+    /// Procedural world-space checkerboard pattern (0 = off, 1 = on).
+    /// Shades alternate between near-white and gray so it reads like the
+    /// UE5 default checker material — great for scale/UV testing.
+    pub checker: f32,
+    /// World-space size of one checker tile (0.5 = 50cm tiles, 1.0 = 1m tiles).
+    pub checker_scale: f32,
 }
 
 impl Default for MaterialExtras {
@@ -526,6 +531,8 @@ impl Default for MaterialExtras {
             clearcoat: 0.0,
             clearcoat_roughness: 0.0,
             emissive_strength: 0.0,
+            checker: 0.0,
+            checker_scale: 1.0,
         }
     }
 }

@@ -117,6 +117,9 @@ enum EditorDockTab {
     Console,
     ScriptEditor,
     Levels,
+    NavMesh,
+    Decals,
+    SaveSlots,
 }
 
 pub struct EditorUi {
@@ -256,6 +259,18 @@ pub struct UiFrameArgs<'a> {
     pub bake_requested: &'a mut bool,
     /// Level manager + streaming config, edited by the Levels panel.
     pub levels: &'a mut crate::engine_subsystems::LevelState,
+    /// Baked navmesh (triangle count / extents) for the NavMesh panel's
+    /// read-only stats — rebuilding it goes through `nav_rebuild_requested`.
+    pub navmesh: &'a crate::navmesh::NavMesh,
+    /// Save-slot manager for the Save/Load panel.
+    pub save_slots: &'a crate::save_slots::SaveSlots,
+    /// Set by the Save/Load panel to (slot, label); the main loop performs
+    /// the actual save next frame (it needs full `&mut self`, not just the
+    /// slice `UiFrameArgs` exposes).
+    pub save_slot_requested: &'a mut Option<(u32, String)>,
+    /// Set by the Save/Load panel; the main loop performs the actual load
+    /// next frame, same reasoning as `save_slot_requested`.
+    pub load_slot_requested: &'a mut Option<u32>,
 }
 
 fn nearly_eq(a: f32, b: f32) -> bool {
@@ -1736,6 +1751,9 @@ fn build_ui(
                     EditorDockTab::Console => "OUTPUT".into(),
                     EditorDockTab::ScriptEditor => "SCRIPT EDITOR".into(),
                     EditorDockTab::Levels => "LEVELS".into(),
+                    EditorDockTab::NavMesh => "NAVMESH".into(),
+                    EditorDockTab::Decals => "DECALS".into(),
+                    EditorDockTab::SaveSlots => "SAVE / LOAD".into(),
                 }
             }
 
@@ -1837,6 +1855,15 @@ fn build_ui(
                     }
                     EditorDockTab::Levels => {
                         panels::render_levels_panel(ui, self.args);
+                    }
+                    EditorDockTab::NavMesh => {
+                        panels::render_navmesh_panel(ui, self.args);
+                    }
+                    EditorDockTab::Decals => {
+                        panels::render_decals_panel(ui, self.args);
+                    }
+                    EditorDockTab::SaveSlots => {
+                        panels::render_save_slots_panel(ui, self.args);
                     }
                 }
             }
@@ -3063,18 +3090,12 @@ UiWidgetKind::Slider => {
             ui.label(format!("Assets: {}", asset_db.entries.len()));
             ui.label(format!("Icons: {}", icon_registry.icons.len()));
             ui.separator();
-            ui.label("Workspace");
-            if ui.selectable_label(*workspace_preset == "Default", "Default").clicked() {
-                *workspace_preset = "Default".to_string();
-                apply_workspace_preset(dock_state, workspace_preset);
-            }
-            if ui.selectable_label(*workspace_preset == "Level Design", "Level Design").clicked() {
-                *workspace_preset = "Level Design".to_string();
-                apply_workspace_preset(dock_state, workspace_preset);
-            }
-            if ui.selectable_label(*workspace_preset == "Scripting", "Scripting").clicked() {
-                *workspace_preset = "Scripting".to_string();
-                apply_workspace_preset(dock_state, workspace_preset);
+            ui.label("Mode");
+            for mode in WORKSPACE_MODES {
+                if ui.selectable_label(*workspace_preset == mode, mode).clicked() {
+                    *workspace_preset = mode.to_string();
+                    apply_workspace_preset(dock_state, workspace_preset);
+                }
             }
         });
     });
@@ -3147,6 +3168,9 @@ UiWidgetKind::Slider => {
                 EditorDockTab::Console => "[log] Console".into(),
                 EditorDockTab::ScriptEditor => "[sc] Script Editor".into(),
                 EditorDockTab::Levels => "[lv] Levels".into(),
+                EditorDockTab::NavMesh => "[nm] NavMesh".into(),
+                EditorDockTab::Decals => "[dc] Decals".into(),
+                EditorDockTab::SaveSlots => "[sv] Save / Load".into(),
             }
         }
         fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
@@ -3254,6 +3278,15 @@ UiWidgetKind::Slider => {
                 }
                 EditorDockTab::Levels => {
                     panels::render_levels_panel(ui, self.args);
+                }
+                EditorDockTab::NavMesh => {
+                    panels::render_navmesh_panel(ui, self.args);
+                }
+                EditorDockTab::Decals => {
+                    panels::render_decals_panel(ui, self.args);
+                }
+                EditorDockTab::SaveSlots => {
+                    panels::render_save_slots_panel(ui, self.args);
                 }
             }
         }
@@ -3891,6 +3924,17 @@ UiWidgetKind::Slider => {
                         let _ = args.world.insert(entity, (extras,));
                     }
                 }
+                if ui.button("Apply checker_gray")
+                    .on_hover_text("UE5-style gray checkerboard — no texture needed, great for judging scale and UVs.")
+                    .clicked()
+                {
+                    if let Ok(mut rend) = args.world.get::<&mut components::Renderable>(entity) {
+                        let _ = args.materials.apply_instance("checker_gray", &mut rend);
+                    }
+                    if let Ok(extras) = args.materials.instance_extras("checker_gray") {
+                        let _ = args.world.insert(entity, (extras,));
+                    }
+                }
                 ui.separator();
                 ui.label("Texture slots");
                 let (albedo_label, normal_label, mr_label) =
@@ -4040,6 +4084,7 @@ UiWidgetKind::Slider => {
                 thumbnail_card(ui, "MAT", "matte_black", Some(Color32::from_rgb(18, 18, 18)));
                 thumbnail_card(ui, "MAT", "silver_brushed", Some(Color32::from_rgb(180, 180, 190)));
                 thumbnail_card(ui, "MAT", "foliage_leaf", Some(Color32::from_rgb(48, 120, 58)));
+                thumbnail_card(ui, "MAT", "checker_gray", Some(Color32::from_rgb(158, 158, 158)));
                 if let Ok(entries) = fs::read_dir(args.scripts_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
@@ -4085,7 +4130,7 @@ UiWidgetKind::Slider => {
                         let path = entry.path();
                         let p = path.to_string_lossy().to_string();
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-                        if ext == "obj" {
+                        if matches!(ext.as_str(), "obj" | "gltf" | "glb") {
                             let selected = mesh_selected.as_ref().map(|s| s == &p).unwrap_or(false);
                             let col = mesh_thumb_color(mesh_thumbnail_color_cache, &p);
                             thumbnail_card(ui, "MESH", &path.file_name().unwrap_or_default().to_string_lossy(), Some(col));
@@ -4126,7 +4171,43 @@ UiWidgetKind::Slider => {
                             }
                         };
                         let c = terrain_color_at_cursor(args);
-                        let _ = spawn_mesh_entity(args, handle, [1.0, 1.0, 1.0], c, true);
+                        let _ = spawn_mesh_entity(args, handle, [1.0, 1.0, 1.0], c, PrimitivePhysics::Dynamic, &key);
+                    }
+                    if ui.button("Import as Photogrammetry Scan")
+                        .on_hover_text(format!(
+                            "Loads the selected OBJ/glTF scan and auto-decimates it to {} triangles \
+                             with the edge-collapse simplifier (raw scans are usually far too dense to \
+                             place as-is). If a texture is selected in the browser, it's applied as albedo.",
+                            PHOTOGRAMMETRY_MAX_TRIANGLES
+                        ))
+                        .clicked()
+                    {
+                        let key = mesh_path.replace('\\', "/");
+                        // Encode the decimation budget into the mesh path so
+                        // scene save/load regenerates this same simplified
+                        // mesh later — see the "?scan_tris=" handling in
+                        // Mesh::load.
+                        let import_path = format!("{}?scan_tris={}", key, PHOTOGRAMMETRY_MAX_TRIANGLES);
+                        match assets::Mesh::load(&import_path) {
+                            Ok(mesh) => {
+                                let source_tris = assets::Mesh::load(&key).map(|m| m.vertices.len() / 3).unwrap_or(0);
+                                let final_tris = mesh.vertices.len() / 3;
+                                let h = args.meshes.add(mesh);
+                                args.mesh_cache.insert(import_path.clone(), h);
+                                let c = terrain_color_at_cursor(args);
+                                let _ = spawn_mesh_entity(args, h, [1.0, 1.0, 1.0], c, PrimitivePhysics::Static, &import_path);
+                                tracing::info!(
+                                    "[Photogrammetry] Imported {} -> {} tris (from {} tris).",
+                                    key, final_tris, source_tris
+                                );
+                                if let (Some(entity), Some(tex)) = (*args.selected_renderable, texture_selected.clone()) {
+                                    upsert_albedo_texture(args.world, entity, tex);
+                                }
+                            }
+                            Err(err) => {
+                                args.error_log.push(format!("[Photogrammetry] Scan import failed {}: {}", key, err));
+                            }
+                        }
                     }
                 }
                 if ui.button("Add foliage ring").clicked() {
@@ -4154,26 +4235,108 @@ UiWidgetKind::Slider => {
                     editor::add_foliage_patch(args.world, args.meshes, args.mesh_cache);
                 }
                 if ui.button("Add Cube").clicked() {
-                    let _ = spawn_primitive(args, [1.0, 1.0, 1.0], [0.78, 0.80, 0.84], false);
+                    let _ = spawn_primitive(args, [1.0, 1.0, 1.0], [0.78, 0.80, 0.84], PrimitivePhysics::None);
                 }
-                if ui.button("Add Plane").clicked() {
+                if ui.button("Add Plane")
+                    .on_hover_text("Flat, walkable ground slab — static collider included.")
+                    .clicked()
+                {
                     let c = terrain_color_at_cursor(args);
-                    let mesh = assets::Mesh::make_plane(1.0, 1.0);
-                    let handle = args.meshes.add(mesh);
-                    let _ = spawn_mesh_entity(args, handle, [6.0, 1.0, 6.0], c, false);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_plane.obj",
+                        assets::Mesh::make_plane(1.0, 1.0),
+                        // Y-scale is visually inert (the plane mesh has zero
+                        // thickness) but sizes the static collider slab below.
+                        [6.0, 0.2, 6.0],
+                        c,
+                        PrimitivePhysics::Static,
+                    );
                 }
                 if ui.button("Add Capsule").clicked() {
                     let c = terrain_color_at_cursor(args);
-                    let mesh = assets::Mesh::make_capsule(0.35, 0.55, 12, 20);
-                    let handle = args.meshes.add(mesh);
-                    let _ = spawn_mesh_entity(args, handle, [1.0, 1.0, 1.0], c, true);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_capsule.obj",
+                        assets::Mesh::make_capsule(0.35, 0.55, 12, 20),
+                        [1.0, 1.0, 1.0],
+                        c,
+                        PrimitivePhysics::Dynamic,
+                    );
                 }
-                if ui.button("Add Floor").clicked() {
+                if ui.button("Add Sphere").clicked() {
                     let c = terrain_color_at_cursor(args);
-                    let _ = spawn_primitive(args, [4.0, 0.2, 4.0], c, false);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_sphere.obj",
+                        assets::Mesh::make_sphere(0.5, 12, 20),
+                        [1.0, 1.0, 1.0],
+                        c,
+                        PrimitivePhysics::Dynamic,
+                    );
+                }
+                if ui.button("Add Cylinder").clicked() {
+                    let c = terrain_color_at_cursor(args);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_cylinder.obj",
+                        assets::Mesh::make_cylinder(0.5, 0.5, 20),
+                        [1.0, 1.0, 1.0],
+                        c,
+                        PrimitivePhysics::Dynamic,
+                    );
+                }
+                if ui.button("Add Cone").clicked() {
+                    let c = terrain_color_at_cursor(args);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_cone.obj",
+                        assets::Mesh::make_cone(0.5, 1.0, 20),
+                        [1.0, 1.0, 1.0],
+                        c,
+                        PrimitivePhysics::Dynamic,
+                    );
+                }
+                if ui.button("Add Tunnel Arch")
+                    .on_hover_text("A walkable corridor segment (floor + walls + arched roof). Stack several end-to-end to build straight caves without any imported meshes.")
+                    .clicked()
+                {
+                    let c = terrain_color_at_cursor(args);
+                    let _ = spawn_builtin_primitive(
+                        args,
+                        "meshes/primitive_tunnel.obj",
+                        assets::Mesh::make_tunnel_arch(4.0, 2.0, 8.0, 20),
+                        [1.0, 1.0, 1.0],
+                        c,
+                        PrimitivePhysics::None,
+                    );
+                    // The tunnel mesh is a hollow U-channel baked at real-world
+                    // size (4m wide, 8m deep) rather than unit size, so the
+                    // generic scale-derived AABB collider (which assumes scale
+                    // == real size) would seal the whole corridor shut as one
+                    // solid block. Attach a thin floor-only slab by hand instead
+                    // so the corridor is walkable but the arch stays open.
+                    if let Some(entity) = *args.selected_renderable {
+                        let mut body = components::RigidBody::static_body();
+                        body.friction = 0.6;
+                        let _ = args.world.insert(
+                            entity,
+                            (
+                                body,
+                                components::Collider { half_w: 2.0, half_h: 0.1, half_d: 4.0, layer: 1, mask: 1 },
+                            ),
+                        );
+                    }
+                }
+                if ui.button("Add Floor")
+                    .on_hover_text("Solid, walkable ground slab — static collider included.")
+                    .clicked()
+                {
+                    let c = terrain_color_at_cursor(args);
+                    let _ = spawn_primitive(args, [4.0, 0.2, 4.0], c, PrimitivePhysics::Static);
                 }
                 if ui.button("Add Physics Cube").clicked() {
-                    let _ = spawn_primitive(args, [1.0, 1.0, 1.0], [0.72, 0.75, 0.80], true);
+                    let _ = spawn_primitive(args, [1.0, 1.0, 1.0], [0.72, 0.75, 0.80], PrimitivePhysics::Dynamic);
                 }
                 if ui.button("Apply Selected Texture -> Selected Mesh").clicked() {
                     if let (Some(entity), Some(tex)) = (args.selected_renderable.as_ref().copied(), texture_selected.clone()) {
@@ -4273,6 +4436,8 @@ UiWidgetKind::Slider => {
                 *snap_scale,
             );
         }
+        // Portal trigger-volume outlines (wireframe overlay).
+        draw_portal_volumes(ui, args, rect);
     };
     if !*undock_viewport {
         egui::CentralPanel::default().show(ctx, |ui| draw_viewport_panel(ui));
@@ -4969,6 +5134,13 @@ fn load_saved_dock_layout() -> Option<(String, DockState<EditorDockTab>)> {
     Some((f.workspace_preset, f.dock_state))
 }
 
+/// Named editor modes, in toolbar order — the Unreal-style "mode toolbox"
+/// switcher. Each one reconfigures which panels are docked via
+/// `apply_workspace_preset`; docking/undocking within a mode still works
+/// exactly like before, this only changes what starts visible.
+const WORKSPACE_MODES: [&str; 5] =
+    ["Default", "Level Design", "Scripting", "AI & Navigation", "Save & Load"];
+
 fn apply_workspace_preset(dock_state: &mut DockState<EditorDockTab>, preset: &str) {
     match preset {
         "Level Design" => {
@@ -4981,13 +5153,31 @@ fn apply_workspace_preset(dock_state: &mut DockState<EditorDockTab>, preset: &st
                 .split_right(main, 0.30, vec![EditorDockTab::Details, EditorDockTab::Profiler]);
             dock_state
                 .main_surface_mut()
-                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::ContentBrowser, EditorDockTab::Levels]);
+                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::ContentBrowser, EditorDockTab::Levels, EditorDockTab::Decals]);
         }
         "Scripting" => {
             *dock_state = DockState::new(vec![EditorDockTab::ContentBrowser, EditorDockTab::Console]);
             dock_state
                 .main_surface_mut()
                 .split_right(NodeIndex::root(), 0.55, vec![EditorDockTab::Viewport]);
+        }
+        "AI & Navigation" => {
+            *dock_state = DockState::new(vec![EditorDockTab::Viewport]);
+            let [main, _left] = dock_state
+                .main_surface_mut()
+                .split_left(NodeIndex::root(), 0.22, vec![EditorDockTab::Outliner]);
+            dock_state
+                .main_surface_mut()
+                .split_right(main, 0.28, vec![EditorDockTab::Details, EditorDockTab::NavMesh]);
+            dock_state
+                .main_surface_mut()
+                .split_below(NodeIndex::root(), 0.72, vec![EditorDockTab::Console]);
+        }
+        "Save & Load" => {
+            *dock_state = DockState::new(vec![EditorDockTab::SaveSlots]);
+            dock_state
+                .main_surface_mut()
+                .split_right(NodeIndex::root(), 0.45, vec![EditorDockTab::Console]);
         }
         _ => {
             *dock_state = DockState::new(vec![EditorDockTab::Viewport]);
@@ -5221,6 +5411,100 @@ pub(crate) fn project_to_screen(camera: &dyn Camera, rect: egui::Rect, world: gl
     let sx = rect.left() + ((ndc.x + 1.0) * 0.5) * rect.width();
     let sy = rect.top() + ((1.0 - (ndc.y + 1.0) * 0.5) * rect.height());
     Some(egui::pos2(sx, sy))
+}
+
+/// Build the 3D wireframe line segments of a portal's trigger volume.
+fn portal_wireframe_segments(
+    portal: &crate::levels::portal::LevelPortal,
+) -> Vec<[glam::Vec3; 2]> {
+    let mut segs: Vec<[glam::Vec3; 2]> = Vec::new();
+    let c = glam::Vec3::from_array(portal.position);
+
+    let push_circle = |segs: &mut Vec<[glam::Vec3; 2]>,
+                       center: glam::Vec3,
+                       r: f32,
+                       u: glam::Vec3,
+                       v: glam::Vec3,
+                       n: usize| {
+        let mut prev = center + u * r;
+        for i in 1..=n {
+            let a = (i as f32 / n as f32) * std::f32::consts::TAU;
+            let p = center + (u * a.cos() + v * a.sin()) * r;
+            segs.push([prev, p]);
+            prev = p;
+        }
+    };
+
+    match portal.shape {
+        crate::levels::portal::PortalShape::Sphere => {
+            let r = portal.trigger_radius;
+            push_circle(&mut segs, c, r, glam::Vec3::X, glam::Vec3::Y, 24);
+            push_circle(&mut segs, c, r, glam::Vec3::X, glam::Vec3::Z, 24);
+            push_circle(&mut segs, c, r, glam::Vec3::Y, glam::Vec3::Z, 24);
+        }
+        crate::levels::portal::PortalShape::Box => {
+            let e = portal.box_extents;
+            let xs = [c.x - e[0], c.x + e[0]];
+            let ys = [c.y - e[1], c.y + e[1]];
+            let zs = [c.z - e[2], c.z + e[2]];
+            let corners = [
+                glam::Vec3::new(xs[0], ys[0], zs[0]),
+                glam::Vec3::new(xs[1], ys[0], zs[0]),
+                glam::Vec3::new(xs[0], ys[1], zs[0]),
+                glam::Vec3::new(xs[1], ys[1], zs[0]),
+                glam::Vec3::new(xs[0], ys[0], zs[1]),
+                glam::Vec3::new(xs[1], ys[0], zs[1]),
+                glam::Vec3::new(xs[0], ys[1], zs[1]),
+                glam::Vec3::new(xs[1], ys[1], zs[1]),
+            ];
+            const EDGES: [(usize, usize); 12] = [
+                (0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+                (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7),
+            ];
+            for (a, b) in EDGES {
+                segs.push([corners[a], corners[b]]);
+            }
+        }
+        crate::levels::portal::PortalShape::Capsule => {
+            let r = portal.capsule_radius;
+            let hh = portal.capsule_half_height;
+            let top = c + glam::Vec3::Y * hh;
+            let bottom = c - glam::Vec3::Y * hh;
+            push_circle(&mut segs, top, r, glam::Vec3::X, glam::Vec3::Z, 24);
+            push_circle(&mut segs, bottom, r, glam::Vec3::X, glam::Vec3::Z, 24);
+            for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let a = c + glam::Vec3::new(dx * r, hh, dz * r);
+                let b = c + glam::Vec3::new(dx * r, -hh, dz * r);
+                segs.push([a, b]);
+            }
+        }
+    }
+    segs
+}
+
+/// Draw every portal's trigger volume as a wireframe overlay in the viewport.
+/// Active portals are cyan; inactive ones are grey.
+fn draw_portal_volumes(ui: &mut egui::Ui, args: &UiFrameArgs<'_>, rect: egui::Rect) {
+    if args.levels.portals.is_empty() {
+        return;
+    }
+    let p = ui.painter();
+    for portal in &args.levels.portals {
+        let col = if portal.active {
+            egui::Color32::from_rgba_unmultiplied(80, 210, 255, 230)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(130, 130, 140, 160)
+        };
+        let stroke = egui::Stroke::new(1.6, col);
+        for [a, b] in portal_wireframe_segments(portal) {
+            if let (Some(pa), Some(pb)) = (
+                project_to_screen(args.camera, rect, a),
+                project_to_screen(args.camera, rect, b),
+            ) {
+                p.line_segment([pa, pb], stroke);
+            }
+        }
+    }
 }
 
 /// Unprojects a screen point onto the world plane passing through
@@ -5783,11 +6067,29 @@ fn mesh_thumb_color(cache: &mut HashMap<String, Color32>, path: &str) -> Color32
     col
 }
 
+/// Default triangle budget for "Import as Photogrammetry Scan" — raw scan
+/// exports routinely land in the hundreds of thousands to millions of
+/// triangles, far too dense to place directly, so imports are auto-decimated
+/// down to this via the edge-collapse simplifier (see `Mesh::import_scan`).
+const PHOTOGRAMMETRY_MAX_TRIANGLES: usize = 50_000;
+
+/// Physics behavior to attach to a spawned primitive.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrimitivePhysics {
+    /// No collider — pure visual (decals, backdrops).
+    None,
+    /// Solid and immovable — ground the player can stand and walk on
+    /// (floors, planes, tunnel-arch corridors).
+    Static,
+    /// Falls and reacts to forces — physics playground props.
+    Dynamic,
+}
+
 fn spawn_primitive(
     args: &mut UiFrameArgs<'_>,
     scale: [f32; 3],
     color: [f32; 3],
-    with_physics: bool,
+    physics: PrimitivePhysics,
 ) -> Result<(), String> {
     let mesh_path = "meshes/cube.obj".to_string();
     let handle = if let Some(h) = args.mesh_cache.get(&mesh_path).copied() {
@@ -5795,11 +6097,32 @@ fn spawn_primitive(
     } else {
         let mesh = assets::Mesh::load(&mesh_path).map_err(|e| e.to_string())?;
         let h = args.meshes.add(mesh);
-        args.mesh_cache.insert(mesh_path, h);
+        args.mesh_cache.insert(mesh_path.clone(), h);
         h
     };
 
-    spawn_mesh_entity(args, handle, scale, color, with_physics)
+    spawn_mesh_entity(args, handle, scale, color, physics, &mesh_path)
+}
+
+/// Spawn a built-in procedural primitive. The generated mesh is cached under
+/// `path` so repeated clicks share one GPU mesh and the entity round-trips
+/// through scene save/load via `Mesh::load`'s primitive dispatch.
+fn spawn_builtin_primitive(
+    args: &mut UiFrameArgs<'_>,
+    path: &str,
+    mesh: assets::Mesh,
+    scale: [f32; 3],
+    color: [f32; 3],
+    physics: PrimitivePhysics,
+) -> Result<(), String> {
+    let handle = if let Some(h) = args.mesh_cache.get(path).copied() {
+        h
+    } else {
+        let h = args.meshes.add(mesh);
+        args.mesh_cache.insert(path.to_string(), h);
+        h
+    };
+    spawn_mesh_entity(args, handle, scale, color, physics, path)
 }
 
 fn spawn_mesh_entity(
@@ -5807,17 +6130,27 @@ fn spawn_mesh_entity(
     handle: assets::Handle<assets::Mesh>,
     scale: [f32; 3],
     color: [f32; 3],
-    with_physics: bool,
+    physics: PrimitivePhysics,
+    mesh_path: &str,
 ) -> Result<(), String> {
     let x = args.terrain_cursor_x as f32 * args.terrain_world.cell_size - 32.0;
     let z = args.terrain_cursor_z as f32 * args.terrain_world.cell_size - 32.0;
     let y = args.terrain_world.height_at(x, z) + 0.5;
+    let name = std::path::Path::new(mesh_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("primitive")
+        .to_string();
     let entity = args.world.spawn((
         components::Position { x, y, z },
         components::Rotation {
             pitch: 0.0,
             yaw: 0.0,
             roll: 0.0,
+        },
+        components::SceneMeta {
+            name,
+            mesh_path: mesh_path.to_string(),
         },
         components::Renderable {
             mesh: handle,
@@ -5828,8 +6161,14 @@ fn spawn_mesh_entity(
             scale,
         },
     ));
-    if with_physics {
-        let mut body = components::RigidBody::dynamic();
+    if physics != PrimitivePhysics::None {
+        // Static -> immovable ground the player can walk on (floors, planes,
+        // tunnel-arch corridors). Dynamic -> falls/reacts like a physics prop.
+        let mut body = if physics == PrimitivePhysics::Static {
+            components::RigidBody::static_body()
+        } else {
+            components::RigidBody::dynamic()
+        };
         body.friction = 0.6;
         let _ = args.world.insert(
             entity,

@@ -1147,6 +1147,14 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
             ui.add(egui::Slider::new(&mut mx.clearcoat, 0.0..=1.0).text("Clearcoat"));
             ui.add(egui::Slider::new(&mut mx.clearcoat_roughness, 0.0..=1.0).text("Clearcoat roughness"));
             ui.add(egui::Slider::new(&mut mx.emissive_strength, 0.0..=10.0).text("Emissive strength"));
+            ui.separator();
+            let mut checker_on = mx.checker > 0.5;
+            if ui.checkbox(&mut checker_on, "Checkerboard (UE5-style debug grid)").changed() {
+                mx.checker = if checker_on { 1.0 } else { 0.0 };
+            }
+            if checker_on {
+                ui.add(egui::Slider::new(&mut mx.checker_scale, 0.05..=10.0).text("Checker tile size (m)"));
+            }
             ui.label(
                 RichText::new("Values are uploaded to the GPU as material_extras (binding 6).")
                     .small()
@@ -1157,6 +1165,8 @@ pub fn render_details_panel(ui: &mut egui::Ui, args: &mut UiFrameArgs<'_>) {
                 mx.clearcoat = 0.0;
                 mx.clearcoat_roughness = 0.0;
                 mx.emissive_strength = 0.0;
+                mx.checker = 0.0;
+                mx.checker_scale = 1.0;
             }
             if ui.button("Remove material extras").clicked() {
                 remove_mx = true;

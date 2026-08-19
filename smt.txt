@@ -828,25 +828,6 @@ hope i can run the engine and i will see the editor and hope i can install the e
 Want me to start with the bundle script (fast, gets you to Steam-ready folders) and then the light baker (the real fidelity lift)? Say the word and I'll build the bundle script first.
 
 
-1. Decals (bullet holes, dirt, wetness)
-2. Data-driven game data (skill trees, item tables, mission data in editable formats)
-3. Crowds/social AI (groups of NPCs, not just one-off AI)
-4. Save-game + checkpoint system
-5. Audio pipeline (footsteps, reverb, streaming music)
-6. UI toolkit + text localization
-7. Content pipeline tooling (bake task scheduler, asset auditing)
-8. Performance budget tools (the framebench they use to hit fidelity targets)
-
-
-
-1. Real GI / bounced light. Decima's signature is ray-traced GI hybridized with baked irradiance volumes. Your only bounce source is baked SH probes (see below) + a "voxel GI" hash hack (deferred.wgsl:523). No real-time GI, no RTX, no voxel cone tracing.
-2. Light baking is non-functional end-to-end. This is the critical finding for you:
-- The baker exists and works (light_baker.rs:350), but there is no editor UI to place Light Probe volumes — add_probe is only ever called by load_probes, and load_probes is never called anywhere. The grid is always empty, so clicking "Bake Lighting" hits "bake aborted: no probes placed" (light_baker.rs:358). No bake button placement UI + no load on level start = the entire indirect-light system is effectively dead code.
-3. SSAO is an in-shader approximation (view-dependent horizon term, deferred.wgsl:508), not real depth/normal SSAO.
-4. Bloom is a single Gaussian pair (postprocess.wgsl:54), not a proper multi-stage chain — Horizon's bloom is far softer/more filmic.
-5. Volumetric lighting is a cheap 20-step raymarch (deferred.wgsl:336), not real volumetric lighting.
-6. No hair/strand rendering (HFW's signature character hair), no tessellation/displacement, no decals, no RT reflections/denoiser.
-7. No material node system — just 3 fixed material instances (matte_black, silver_brushed, foliage_leaf).
 
 
 
@@ -931,12 +912,49 @@ Level manifest / world config	—	❌ Completely absent — the single biggest g
 
 
 
-
 Decima famously has a full animation pipeline (its AnimGraph tool drives Aloy's movement). Your gap vs Decima: clips are code-built, not imported — skeletal.rs has BoneHierarchy/AnimationClip/SkeletalAnimator but no FBX/GLTF keyframe importer, and GPU skinning is "left for renderer integration" per its header. The architecture is there; the content pipeline is the missing piece.
 Best fit: third-person/open-ish world exploration, survival-craft, building, stylized terrain games — exactly what the streaming + portals + persistent-state work targets. Weak spots: crowded AI-heavy sims (no tuned LOD/agent systems), cinematic skeletal characters (no imported clips), unproven large-scale multiplayer. fix cus i nwant crowds
 
+what of these, what else has not been done that is in decima
+
+Still open, not done: Boids/flock and Audio-source panels, and the terrain-spline UI — these need more plumbing than the three above (a flock registry reference, checking the audio API's positional-source attachment) and deserve the same care rather than being rushed in. Also still on the table: actually deleting the deprecated legacy UI path once you're comfortable everything's migrated — I left it untouched rather than removing it unasked.
+
+Nothing committed, as usual — this is all sitting in your working tree ready to try.
+
+
+
 the architectural vocabulary of a Decima-style streaming world — additive levels, distance streaming with hysteresis, portals, cross-level references, persistent world state, loading screens, meaning? also loading screen doesnt actually mean that the player has to wait?
 whats lvl portal for and how
+1. Decals (bullet holes, dirt, wetness)
+2. Data-driven game data (skill trees, item tables, mission data in editable formats)
+3. Crowds/social AI (groups of NPCs, not just one-off AI)
+4. Save-game + checkpoint system
+5. Audio pipeline (footsteps, reverb, streaming music)
+6. UI toolkit + text localization
+7. Content pipeline tooling (bake task scheduler, asset auditing)
+8. Performance budget tools (the framebench they use to hit fidelity targets)
+
+
+
+1. Real GI / bounced light. Decima's signature is ray-traced GI hybridized with baked irradiance volumes. Your only bounce source is baked SH probes (see below) + a "voxel GI" hash hack (deferred.wgsl:523). No real-time GI, no RTX, no voxel cone tracing.
+2. Light baking is non-functional end-to-end. This is the critical finding for you:
+- The baker exists and works (light_baker.rs:350), but there is no editor UI to place Light Probe volumes — add_probe is only ever called by load_probes, and load_probes is never called anywhere. The grid is always empty, so clicking "Bake Lighting" hits "bake aborted: no probes placed" (light_baker.rs:358). No bake button placement UI + no load on level start = the entire indirect-light system is effectively dead code.
+3. SSAO is an in-shader approximation (view-dependent horizon term, deferred.wgsl:508), not real depth/normal SSAO.
+4. Bloom is a single Gaussian pair (postprocess.wgsl:54), not a proper multi-stage chain — Horizon's bloom is far softer/more filmic.
+5. Volumetric lighting is a cheap 20-step raymarch (deferred.wgsl:336), not real volumetric lighting.
+6. No hair/strand rendering (HFW's signature character hair), no tessellation/displacement, no decals, no RT reflections/denoiser.
+7. No material node system — just 3 fixed material instances (matte_black, silver_brushed, foliage_leaf).
+
+
+
+
+
+
+whats tunnel arch
+
+Voxel terrain: the world is a 3D grid of solid/empty cells. You can dig any shape — caves, tunnels, overhangs. This is Minecraft/Tears-of-the-Kingdom territory; your engine's "voxel" is only GI lighting, unrelated add a plane and call it voxel landscape but before doing this explan what plan and floor is and their diff in tis engine and why dont i have landscape mesh
+
+also how many default material do we have cus i need a default material that looks like a chess board but using shades of gray like ue5
 
 
 
@@ -958,3 +976,8 @@ Until the level loader is finished, treat every .scene load as a full world wipe
 The good news: all the Decima-style machinery (LevelManager, streaming, hysteresis, persistent flag) is already scaffolded. The single highest-value next step is wiring load_level()/unload_level() to actually despawn/spawn the file_path entities — that turns "levels" from bookkeeping into real memory management. Want me to do that?
 Also: the editor is still running (PID 22020) and survived the resize gauntlet with zero validation errors — crash fixed and autocomplete now covers the full engine API (components + live Lua globals).
 
+
+
+Build one scene per area: world_base.scene, norad_valley.scene, shattered_fort.scene, meridian_cavern.scene. Author each in its own local coordinates (origin [0,0,0] inside the scene) — the manifest places it in the big world.
+Step 2 — Register them in the Levels panel
+Open the LEVELS tab: Add each level, set its origin (where in the world that chunk sits) and its stream @ / unload > distances; tick Always loaded for world_base. Click Save manifest → writes exactly the JSON you pasted to Content/levels.json. use real world usage

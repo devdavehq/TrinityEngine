@@ -82,6 +82,8 @@ struct MaterialExtras {
     clearcoat_roughness: f32,  // 0-1 clearcoat roughness
     anisotropy:          f32,  // anisotropic highlight stretch (brushed metal, hair)
     emissive_strength:   f32,  // self-illumination multiplier
+    checker:              f32,  // 0 = off, 1 = procedural world-space checkerboard
+    checker_scale:        f32,  // world-space size of one checker tile
     _pad: vec3<f32>,
 };
 @group(1) @binding(6) var<uniform> material_extras: MaterialExtras;
@@ -635,7 +637,20 @@ fn fs_main(in: VertOut) -> GbufferOutput {
     // Multiply by the vertex color (tint). Usually tint = white = no change.
     let world_uv = in.world_pos.xz * 0.12;
     let albedo_sample = textureSample(t_albedo, s_albedo, world_uv).rgb;
-    let albedo = albedo_sample * in.color;
+    var albedo = albedo_sample * in.color;
+
+    // -- Procedural world-space checkerboard (UE5-style default material) --
+    // Overrides the sampled albedo entirely with alternating near-white /
+    // mid-gray cells, computed in full 3D so it reads correctly on floors,
+    // walls, and ceilings alike (e.g. tunnel-arch interiors) without needing
+    // a texture or UVs at all.
+    if material_extras.checker > 0.5 {
+        let cs = max(material_extras.checker_scale, 0.01);
+        let cell = floor(in.world_pos / cs);
+        let parity = (cell.x + cell.y + cell.z) % 2.0;
+        let shade = select(0.18, 0.85, abs(parity) < 0.5);
+        albedo = vec3<f32>(shade, shade, shade) * in.color;
+    }
 
     // Sample normal map.
     // Normal maps store directions as RGB where (0.5, 0.5, 1.0) = flat.

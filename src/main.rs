@@ -162,7 +162,7 @@ use physics::{physics_system, character_controller_system, ragdoll_system, water
 use destruction::destruction_system;
 use profiler::FrameProfiler;
 use renderer::Renderer;
-use scene::{SceneManager, SubSceneManager, SceneTransition};
+use scene::{SceneManager, SceneTransition};
 use settings::EngineSettings;
 #[cfg(feature = "scripting")]
 use scripting::ScriptEngine;
@@ -250,8 +250,6 @@ struct GameApp {
     #[cfg(feature = "scripting")]
     demo_plugin: demo_plugin::DemoPlugin,
     scene_mgr:  SceneManager,
-    /// Sub-scene manager: loads scenes inside the current scene at world offsets.
-    sub_scene_mgr: SubSceneManager,
     /// Scene transition controller: fade-to-black effect for scene switches.
     transition: SceneTransition,
     settings:   EngineSettings,
@@ -356,6 +354,10 @@ struct GameApp {
     requested_scene_switch: Option<String>,
     /// Set by the editor's "Bake Lighting" button; consumed next frame.
     bake_requested: bool,
+    /// Set by the editor's Save/Load panel — (slot, label); consumed next frame.
+    save_slot_requested: Option<(u32, String)>,
+    /// Set by the editor's Save/Load panel; consumed next frame.
+    load_slot_requested: Option<u32>,
     stop_asset_watch: Arc<AtomicBool>,
     stop_scene_watch: Arc<AtomicBool>,
 }
@@ -468,7 +470,6 @@ impl GameApp {
             #[cfg(feature = "scripting")]
             demo_plugin:    demo_plugin::DemoPlugin::new(),
             scene_mgr:      SceneManager::new(&scene_path),
-            sub_scene_mgr:  SubSceneManager::new(),
             transition:     SceneTransition::new(),
             runtime_mode,
             auto_open_last_project: std::env::var("TRINITY_AUTO_OPEN").map(|v| v == "1").unwrap_or(false),
@@ -548,6 +549,8 @@ impl GameApp {
             scene_list_dirty: true,
             requested_scene_switch: None,
             bake_requested: false,
+            save_slot_requested: None,
+            load_slot_requested: None,
             stop_asset_watch: Arc::new(AtomicBool::new(false)),
             stop_scene_watch: Arc::new(AtomicBool::new(false)),
         }
@@ -1508,9 +1511,12 @@ impl ApplicationHandler for GameApp {
                             KeyCode::KeyB => editor::print_asset_browser(),
                             KeyCode::KeyN => self.cycle_selected_renderable(false),
                             KeyCode::KeyM => self.cycle_selected_renderable(true),
+                            // Quick material swap for the selected entity: 1 matte black,
+                            // 2 brushed silver, 3 foliage leaf, 4 UE5-style gray checkerboard.
                             KeyCode::Digit1 => self.apply_material_instance_to_selected("matte_black"),
                             KeyCode::Digit2 => self.apply_material_instance_to_selected("silver_brushed"),
                             KeyCode::Digit3 => self.apply_material_instance_to_selected("foliage_leaf"),
+                            KeyCode::Digit4 => self.apply_material_instance_to_selected("checker_gray"),
                             KeyCode::KeyJ => {
                                 if let Some(entity) = self.selected_renderable {
                                     if let Ok(mut a) = self.world.get::<&mut Animator>(entity) {
@@ -2024,6 +2030,17 @@ impl ApplicationHandler for GameApp {
                     self.nav_rebuild_requested = false;
                 }
 
+                // ── Editor-triggered save/load ──────────────────────────────
+                // The Save/Load panel can't call write_save_slot/load_save_slot
+                // directly (it only gets a slice of `self` via UiFrameArgs) —
+                // same request-flag pattern as bake_requested / nav_rebuild_requested.
+                if let Some((slot, label)) = self.save_slot_requested.take() {
+                    self.write_save_slot(slot, &label, false);
+                }
+                if let Some(slot) = self.load_slot_requested.take() {
+                    self.load_save_slot(slot);
+                }
+
                 // â”€â”€ Reset physics ground flag â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 // Must happen before physics_system so entities that walk off
                 // edges fall correctly on the next frame.
@@ -2343,8 +2360,9 @@ impl ApplicationHandler for GameApp {
                             }
                             let evicted = self.levels.level_manager.release_level_meshes(
                                 *level_id,
+                                &self.world,
                                 &mut self.assets.meshes,
-                                &self.assets.mesh_cache,
+                                &mut self.assets.mesh_cache,
                             );
                             if evicted > 0 {
                                 tracing::info!("[Streaming] Evicted {} mesh(es) for level {}", evicted, level_id);
@@ -2456,8 +2474,9 @@ impl ApplicationHandler for GameApp {
                             if self.levels.level_manager.despawn_level(source_id, &mut self.world) {
                                 let evicted = self.levels.level_manager.release_level_meshes(
                                     source_id,
+                                    &self.world,
                                     &mut self.assets.meshes,
-                                    &self.assets.mesh_cache,
+                                    &mut self.assets.mesh_cache,
                                 );
                                 tracing::info!(
                                     "[Portal] unloaded source level {} (evicted {} mesh(es))",
@@ -2753,6 +2772,10 @@ impl ApplicationHandler for GameApp {
                             audio: &mut self.audio,
                             bake_requested: &mut self.bake_requested,
                             levels: &mut self.levels,
+                            navmesh: &self.navmesh,
+                            save_slots: &self.save_slots,
+                            save_slot_requested: &mut self.save_slot_requested,
+                            load_slot_requested: &mut self.load_slot_requested,
                         };
                         if self.app_stage == AppStage::EditorLoading {
                             ui.begin_editor_loading(_window, self.project_stage_started_at.elapsed().as_secs_f32());

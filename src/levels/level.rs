@@ -269,15 +269,17 @@ impl LevelManager {
         true
     }
 
-    /// Release the mesh references a level claimed at spawn, and evict any
-    /// mesh whose refcount dropped to zero and that isn't pinned by the
-    /// mesh cache. Call this right after `despawn_level`. Returns how many
-    /// meshes were freed from the store.
+    /// Release the mesh references a level claimed at spawn, then evict every
+    /// mesh whose refcount dropped to zero and that is not referenced by any
+    /// live entity in the world. The mesh cache is pruned for evicted meshes
+    /// so they reload on demand next time. Call this right after
+    /// `despawn_level`. Returns how many meshes were freed from the store.
     pub fn release_level_meshes(
         &mut self,
         id: u32,
+        world: &hecs::World,
         meshes: &mut crate::assets::AssetStore<crate::assets::Mesh>,
-        mesh_cache: &std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
+        mesh_cache: &mut std::collections::HashMap<String, crate::assets::Handle<crate::assets::Mesh>>,
     ) -> usize {
         let Some(level) = self.levels.iter_mut().find(|l| l.id == id) else {
             return 0;
@@ -286,9 +288,18 @@ impl LevelManager {
         for mesh_id in refs {
             meshes.release(&crate::assets::Handle::new(mesh_id));
         }
-        let protected: std::collections::HashSet<u32> =
-            mesh_cache.values().map(|h| h.id).collect();
-        meshes.evict_unused(&protected)
+        // Live set: every mesh still referenced by a Renderable in the world
+        // (primary scene + still-loaded levels). Anything else with zero refs
+        // is safe to evict.
+        let live: std::collections::HashSet<u32> = world
+            .query::<&crate::components::Renderable>()
+            .iter()
+            .map(|r| r.mesh.id)
+            .collect();
+        let evicted = meshes.evict_unused(&live);
+        let evicted_set: std::collections::HashSet<u32> = evicted.into_iter().collect();
+        mesh_cache.retain(|_, h| !evicted_set.contains(&h.id));
+        evicted_set.len()
     }
 
     /// Register every level from a manifest (appending to any levels that were

@@ -5,17 +5,14 @@
 // Sub-modules:
 //   loader     — .scene file parser (INI-like format)
 //   prefab     — reusable entity templates (.prefab files)
-//   subscene   — load scenes INSIDE the current scene with position offsets
 //   transition — fade-to-black visual effect for scene switches
 // ──────────────────────────────────────────────────────────────────────────────
 pub mod loader;
 pub mod prefab;
-pub mod subscene;
 pub mod transition;
 pub mod diff;
 pub use loader::parse_scene;
 pub use prefab::PrefabRegistry;
-pub use subscene::SubSceneManager;
 pub use transition::SceneTransition;
 
 use crate::assets::{AssetStore, Handle, Mesh};

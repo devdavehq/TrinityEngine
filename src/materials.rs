@@ -43,6 +43,10 @@ pub struct MasterMaterial {
     pub clearcoat: f32,
     /// Clearcoat roughness (0 = mirror, 1 = rough clearcoat).
     pub clearcoat_roughness: f32,
+    /// Procedural world-space checkerboard pattern (0 = off, 1 = on).
+    pub checker: f32,
+    /// World-space size of one checker tile.
+    pub checker_scale: f32,
 }
 
 /// A material instance that references a master and applies multipliers.
@@ -57,6 +61,10 @@ pub struct MaterialInstance {
     pub subsurface_mul: f32,
     pub clearcoat_mul: f32,
     pub clearcoat_roughness_mul: f32,
+    /// Direct override: 1 turns the world-space checkerboard on.
+    pub checker: f32,
+    /// Direct override: tile size in world units.
+    pub checker_scale: f32,
 }
 
 /// Parsed representation of a .material TOML file.
@@ -98,6 +106,8 @@ impl MaterialLibrary {
                 subsurface: 0.0,
                 clearcoat: 0.0,
                 clearcoat_roughness: 0.6,
+                checker: 0.0,
+                checker_scale: 1.0,
             },
         );
         self.masters.insert(
@@ -111,6 +121,8 @@ impl MaterialLibrary {
                 subsurface: 0.0,
                 clearcoat: 0.0,
                 clearcoat_roughness: 0.4,
+                checker: 0.0,
+                checker_scale: 1.0,
             },
         );
         self.masters.insert(
@@ -124,6 +136,25 @@ impl MaterialLibrary {
                 subsurface: 0.25,
                 clearcoat: 0.0,
                 clearcoat_roughness: 0.6,
+                checker: 0.0,
+                checker_scale: 1.0,
+            },
+        );
+        // UE5-style gray checkerboard — the classic "no material assigned"
+        // debug pattern, useful for scale/UV testing without a texture asset.
+        self.masters.insert(
+            "master_checker".into(),
+            MasterMaterial {
+                base_color: [0.62, 0.62, 0.62],
+                metallic: 0.0,
+                roughness: 0.6,
+                ao: 1.0,
+                emissive_strength: 0.0,
+                subsurface: 0.0,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.6,
+                checker: 1.0,
+                checker_scale: 1.0,
             },
         );
 
@@ -139,6 +170,8 @@ impl MaterialLibrary {
                 subsurface_mul: 1.0,
                 clearcoat_mul: 1.0,
                 clearcoat_roughness_mul: 1.0,
+                checker: 0.0,
+                checker_scale: 1.0,
             },
         );
         self.instances.insert(
@@ -153,6 +186,8 @@ impl MaterialLibrary {
                 subsurface_mul: 1.0,
                 clearcoat_mul: 0.2,
                 clearcoat_roughness_mul: 1.0,
+                checker: 0.0,
+                checker_scale: 1.0,
             },
         );
         self.instances.insert(
@@ -167,6 +202,26 @@ impl MaterialLibrary {
                 subsurface_mul: 1.0,
                 clearcoat_mul: 1.0,
                 clearcoat_roughness_mul: 1.0,
+                checker: 0.0,
+                checker_scale: 1.0,
+            },
+        );
+        // Default instance of master_checker — shades of gray, 1m tiles,
+        // matching the Unreal Engine 5 default-material look.
+        self.instances.insert(
+            "checker_gray".into(),
+            MaterialInstance {
+                master: "master_checker".into(),
+                color_tint: [1.0, 1.0, 1.0],
+                metallic_mul: 1.0,
+                roughness_mul: 1.0,
+                ao_mul: 1.0,
+                emissive_mul: 1.0,
+                subsurface_mul: 1.0,
+                clearcoat_mul: 1.0,
+                clearcoat_roughness_mul: 1.0,
+                checker: 1.0,
+                checker_scale: 1.0,
             },
         );
     }
@@ -348,6 +403,10 @@ impl MaterialLibrary {
                 * inst.clearcoat_roughness_mul)
                 .clamp(0.0, 1.0),
             emissive_strength: (master.emissive_strength * inst.emissive_mul).clamp(0.0, 10.0),
+            // Instance `checker` is a direct override (not a multiplier): any
+            // non-zero value turns the pattern on regardless of the master.
+            checker: if inst.checker > 0.0 || master.checker > 0.0 { 1.0 } else { 0.0 },
+            checker_scale: if inst.checker_scale > 0.0 { inst.checker_scale } else { master.checker_scale },
         })
     }
 
@@ -389,6 +448,8 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
     let mut subsurface = 0.0f32;
     let mut clearcoat = 0.0f32;
     let mut clearcoat_roughness = 0.6f32;
+    let mut checker = 0.0f32;
+    let mut checker_scale = 1.0f32;
 
     // Instance fields
     let mut master_ref = String::new();
@@ -450,6 +511,8 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             "clearcoat_mul" => clearcoat_mul = parse_f32(value),
             "clearcoat_roughness" => clearcoat_roughness = parse_f32(value),
             "clearcoat_roughness_mul" => clearcoat_roughness_mul = parse_f32(value),
+            "checker" => checker = parse_f32(value),
+            "checker_scale" => checker_scale = parse_f32(value),
 
             // Array values: base_color = [0.5, 0.3, 0.1]
             "base_color" => {
@@ -492,6 +555,8 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             subsurface_mul,
             clearcoat_mul,
             clearcoat_roughness_mul,
+            checker,
+            checker_scale,
         })
     } else {
         MaterialFile::Master(MasterMaterial {
@@ -503,6 +568,8 @@ fn parse_material_toml(contents: &str) -> Result<(String, MaterialFile), String>
             subsurface,
             clearcoat,
             clearcoat_roughness,
+            checker,
+            checker_scale,
         })
     };
 
